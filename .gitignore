@@ -10,3 +10,5 @@ _build/
 _tmp*/
 *.bak
 .DS_Store
+
+dist/

@@ -48,11 +48,13 @@
 - (void)sl_buildReaderForKey:(NSString *)key;
 - (BOOL)sl_pumpAudio;
 - (NSData *)sl_convertAudio:(NSData *)input;
+- (NSInteger)sl_normalizedRotation;
 - (CVPixelBufferRef)sl_render:(CVPixelBufferRef)src
                       toWidth:(size_t)w
                        height:(size_t)h
                        format:(OSType)pf
-                       mirror:(BOOL)mirror CF_RETURNS_RETAINED;
+                       mirror:(BOOL)mirror
+                     rotation:(NSInteger)rotation CF_RETURNS_RETAINED;
 
 @end
 
@@ -71,6 +73,9 @@
         _audioPCM = [NSMutableData data];
         _ciContext = [CIContext contextWithOptions:nil];
         _loopEnabled = YES;
+        _mirrorEnabled = NO;
+        _rotation = 0;
+        _audioReplaceEnabled = YES;
     }
     return self;
 }
@@ -419,21 +424,37 @@
     size_t sw = CVPixelBufferGetWidth(pb);
     size_t sh = CVPixelBufferGetHeight(pb);
     OSType spf = CVPixelBufferGetPixelFormatType(pb);
+    NSInteger rot = [self sl_normalizedRotation];
 
-    if (sw == w && sh == h && spf == pixelFormat && !self.mirrorEnabled) {
-        return pb;   // 尺寸格式都对齐，零转换直接给
+    // 尺寸、格式都对上、又没开镜像/旋转，才能零转换直出
+    if (sw == w && sh == h && spf == pixelFormat && !self.mirrorEnabled && rot == 0) {
+        return pb;
     }
 
-    CVPixelBufferRef out = [self sl_render:pb toWidth:w height:h format:pixelFormat mirror:self.mirrorEnabled];
+    CVPixelBufferRef out = [self sl_render:pb
+                                   toWidth:w
+                                    height:h
+                                    format:pixelFormat
+                                    mirror:self.mirrorEnabled
+                                  rotation:rot];
     CVPixelBufferRelease(pb);
     return out;
+}
+
+/// 角度只认 0/90/180/270，其余一律当 0（脏数据不该让画面整个歪掉）
+- (NSInteger)sl_normalizedRotation {
+    NSInteger r = self.rotation % 360;
+    if (r < 0) r += 360;
+    if (r == 90 || r == 180 || r == 270) return r;
+    return 0;
 }
 
 - (CVPixelBufferRef)sl_render:(CVPixelBufferRef)src
                       toWidth:(size_t)w
                        height:(size_t)h
                        format:(OSType)pf
-                       mirror:(BOOL)mirror {
+                       mirror:(BOOL)mirror
+                     rotation:(NSInteger)rotation {
     NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
     CVPixelBufferRef dst = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, pf, (__bridge CFDictionaryRef)attrs, &dst) != kCVReturnSuccess)
@@ -443,23 +464,33 @@
     size_t sh = CVPixelBufferGetHeight(src);
     if (sw < 1 || sh < 1) { CVPixelBufferRelease(dst); return NULL; }
 
-    CGFloat sx = (CGFloat)w / (CGFloat)sw;
-    CGFloat sy = (CGFloat)h / (CGFloat)sh;
-
     CIImage *img = [CIImage imageWithCVPixelBuffer:src];
-    CGAffineTransform t;
-    if (mirror) {
-        // 先水平翻转再平移到 (0,0)，结果 extent 正好是 (0,0,w,h)
-        t = CGAffineTransformConcat(CGAffineTransformMakeScale(-sx, sy),
-                                    CGAffineTransformMakeTranslation((CGFloat)w, 0));
-    } else {
-        t = CGAffineTransformMakeScale(sx, sy);
-    }
-    img = [img imageByApplyingTransform:t];
 
-    CGRect e = img.extent;
-    if (e.origin.x != 0 || e.origin.y != 0) {
+    // 1) 旋转。CI 是 y 轴向上的坐标系，视觉上的「顺时针」要取负角度。
+    //    旋转后 extent 会跑到负象限，必须平移回 (0,0)，否则后面缩放会按错的框算。
+    if (rotation != 0) {
+        img = [img imageByApplyingTransform:CGAffineTransformMakeRotation(-rotation * M_PI / 180.0)];
+        CGRect e = img.extent;
         img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(-e.origin.x, -e.origin.y)];
+    }
+
+    // 2) 铺满目标框再居中裁切（aspect-fill）。直接拉伸会把人脸拉扁，
+    //    竖屏素材塞进横屏预览时尤其明显。
+    CGRect re = img.extent;
+    if (re.size.width < 1 || re.size.height < 1) { CVPixelBufferRelease(dst); return NULL; }
+    CGFloat s = MAX((CGFloat)w / re.size.width, (CGFloat)h / re.size.height);
+    img = [img imageByApplyingTransform:CGAffineTransformMakeScale(s, s)];
+
+    CGRect se = img.extent;
+    img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(
+        ((CGFloat)w - se.size.width) / 2.0,
+        ((CGFloat)h - se.size.height) / 2.0)];
+
+    // 3) 镜像：在目标坐标系里水平翻转，翻转后再平移回 (0,0)
+    if (mirror) {
+        img = [img imageByApplyingTransform:CGAffineTransformConcat(
+            CGAffineTransformMakeScale(-1, 1),
+            CGAffineTransformMakeTranslation((CGFloat)w, 0))];
     }
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
@@ -475,6 +506,13 @@
 
 - (NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes {
     if (!asbd || asbd->mBytesPerFrame == 0 || numBytes == 0) return nil;
+
+    // 关掉「替换音频」= 静音。这里必须返回全零的 PCM，不能返回 nil：
+    // 返回 nil 会让注入层放行真实麦克风，把环境声原样录进去。
+    // 走这条分支也就不需要素材有音轨，无声视频同样能静音。
+    if (!self.audioReplaceEnabled) {
+        return [NSMutableData dataWithLength:numBytes];
+    }
 
     [_lock lock];
     BOOL firstTime = !_hasAudioDstASBD || memcmp(asbd, &_audioDstASBD, sizeof(*asbd)) != 0;

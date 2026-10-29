@@ -35,8 +35,14 @@ void SLCamReloadAll(void);
 /// 开关的存储键（设置页与业务共用，别各存一份）
 extern NSString *const kSLCamEnabledKey;
 
-/// 画面设置：循环播放 / 水平镜像。设置页负责写，帧源负责读。
+/// 画面设置：循环播放 / 水平镜像 / 旋转角度。设置页负责写，帧源负责读。
 extern NSString *const kSLCamLoopKey;
 extern NSString *const kSLCamMirrorKey;
+
+/// 旋转角度，NSInteger，顺时针，只认 0 / 90 / 180 / 270（默认 0）
+extern NSString *const kSLCamRotateKey;
+
+/// 是否用素材音频替换麦克风，BOOL，默认 YES；NO = 静音输出
+extern NSString *const kSLCamAudioKey;
 
 NS_ASSUME_NONNULL_END

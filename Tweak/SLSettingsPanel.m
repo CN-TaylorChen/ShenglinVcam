@@ -7,6 +7,7 @@
 //
 //  底包只有四组，套用时按需加行 —— 加行只动三个方法：
 //    numberOfRowsInSection / cellForRowAtIndexPath / didSelectRowAtIndexPath。
+//  0.2.2 起「画面」组多了旋转一行、「声音」组独立出来放音频开关。
 //
 
 #import "SLSettingsPanel.h"
@@ -20,7 +21,7 @@
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVersion @"0.2.1"
+#define SLVersion @"0.2.2"
 
 // kSLCamLoopKey / kSLCamMirrorKey 现在由 SLCamCore.m 统一导出（SLCamBridge.h 里 extern），
 // 帧源要读同样的键，不能再各定义一份 static。
@@ -143,23 +144,44 @@ static void SLSetBool(NSString *key, BOOL v) {
     [d synchronize];
 }
 
+/// 旋转值只认 0/90/180/270，脏数据一律当 0
+static NSInteger SLRotationValue(void) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:kSLCamRotateKey];
+    NSInteger r = v ? [v integerValue] : 0;
+    r %= 360;
+    if (r < 0) r += 360;
+    return (r == 90 || r == 180 || r == 270) ? r : 0;
+}
+
+static void SLSetRotation(NSInteger deg) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setInteger:deg forKey:kSLCamRotateKey];
+    [d synchronize];
+}
+
+static NSString *SLRotationSummary(void) {
+    NSInteger r = SLRotationValue();
+    return r == 0 ? @"不旋转" : [NSString stringWithFormat:@"顺时针 %ld°", (long)r];
+}
+
 #pragma mark - Table
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv {
     (void)tv;
-    return 4;
+    return 5;
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
     (void)tv;
     if (section == 0) return 2;   // 启用 + 悬浮球图标
     if (section == 1) return 1;   // 当前素材
-    if (section == 2) return 2;   // 循环 + 镜像
+    if (section == 2) return 3;   // 循环 + 镜像 + 旋转
+    if (section == 3) return 1;   // 音频
     return 1;                     // 运行日志
 }
 
 - (NSString *)sl_headerForSection:(NSInteger)section {
-    return @[@"基本设置", @"素材", @"画面", @"诊断"][section];
+    return @[@"基本设置", @"素材", @"画面", @"声音", @"诊断"][section];
 }
 
 - (UIView *)tableView:(UITableView *)tv viewForHeaderInSection:(NSInteger)section {
@@ -174,7 +196,8 @@ static void SLSetBool(NSString *key, BOOL v) {
 
 - (NSString *)sl_footerForSection:(NSInteger)section {
     if (section == 0) return @"关掉后胶囊不再展开，长按球仍可进设置。";
-    if (section == 2) return @"这两个开关只负责存值，由注入层读取。";
+    if (section == 2) return @"旋转按顺时针计算，画面会铺满取景框、多出来的部分居中裁掉。";
+    if (section == 3) return @"关掉后麦克风会被静音，不会录入环境声。素材没有音轨时同样生效。";
     return nil;
 }
 
@@ -232,11 +255,23 @@ static void SLSetBool(NSString *key, BOOL v) {
         cell.detailTextLabel.text = SLCamStatusSummary();
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     } else if (ip.section == 2) {
-        BOOL loop = (ip.row == 0);
-        cell.textLabel.text = loop ? @"循环播放" : @"镜像画面";
+        if (ip.row == 2) {
+            cell.textLabel.text = @"画面旋转";
+            cell.detailTextLabel.text = SLRotationSummary();
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        } else {
+            BOOL loop = (ip.row == 0);
+            cell.textLabel.text = loop ? @"循环播放" : @"镜像画面";
+            sw = [[UISwitch alloc] init];
+            sw.on = SLBoolForKey(loop ? kSLCamLoopKey : kSLCamMirrorKey, loop);
+            sw.tag = ip.row;
+            [sw addTarget:self action:@selector(sl_optionChanged:) forControlEvents:UIControlEventValueChanged];
+        }
+    } else if (ip.section == 3) {
+        cell.textLabel.text = @"替换音频";
         sw = [[UISwitch alloc] init];
-        sw.on = SLBoolForKey(loop ? kSLCamLoopKey : kSLCamMirrorKey, loop);
-        sw.tag = ip.row;
+        sw.on = SLBoolForKey(kSLCamAudioKey, YES);
+        sw.tag = 2;
         [sw addTarget:self action:@selector(sl_optionChanged:) forControlEvents:UIControlEventValueChanged];
     } else {
         cell.textLabel.text = @"运行日志";
@@ -253,9 +288,41 @@ static void SLSetBool(NSString *key, BOOL v) {
         [self.navigationController pushViewController:[[SLFloatIconController alloc] init] animated:YES];
     } else if (ip.section == 1) {
         [self.navigationController pushViewController:[[SLMediaListController alloc] init] animated:YES];
-    } else if (ip.section == 3) {
+    } else if (ip.section == 2 && ip.row == 2) {
+        [self sl_pickRotation];
+    } else if (ip.section == 4) {
         [self.navigationController pushViewController:[[SLLogViewController alloc] init] animated:YES];
     }
+}
+
+#pragma mark - 旋转
+
+- (void)sl_pickRotation {
+    NSArray<NSNumber *> *vals  = @[@0, @90, @180, @270];
+    NSArray<NSString *> *names = @[@"不旋转", @"顺时针 90°", @"顺时针 180°", @"顺时针 270°"];
+    NSInteger cur = SLRotationValue();
+
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"画面旋转"
+                                                                  message:@"按顺时针方向调整素材画面"
+                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSUInteger i = 0; i < vals.count; i++) {
+        NSInteger v = vals[i].integerValue;
+        NSString *title = (v == cur) ? [names[i] stringByAppendingString:@"  ✓"] : names[i];
+        [sheet addAction:[UIAlertAction actionWithTitle:title
+                                                 style:UIAlertActionStyleDefault
+                                               handler:^(UIAlertAction *a) {
+            SLSetRotation(v);
+            SLCamReloadAll();
+            [self.tableView reloadData];
+            SLToast(v == 0 ? @"已取消旋转" : [NSString stringWithFormat:@"已顺时针旋转 %ld°", (long)v]);
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+    // 弹窗形态下没有 anchor 会直接崩，必须给一个
+    sheet.popoverPresentationController.sourceView = self.view;
+    sheet.popoverPresentationController.sourceRect = self.view.bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 #pragma mark - 开关
@@ -267,8 +334,15 @@ static void SLSetBool(NSString *key, BOOL v) {
 }
 
 - (void)sl_optionChanged:(UISwitch *)sw {
+    // tag：0 = 循环播放，1 = 镜像，2 = 替换音频
+    if (sw.tag == 2) {
+        SLSetBool(kSLCamAudioKey, sw.on);
+        SLCamReloadAll();
+        SLToast(sw.on ? @"已改用素材音频" : @"已静音，不再录入环境声");
+        return;
+    }
     SLSetBool(sw.tag == 0 ? kSLCamLoopKey : kSLCamMirrorKey, sw.on);
-    // 业务侧自己读这两个键；底包只负责存，不做任何画面处理
+    SLCamReloadAll();   // 让帧源立刻读到新值，不用等重启
 }
 
 @end

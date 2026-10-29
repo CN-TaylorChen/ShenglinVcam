@@ -22,10 +22,17 @@
 NSString *const kSLCamEnabledKey = @"SLCamEnabled";
 NSString *const kSLCamLoopKey    = @"SLCamLoop";
 NSString *const kSLCamMirrorKey  = @"SLCamMirror";
+NSString *const kSLCamRotateKey  = @"SLCamRotate";
+NSString *const kSLCamAudioKey   = @"SLCamAudio";
 
 static BOOL SLCamReadBool(NSString *key, BOOL def) {
     id v = [[NSUserDefaults standardUserDefaults] objectForKey:key];
     return v ? [v boolValue] : def;
+}
+
+static NSInteger SLCamReadInt(NSString *key, NSInteger def) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:key];
+    return v ? [v integerValue] : def;
 }
 
 BOOL SLCamEnabled(void) {
@@ -64,13 +71,17 @@ void SLCamReloadAll(void) {
     SLMediaItem *it = [SLMediaStore currentItem];
     SLCamFeed *feed = [SLCamFeed shared];
 
-    feed.loopEnabled   = SLCamReadBool(kSLCamLoopKey, YES);
-    feed.mirrorEnabled = SLCamReadBool(kSLCamMirrorKey, NO);
+    feed.loopEnabled         = SLCamReadBool(kSLCamLoopKey, YES);
+    feed.mirrorEnabled       = SLCamReadBool(kSLCamMirrorKey, NO);
+    feed.rotation            = SLCamReadInt(kSLCamRotateKey, 0);
+    feed.audioReplaceEnabled = SLCamReadBool(kSLCamAudioKey, YES);
 
-    if (![feed.sourcePath isEqualToString:it.path ?: @""]) {
+    // 只有路径真的变了才重启解码。切个镜像/旋转开关不该把画面跳回第一帧 ——
+    // 那在直播/通话里非常出戏。
+    NSString *want = it.path ?: @"";
+    NSString *cur  = feed.sourcePath ?: @"";
+    if (![cur isEqualToString:want]) {
         feed.sourcePath = it.path;
-    } else {
-        [feed rewind];
     }
 
     // 只有「总开关开着 + 有素材文件」才真正替换；否则注入层原样放行真摄像头

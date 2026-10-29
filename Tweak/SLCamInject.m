@@ -29,6 +29,21 @@ static int  sSLCamHookCount = 0;
 static BOOL sLoggedMissingOrig = NO;
 static BOOL sLoggedFirstVideo = NO;
 static BOOL sLoggedFirstAudio = NO;
+static int  sSLCamFailCount = 0;
+static int  sSLCamAudioFailCount = 0;
+static int  sSLCamBadPTS = 0;
+
+/// 四字符码转可读串（'BGRA' / '420f'），日志里比裸数字好认
+static NSString *SLFourCC(OSType v) {
+    char c[5] = {
+        (char)((v >> 24) & 0xff), (char)((v >> 16) & 0xff),
+        (char)((v >> 8) & 0xff),  (char)(v & 0xff), 0
+    };
+    for (int i = 0; i < 4; i++) {
+        if (c[i] < 32 || c[i] > 126) c[i] = '?';
+    }
+    return @(c);
+}
 
 /// 音视频输出可能各自重写了 _processSampleBuffer:，必须按 Method 分别保存原始 IMP，
 /// 否则音频会走到视频的原始实现上去（表现为只有画面变、声音还在）。
@@ -72,23 +87,81 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
             CGSize size = CGSizeMake((CGFloat)CVPixelBufferGetWidth(img),
                                      (CGFloat)CVPixelBufferGetHeight(img));
 
+            // 宿主自己的 fmt 和它自己的 buffer 是否自洽？
+            // iOS 17 起 AVCaptureConnection 的旋转会直接作用到 VideoDataOutput 的 buffer 上：
+            // buffer 变成竖的（1080x1920），而 fmt 还留着传感器尺寸（1920x1080）。
+            // 这种 fmt 拿来做 CMSampleBufferCreateReadyWithImageBuffer 的校验必然不过。
+            BOOL fmtMatchesReal = CMVideoFormatDescriptionMatchesImageBuffer(
+                (CMVideoFormatDescriptionRef)fmt, img);
+
             if (!sLoggedFirstVideo) {
                 sLoggedFirstVideo = YES;
-                SLLog(@"首帧 视频 %zux%zu pf=%u", (size_t)size.width, (size_t)size.height, (unsigned)pf);
+                CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions((CMVideoFormatDescriptionRef)fmt);
+                SLLog(@"首帧 视频 %zux%zu pf=%u(%@) · fmt %dx%d %@ · 自洽=%@",
+                      (size_t)size.width, (size_t)size.height, (unsigned)pf, SLFourCC(pf),
+                      d.width, d.height,
+                      SLFourCC(CMFormatDescriptionGetMediaSubType(fmt)),
+                      fmtMatchesReal ? @"Y" : @"N");
             }
 
             CMSampleTimingInfo timing = {0};
             timing.presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(sbuf);
             timing.decodeTimeStamp       = CMSampleBufferGetDecodeTimeStamp(sbuf);
             timing.duration              = CMSampleBufferGetDuration(sbuf);
-            if (CMTIME_IS_INVALID(timing.duration)) timing.duration = CMTimeMake(1, 30);
+
+            // duration 必须是「有效 + 非负」，否则 CMSampleBufferCreateReady 会以
+            // kCMSampleBufferError_InvalidSampleTimingInfo 失败 —— 这个错跟格式无关，
+            // 但表现和格式错一模一样（每帧都失败）。采集帧的 duration 经常是 indefinite，
+            // 光判 CMTIME_IS_INVALID 拦不住。
+            if (!CMTIME_IS_VALID(timing.duration) || CMTIME_IS_NEGATIVE(timing.duration)) {
+                timing.duration = CMTimeMake(1, 30);
+            }
+            if (!CMTIME_IS_VALID(timing.decodeTimeStamp)) {
+                timing.decodeTimeStamp = kCMTimeInvalid;
+            }
+            if (!CMTIME_IS_VALID(timing.presentationTimeStamp)) {
+                // 没有有效的 PTS 就没法接进宿主的时间轴，硬塞一个反而会把下游时序搞乱。
+                // 这一帧直接放行真画面，下一帧再说。
+                if (sSLCamBadPTS++ == 0) SLLog(@"注入: 真帧没有有效 PTS，跳过替换");
+                ((SLProcessSampleBufferFn)orig)(self, _cmd, sbuf);
+                return;
+            }
 
             CVPixelBufferRef frame = [feed copyFrameForPixelFormat:pf size:size];
             if (frame) {
-                if (CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, frame, fmt, &timing, &fake) != noErr) {
-                    SLLog(@"注入: CMSampleBuffer 构造失败（fmt 与帧不匹配）");
-                    fake = NULL;
+                // 优先沿用宿主的 fmt（下游的编码器/写入器都按它配置，换了会出岔子）。
+                // 只有当假帧确实与它不匹配时，才退而求其次自建一个 —— 自建的保证内部自洽。
+                CMVideoFormatDescriptionRef useFmt = (CMVideoFormatDescriptionRef)fmt;
+                CMVideoFormatDescriptionRef ownFmt = NULL;
+                if (!CMVideoFormatDescriptionMatchesImageBuffer((CMVideoFormatDescriptionRef)fmt, frame)) {
+                    if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &ownFmt) == noErr
+                        && ownFmt) {
+                        useFmt = ownFmt;
+                    }
                 }
+
+                OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, frame, useFmt,
+                                                                       &timing, &fake);
+                if (st != noErr) {
+                    fake = NULL;
+                    sSLCamFailCount++;
+                    // 前 3 次 + 之后每 120 帧打一条，既能看到细节又不会把日志刷爆
+                    if (sSLCamFailCount <= 3 || sSLCamFailCount % 120 == 0) {
+                        CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions((CMVideoFormatDescriptionRef)fmt);
+                        SLLog(@"注入: 打包失败 #%d st=%d · fmt %dx%d %@ · 帧 %ux%u %@ · 自洽=%@ · 兜底fmt=%@",
+                              sSLCamFailCount, (int)st,
+                              d.width, d.height, SLFourCC(CMFormatDescriptionGetMediaSubType(fmt)),
+                              (unsigned)CVPixelBufferGetWidth(frame),
+                              (unsigned)CVPixelBufferGetHeight(frame),
+                              SLFourCC(CVPixelBufferGetPixelFormatType(frame)),
+                              fmtMatchesReal ? @"Y" : @"N",
+                              ownFmt ? @"Y" : @"N");
+                    }
+                } else if (sSLCamFailCount > 0) {
+                    SLLog(@"注入: 打包恢复正常（累计失败 %d 次）", sSLCamFailCount);
+                    sSLCamFailCount = 0;
+                }
+                if (ownFmt) CFRelease(ownFmt);
                 CVPixelBufferRelease(frame);
             }
         }
@@ -120,9 +193,15 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
                         t.duration = CMTimeMake(1, (int32_t)asbd->mSampleRate);
                         CMItemCount frames = (CMItemCount)(len / asbd->mBytesPerFrame);
 
-                        if (CMSampleBufferCreate(kCFAllocatorDefault, newBB, true, NULL, NULL, fmt,
-                                                 frames, 1, &t, 0, NULL, &fake) != noErr) {
+                        OSStatus ast = CMSampleBufferCreate(kCFAllocatorDefault, newBB, true, NULL, NULL, fmt,
+                                                            frames, 1, &t, 0, NULL, &fake);
+                        if (ast != noErr) {
                             fake = NULL;
+                            sSLCamAudioFailCount++;
+                            if (sSLCamAudioFailCount <= 3 || sSLCamAudioFailCount % 300 == 0) {
+                                SLLog(@"注入: 音频打包失败 #%d st=%d · %u 帧 · %zu 字节",
+                                      sSLCamAudioFailCount, (int)ast, (unsigned)frames, len);
+                            }
                         }
                         CFRelease(newBB);
                     }

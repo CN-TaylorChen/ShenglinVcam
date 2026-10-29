@@ -30,6 +30,15 @@ NS_ASSUME_NONNULL_BEGIN
 /// 水平镜像（默认 NO）
 @property (nonatomic, assign) BOOL mirrorEnabled;
 
+/// 画面旋转角度，顺时针，只认 0 / 90 / 180 / 270（默认 0）。
+/// 旋转后按「铺满目标框 + 居中裁切」缩放，不会把人脸拉扁。
+@property (nonatomic, assign) NSInteger rotation;
+
+/// 是否用素材音频替换麦克风（默认 YES）。
+/// NO 时输出**静音**而不是放行真实麦克风 —— 虚拟摄像头场景下关声音就是要静音，
+/// 放行麦克风会把环境声录进去。
+@property (nonatomic, assign) BOOL audioReplaceEnabled;
+
 /// 取下一帧（原始尺寸）。返回 +1 的 buffer，调用方负责 CFRelease；没有可用帧返回 NULL。
 - (nullable CVPixelBufferRef)copyNextFrame CF_RETURNS_RETAINED;
 
