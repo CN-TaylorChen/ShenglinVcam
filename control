@@ -1,8 +1,8 @@
 Package: com.cookieodd.shenglinvcam
 Name: 声临·虚拟摄像头 (ShenglinVcam)
-Version: 0.1.0
+Version: 0.2.0
 Architecture: iphoneos-arm64
-Description: 纯净底包：玻璃外壳、悬浮球、素材库与注入插槽，业务层留空。
+Description: 全平台虚拟摄像头：玻璃外壳、悬浮球、素材库、音视频替换。相册选素材，所有第三方 App 的摄像头输出都会被换成你的视频。
 Maintainer: CN-TaylorChen
 Author: CN-TaylorChen
 Section: Tweaks

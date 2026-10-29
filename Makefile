@@ -7,7 +7,7 @@
 #   3) 改 Tweak/SLCam.x 里的版本宏与 app 专属 hook，业务填 SLCamFeed / SLCamInject
 #   其余（外观、设置页、素材页、日志、发货链）一律不动。
 
-ARCHS = arm64
+ARCHS = arm64 arm64e
 TARGET := iphone:clang:latest:15.0
 
 include $(THEOS)/makefiles/common.mk
@@ -29,9 +29,9 @@ ShenglinVcam_FILES = Tweak/SLCam.x \
 	Tweak/SLCamInject.m \
 	Tweak/SLTarget.m
 
-ShenglinVcam_CFLAGS = -fobjc-arc
+ShenglinVcam_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function
 ShenglinVcam_LDFLAGS = -Xlinker -not_for_dyld_shared_cache
-ShenglinVcam_FRAMEWORKS = UIKit Foundation AVFoundation CoreVideo CoreMedia PhotosUI UniformTypeIdentifiers
+ShenglinVcam_FRAMEWORKS = UIKit Foundation AVFoundation CoreVideo CoreMedia CoreImage AudioToolbox PhotosUI UniformTypeIdentifiers
 ShenglinVcam_LIBRARIES = objc
 
 include $(THEOS_MAKE_PATH)/library.mk

@@ -35,4 +35,8 @@ void SLCamReloadAll(void);
 /// 开关的存储键（设置页与业务共用，别各存一份）
 extern NSString *const kSLCamEnabledKey;
 
+/// 画面设置：循环播放 / 水平镜像。设置页负责写，帧源负责读。
+extern NSString *const kSLCamLoopKey;
+extern NSString *const kSLCamMirrorKey;
+
 NS_ASSUME_NONNULL_END

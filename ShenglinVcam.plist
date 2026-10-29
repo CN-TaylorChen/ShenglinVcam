@@ -1,1 +1,1 @@
-{ Filter = { Bundles = ( "com.tencent.xin", "com.tencent.mqq" ); }; }
+{ Filter = { Bundles = ( "com.apple.UIKit" ); }; }

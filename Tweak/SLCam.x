@@ -20,12 +20,15 @@
 #import "SLTarget.h"
 #import "SLLog.h"
 
-#define SLVersion @"0.1.0"
+#define SLVersion @"0.2.0"
 
 /// 设置页「运行日志」那行右侧的钩子状态（SLLogViewController.h 里声明的）
 NSString *SLHookStatusSummary(void) {
-    if (SLCamInjecting()) return @"替换中";
-    return @"未接入（骨架）";
+    if (!SLCamHooksInstalled()) return @"未安装";
+    int n = SLCamHookCount();
+    if (n <= 0) return @"未命中";
+    if (SLCamInjecting()) return [NSString stringWithFormat:@"替换中 · %d 个方法", n];
+    return [NSString stringWithFormat:@"待命 · %d 个方法", n];
 }
 
 %ctor {

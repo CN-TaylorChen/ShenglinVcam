@@ -25,8 +25,9 @@ static NSString *const kSLCamTargetsKey = @"SLCamTargets";
 + (BOOL)isTargetProcess {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     if (!bid.length) return NO;
-    // 系统进程不挂：SpringBoard / 设置 / 桌面这些没有摄像头场景，挂了只会碍事
-    if ([bid hasPrefix:@"com.apple."]) return NO;
+    // 系统进程不挂：SpringBoard / 设置 / 桌面这些没有摄像头场景，挂了只会碍事。
+    // 例外是系统「相机」—— 那是最直观的验证目标，放行。
+    if ([bid hasPrefix:@"com.apple."] && ![bid isEqualToString:@"com.apple.camera"]) return NO;
 
     NSArray<NSString *> *list = [self targetBundleIDs];
     if (list.count == 0) return YES;   // 没配置 = 全域生效
