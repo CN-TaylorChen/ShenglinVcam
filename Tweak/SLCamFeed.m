@@ -388,8 +388,19 @@
         return;
     }
     _reader = reader;
-    SLLog(@"feed 管线就绪 %@ (video=%@ audio=%@)", key ?: @"(nil)",
-          _videoOut ? @"Y" : @"N", _audioOut ? @"Y" : @"N");
+
+    // 循环播放每轮都要重建 reader，每 11 秒刷一行会把日志淹掉。
+    // 只在「首次 / 目标格式变了 / 每 20 轮」打一次 —— 真出问题时也还看得到心跳。
+    static NSString *sLastLoggedKey = nil;
+    static int sLoopRounds = 0;
+    sLoopRounds++;
+    BOOL keyChanged = ![sLastLoggedKey isEqualToString:key ?: @""];
+    if (keyChanged || sLoopRounds % 20 == 0) {
+        sLastLoggedKey = key ?: @"";
+        SLLog(@"feed 管线就绪 %@ (video=%@ audio=%@)%@", key ?: @"(nil)",
+              _videoOut ? @"Y" : @"N", _audioOut ? @"Y" : @"N",
+              keyChanged ? @"" : [NSString stringWithFormat:@" · 第 %d 轮", sLoopRounds]);
+    }
 }
 
 #pragma mark - 出帧

@@ -1,47 +1,49 @@
-## 这一版修了什么
+## 0.2.3 —— 音频探测版
 
-### 1. 「不黑屏，但也没替换成功」
+画面替换已经确认可用（陌陌真机：`自洽=Y`，打包零失败）。这一版不碰画面逻辑，
+只做两件事：**把音频为什么没被拦查清楚**，以及**把日志降噪**。
 
-上一版日志里每帧都在刷：
+### 日志里发现的两件事
+
+**1. 只挂上了 1 个方法，而且是 `AVCaptureVideoDataOutput` 自己的**
 
 ```
-注入: CMSampleBuffer 构造失败（fmt 与帧不匹配）
-feed 管线就绪 1111970369:1080x1920 (video=Y audio=N)
+hook -[AVCaptureVideoDataOutput _processSampleBuffer:] types=v24@0:8^{opaqueCMSampleBuffer=}16
+注入: 共 hook 1 个方法
 ```
 
-`1111970369` 就是 `BGRA`。也就是说假帧解出来了、格式也对，**卡在最后一步打包**：
-`CMSampleBufferCreateReadyWithImageBuffer` 会先跑一次
-`CMVideoFormatDescriptionMatchesImageBuffer`，要求格式描述（fmt）的像素格式、
-宽高、平面性与 pixelBuffer **三项全等**，差一项就返回错误。
+也就是说 `AVCaptureOutput` 基类上并没有这个方法，音频输出类也没有自己的同名方法。
+**音频这条路目前完全没有被拦**（日志里从来没有出现过「首帧 音频」）。素材带音轨也换不了声。
 
-问题在于 fmt 是宿主的，帧是我们自己造的。iOS 17 起 `AVCaptureConnection` 的旋转
-会直接作用到 `VideoDataOutput` 的 buffer 上——buffer 变成竖的 `1080x1920`，
-而 fmt 还留着传感器尺寸 `1920x1080`。拿这种 fmt 去包任何帧都不可能过。
+**2. 上一版的归因错了一半**
 
-**改法：**
+```
+首帧 视频 1080x1920 pf=1111970369(BGRA) · fmt 1080x1920 BGRA · 自洽=Y
+```
 
-- 先用 `CMVideoFormatDescriptionMatchesImageBuffer` 判断宿主 fmt 与它**自己的** buffer 是否自洽；
-- 假帧与 fmt 不匹配时，用 `CMVideoFormatDescriptionCreateForImageBuffer` 从假帧自建一个 fmt（保证内部自洽）再打包；
-- `duration` 改成用 `CMTIME_IS_VALID` + `CMTimeCompare` 判，`indefinite` 的时长同样会让打包以
-  `InvalidSampleTimingInfo` 失败，症状和格式错一模一样；
-- 失败日志现在打印**真实 OSStatus** + fmt 与帧各自的格式尺寸，不再是一句笼统的「不匹配」。
+`自洽=Y` 说明宿主自己的 fmt 和 buffer 完全一致——**「旋转导致 fmt 与 buffer 尺寸不符」
+这个推测对陌陌不成立**。真正让打包失败的是时间戳：采集帧的 `duration` 不是
+`kCMTimeInvalid`（旧代码拦得住）而是「有效位为真、但不是正常数值」的形态，
+旧代码的 `CMTIME_IS_INVALID` 判不出来，`CMSampleBufferCreateReady` 就报
+`InvalidSampleTimingInfo`。这一版会把**原始的 duration/dts 打出来**，下次就能坐实。
 
-### 2. 新增：画面旋转
+### 这一版新增的诊断
 
-设置 → 画面 → **画面旋转**，可选 不旋转 / 顺时针 90° / 180° / 270°。
+- `探测: AVCaptureAudioDataOutput → ...`：列出音频输出类上所有名字带 sample/buffer 的方法
+- `会话加输出: <类名>`：App 往 `AVCaptureSession` 里加了哪些输出（看音频到底走哪条路）
+- `注入: 真帧 duration 非法（value=... scale=... flags=...）`：时间戳归一化时记下原值
+- 扫描挂点从「名字含 processSampleBuffer」放宽到「名字含 samplebuffer」，
+  但**只挂 `void` + 单个指针参数**的方法——签名不符的会打印「跳过」而不是硬挂
+  （硬挂会把多余参数丢掉，宿主当场行为异常）
 
-渲染同时从「拉伸」改成「铺满取景框 + 居中裁切」，竖屏素材塞进横屏预览不会再被压扁。
+### 顺手降噪
 
-### 3. 新增：音频开关
+`feed 管线就绪` 不再每轮循环都刷（11 秒一条 → 只在首次/格式变化/每 20 轮打一次）。
 
-设置 → 声音 → **替换音频**。
+### 下一步
 
-- 开：用素材音轨替换麦克风（默认）；
-- 关：**输出静音**，不会把环境声录进去。素材本身没有音轨时同样生效。
-
-### 4. 顺手修的
-
-切循环/镜像/旋转/音频开关不再让画面跳回第一帧（以前每次改动都会 `rewind`）。
+把这一版装上跑一次，日志里那三行探测结果发我，就能确定音频该挂哪个方法，
+然后 0.2.4 把「带语音」补齐。
 
 ## 装法
 
@@ -49,15 +51,4 @@ feed 管线就绪 1111970369:1080x1920 (video=Y audio=N)
 越狱环境直接装 `ShenglinVcam-v*.deb`。
 
 > 本包与底包（声临）**包名和 dylib 名完全一致**，装这个会把底包覆盖掉。
-> 两个都要用的话别同时装，等我做改名共存版。
-
-## 验证要点
-
-换素材后打开相机，日志里应该看到：
-
-```
-首帧 视频 1080x1920 pf=1111970369(BGRA) · fmt 1920x1080 BGRA · 自洽=N
-```
-
-`自洽=N` 说明宿主自己的 fmt 和 buffer 就对不上，这正是这一版要兜的情况。
-只要之后**不再出现**「打包失败」，就说明假帧真的进到宿主了。
+> 两个都要用的话别同时装。

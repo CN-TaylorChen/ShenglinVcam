@@ -32,6 +32,7 @@ static BOOL sLoggedFirstAudio = NO;
 static int  sSLCamFailCount = 0;
 static int  sSLCamAudioFailCount = 0;
 static int  sSLCamBadPTS = 0;
+static int  sSLCamTimingFixLogged = 0;
 
 /// 四字符码转可读串（'BGRA' / '420f'），日志里比裸数字好认
 static NSString *SLFourCC(OSType v) {
@@ -114,9 +115,18 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
             // 但表现和格式错一模一样（每帧都失败）。采集帧的 duration 经常是 indefinite，
             // 光判 CMTIME_IS_INVALID 拦不住。
             if (!CMTIME_IS_VALID(timing.duration) || CMTimeCompare(timing.duration, kCMTimeZero) < 0) {
+                if (sSLCamTimingFixLogged++ == 0) {
+                    SLLog(@"注入: 真帧 duration 非法（value=%lld scale=%d flags=%u），已归一成 1/30",
+                          timing.duration.value, timing.duration.timescale, timing.duration.flags);
+                }
                 timing.duration = CMTimeMake(1, 30);
             }
             if (!CMTIME_IS_VALID(timing.decodeTimeStamp)) {
+                if (sSLCamTimingFixLogged++ == 0) {
+                    SLLog(@"注入: 真帧 dts 非法（value=%lld scale=%d flags=%u），已置为 invalid",
+                          timing.decodeTimeStamp.value, timing.decodeTimeStamp.timescale,
+                          timing.decodeTimeStamp.flags);
+                }
                 timing.decodeTimeStamp = kCMTimeInvalid;
             }
             if (!CMTIME_IS_VALID(timing.presentationTimeStamp)) {
@@ -239,11 +249,78 @@ static void SLCamHookMethod(Class owner, Method m) {
     method_setImplementation(m, (IMP)SLCamProcessSampleBuffer);
 }
 
+/// 只挂「void + 一个指针参数」的方法。
+///
+/// 名字带 SampleBuffer 不代表签名就是 (self, _cmd, CMSampleBufferRef)，
+/// 万一挂到带 connection 之类的多参方法上，我们的实现会把后面的参数整个丢掉，
+/// 宿主当场行为异常。宁可漏挂，不可挂错。
+static BOOL SLCamIsSinglePointerArgMethod(Method m) {
+    if (method_getNumberOfArguments(m) != 3) return NO;
+
+    char ret[16] = {0};
+    method_getReturnType(m, ret, sizeof(ret));
+    if (ret[0] != 'v') return NO;
+
+    char arg[16] = {0};
+    method_getArgumentType(m, 2, arg, sizeof(arg));
+    return arg[0] == '^';
+}
+
+/// 把某个类（含父类）上「像采样缓冲」的方法名列出来，只记日志不挂。
+/// 音频输出在各系统版本上的私有方法名不一样，靠这个先看清再动手。
+static void SLCamDumpCandidates(const char *className) {
+    Class cls = objc_getClass(className);
+    if (!cls) {
+        SLLog(@"探测: %s 不存在", className);
+        return;
+    }
+    NSMutableArray<NSString *> *hits = [NSMutableArray array];
+    for (Class c = cls; c; c = class_getSuperclass(c)) {
+        unsigned int n = 0;
+        Method *list = class_copyMethodList(c, &n);
+        for (unsigned i = 0; i < n; i++) {
+            NSString *name = @(sel_getName(method_getName(list[i])));
+            NSString *low = name.lowercaseString;
+            if (![low containsString:@"sample"] && ![low containsString:@"buffer"]) continue;
+            [hits addObject:[NSString stringWithFormat:@"%s.%@", class_getName(c), name]];
+        }
+        free(list);
+    }
+    SLLog(@"探测: %s → %@", className,
+          hits.count ? [hits componentsJoinedByString:@", "] : @"(无)");
+}
+
+#pragma mark - 会话输出探测
+
+// App 到底往会话里加了哪些输出？音频是不是走 AVCaptureAudioDataOutput，
+// 直接看这个就知道，比猜私有方法名靠谱。
+typedef void (*SLAddOutputFn)(id, SEL, id);
+static IMP gSLAddOutputOrig = NULL;
+
+static void SLCamAddOutput(id self, SEL _cmd, id output) {
+    if (output) {
+        SLLog(@"会话加输出: %s", class_getName([output class]));
+    }
+    if (gSLAddOutputOrig) {
+        ((SLAddOutputFn)gSLAddOutputOrig)(self, _cmd, output);
+    }
+}
+
+static void SLCamHookSessionOutputs(void) {
+    Class cls = objc_getClass("AVCaptureSession");
+    if (!cls) return;
+    Method m = class_getInstanceMethod(cls, @selector(addOutput:));
+    if (!m) return;
+    if (gSLAddOutputOrig) return;
+    gSLAddOutputOrig = method_getImplementation(m);
+    method_setImplementation(m, (IMP)SLCamAddOutput);
+}
+
 void SLCamInstallHooks(void) {
     if (sSLCamHooksInstalled) return;
     sSLCamHooksInstalled = YES;
 
-    // 不写死 selector：这几个类及其父类上凡是名字带 processSampleBuffer 的都挂上
+    // 不写死 selector：这几个类及其父类上凡是名字带 samplebuffer 的都挂上
     NSArray<NSString *> *classNames = @[
         @"AVCaptureVideoDataOutput",
         @"AVCaptureAudioDataOutput",
@@ -259,13 +336,24 @@ void SLCamInstallHooks(void) {
             unsigned int n = 0;
             Method *list = class_copyMethodList(c, &n);
             for (unsigned i = 0; i < n; i++) {
-                NSString *name = @(sel_getName(method_getName(list[i])));
-                if (![name containsString:@"processSampleBuffer"]) continue;
+                NSString *name = @(sel_getName(method_getName(list[i]))).lowercaseString;
+                if (![name containsString:@"samplebuffer"]) continue;
+                if (!SLCamIsSinglePointerArgMethod(list[i])) {
+                    SLLog(@"跳过 -[%s %s]：签名不是单指针参数，挂了会丢参",
+                          class_getName(c), sel_getName(method_getName(list[i])));
+                    continue;
+                }
                 SLCamHookMethod(c, list[i]);
             }
             free(list);
         }
     }
+
+    // 音频在各系统版本上未必走 AVCaptureAudioDataOutput，先把候选方法名和
+    // 会话里实际加了哪些输出打出来，下次日志就能定位
+    SLCamDumpCandidates("AVCaptureAudioDataOutput");
+    SLCamDumpCandidates("AVCaptureAudioPreviewOutput");
+    SLCamHookSessionOutputs();
 
     if (sSLCamHookCount == 0) {
         SLLog(@"注入: 没找到 _processSampleBuffer: —— 该系统版本可能改了私有 API，"
