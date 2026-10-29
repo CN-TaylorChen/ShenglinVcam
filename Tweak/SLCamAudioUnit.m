@@ -28,6 +28,22 @@ static BOOL gSLReplacedLogged = NO;
 static BOOL gSLAQProbeLogged = NO;
 static int  gSLReplaceCount = 0;
 
+// ---- 0.2.6 诊断计数 ----
+// 这段代码里每一道提前返回都是静默的，日志上「hook 没被调用」和「被某道门挡掉」
+// 长得一模一样。下面这些标志让每道门第一次拒绝时留一行痕，之后不再刷屏。
+static int  sCalls = 0;         // AudioUnitRender 被调用总次数
+static int  sBus1Calls = 0;     // 其中 bus=1（输入方向）的次数
+static BOOL sLoggedEntry = NO;
+static BOOL sLoggedBus1 = NO;
+static BOOL sLoggedRenderFail = NO;
+static BOOL sLoggedNotInjecting = NO;
+static BOOL sLoggedYieldAVCap = NO;
+static BOOL sLoggedCacheFull = NO;
+static BOOL sLoggedNotInput = NO;
+static BOOL sLoggedNoASBD = NO;
+static BOOL sLoggedNotPCM = NO;
+static int  sAddOutputLogs = 0;
+
 #pragma mark - 每个 AudioUnit 的属性缓存
 
 // 采集回调每 10ms 就要跑一次，不能每次都去 AudioUnitGetProperty（那是加锁的）。
@@ -86,21 +102,88 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
     // 先让宿主把麦克风数据拿到手，再就地替换 —— 这样无论它怎么处理
     // 时间戳、错误码、静音标志，我们都不改变行为，只换内容。
     OSStatus st = orig(unit, flags, ts, bus, frames, ioData);
-    if (st != noErr || !ioData || ioData->mNumberBuffers == 0) return st;
+
+    // ---- 诊断：先证明「这个 hook 到底有没有被调用」 ----
+    sCalls++;
+    if (bus == 1) sBus1Calls++;
+
+    if (!sLoggedEntry) {
+        sLoggedEntry = YES;
+        SLLog(@"音频: AudioUnitRender 首次被调用 bus=%u frames=%u bufs=%u st=%d",
+              (unsigned)bus, (unsigned)frames,
+              ioData ? (unsigned)ioData->mNumberBuffers : 0, (int)st);
+    }
+    if (bus == 1 && !sLoggedBus1) {
+        sLoggedBus1 = YES;
+        SLLog(@"音频: 首次出现 bus=1 输入调用 frames=%u bufs=%u st=%d",
+              (unsigned)frames,
+              ioData ? (unsigned)ioData->mNumberBuffers : 0, (int)st);
+    }
+    if (sCalls % 3000 == 0) {
+        SLLog(@"音频: 心跳 调用 %d 次 / bus=1 %d 次", sCalls, sBus1Calls);
+    }
+
+    if (st != noErr || !ioData || ioData->mNumberBuffers == 0) {
+        if (!sLoggedRenderFail) {
+            sLoggedRenderFail = YES;
+            SLLog(@"音频: 放行 —— 宿主渲染没成功 st=%d bufs=%u", (int)st,
+                  ioData ? (unsigned)ioData->mNumberBuffers : 0);
+        }
+        return st;
+    }
 
     // 输入元素固定是 bus 1（RemoteIO / VoiceProcessingIO 都一样）。
     // bus 0 是播放方向，绝对不能碰，否则会把对方的声音也改掉。
     if (bus != 1) return st;
 
-    if (!SLCamInjecting()) return st;
+    if (!SLCamInjecting()) {
+        if (!sLoggedNotInjecting) {
+            sLoggedNotInjecting = YES;
+            SLLog(@"音频: 跳过 —— 当前没开启替换");
+        }
+        return st;
+    }
 
     // 宿主音频已经走 AVCapture 了（比如陌陌），这条链路必须让路
-    if (SLCamAVCaptureAudioSeen()) return st;
+    if (SLCamAVCaptureAudioSeen()) {
+        if (!sLoggedYieldAVCap) {
+            sLoggedYieldAVCap = YES;
+            SLLog(@"音频: 让路 —— 宿主音频走 AVCapture，交给那条链路");
+        }
+        return st;
+    }
 
     BOOL isNew = NO;
     SLUnitCache *c = SLCacheFor(unit, bus, &isNew);
-    if (!c || !c->isInput || !c->hasASBD) return st;
-    if (c->asbd.mFormatID != kAudioFormatLinearPCM || c->asbd.mBytesPerFrame == 0) return st;
+    if (!c) {
+        if (!sLoggedCacheFull) {
+            sLoggedCacheFull = YES;
+            SLLog(@"音频: 跳过 —— unit 缓存已满（上限 %d）", SL_UNIT_CACHE);
+        }
+        return st;
+    }
+    if (!c->isInput) {
+        if (!sLoggedNotInput) {
+            sLoggedNotInput = YES;
+            SLLog(@"音频: 跳过 —— 这个 unit 的输入元素没开，不是麦克风采集");
+        }
+        return st;
+    }
+    if (!c->hasASBD) {
+        if (!sLoggedNoASBD) {
+            sLoggedNoASBD = YES;
+            SLLog(@"音频: 跳过 —— 拿不到输入格式（StreamFormat 查询失败）");
+        }
+        return st;
+    }
+    if (c->asbd.mFormatID != kAudioFormatLinearPCM || c->asbd.mBytesPerFrame == 0) {
+        if (!sLoggedNotPCM) {
+            sLoggedNotPCM = YES;
+            SLLog(@"音频: 跳过 —— 输入不是线性 PCM（formatID=%u %uB/帧）",
+                  (unsigned)c->asbd.mFormatID, (unsigned)c->asbd.mBytesPerFrame);
+        }
+        return st;
+    }
 
     if (isNew) {
         SLLog(@"音频: AudioUnit 输入 %.0fHz %uch %uB/帧 交错=%@ flags=0x%x",
@@ -197,7 +280,17 @@ void SLCamInstallAudioUnitHook(void) {
     }
 
     // 已经装过：只补扫，把后加载的 SDK / 插件进程里新映射的镜像也覆盖到
-    if (gSLHooked) SLSymbolHookRescan();
+    if (gSLHooked) {
+        SLSymbolHookRescan();
+        // 会话开始装配输出时，正好是个观察点：此刻 AudioUnitRender 被调过几次。
+        // 全程都是 0，就说明宿主的麦克风压根不经过这个函数（调用点在系统框架内部，
+        // 或者走了 dlsym 动态解析）—— 指针表 hook 再怎么改也够不着。
+        if (sAddOutputLogs < 4) {
+            sAddOutputLogs++;
+            SLLog(@"音频: 会话加输出时 AudioUnitRender 累计调用 %d 次 / bus=1 %d 次",
+                  sCalls, sBus1Calls);
+        }
+    }
 }
 
 BOOL SLCamAudioUnitHooked(void) {

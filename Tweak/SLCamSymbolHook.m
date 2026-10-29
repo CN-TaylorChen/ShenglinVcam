@@ -15,6 +15,10 @@
 //    · 读指针槽前先用 vm_region 确认那块内存真的映射过且可读；
 //    · mprotect 失败就不写 —— 写只读页一样会崩。
 //
+//  0.2.6 加了诊断：命中要打镜像名，被认证 GOT 跳过的槽要单独计数。
+//  没有这两项，日志上分不清「镜像里没有这个槽」和「槽在 __auth_got 里被我们跳过」——
+//  而这两种情况的修法完全不同。
+//
 
 #import "SLCamSymbolHook.h"
 #import "SLLog.h"
@@ -82,7 +86,55 @@ static BOOL SLMakeWritable(void *addr, size_t len) {
     return kr == KERN_SUCCESS;
 }
 
-static int SLScanImage(const struct mach_header_64 *hdr) {
+/// 这个指针表 section 有多少个槽（已按间接符号表长度裁过）。
+static uint32_t SLSectionSlotCount(const struct section_64 *sect,
+                                   const struct dysymtab_command *dysymtab) {
+    if (sect->size < sizeof(void *)) return 0;
+    if (sect->reserved1 == 0) return 0;
+    if (sect->reserved1 >= dysymtab->nindirectsyms) return 0;
+    uint32_t count = (uint32_t)(sect->size / sizeof(void *));
+    if (sect->reserved1 + count > dysymtab->nindirectsyms) {
+        count = dysymtab->nindirectsyms - sect->reserved1;
+    }
+    return count;
+}
+
+/// 把间接符号表里的下标翻成符号名（已去掉前导下划线）。
+/// remainOut 给出这条字符串在字符串表里还剩多少字节，供调用方做边界判断。
+static const char *SLNameAtIndex(uint32_t symIdx, const struct nlist_64 *syms,
+                                 const char *strtab, uint32_t strtabSize,
+                                 uint32_t nsyms, size_t *remainOut) {
+    if (symIdx == INDIRECT_SYMBOL_LOCAL || symIdx == INDIRECT_SYMBOL_ABS) return NULL;
+    if (symIdx >= nsyms) return NULL;
+
+    uint32_t strx = syms[symIdx].n_un.n_strx;
+    // n_strx 越界时 strtab + strx 落在 __LINKEDIT 外，读一下就崩
+    if (strx == 0 || strx >= strtabSize) return NULL;
+
+    const char *s = strtab + strx;
+    if (!*s) return NULL;
+
+    uint32_t off = 0;
+    if (s[0] == '_') { s++; off = 1; if (!*s) return NULL; }   // Mach-O 符号带前导下划线
+
+    if (remainOut) *remainOut = (size_t)(strtabSize - strx - off);
+    return s;
+}
+
+/// 这个名字是不是我们注册过的目标？是就返回下标。
+static int SLTargetIndexForName(const char *sname, size_t remain) {
+    if (!sname) return -1;
+    for (int t = 0; t < sTargetCount; t++) {
+        size_t need = strlen(sTargets[t].name);
+        // 剩余长度装不下名字（含结尾 NUL）就说明这条字符串不完整，别比
+        if (remain <= need) continue;
+        if (strcmp(sname, sTargets[t].name) == 0) return t;
+    }
+    return -1;
+}
+
+static int SLScanImage(const struct mach_header_64 *hdr, const char *imgName,
+                       int *authSkipped) {
     // ---- 第一遍：找 __TEXT 的 vmaddr、__LINKEDIT、符号表命令 ----
     const struct segment_command_64 *linkedit = NULL;
     const struct symtab_command *symtab = NULL;
@@ -153,14 +205,29 @@ static int SLScanImage(const struct mach_header_64 *hdr) {
         const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
         // arm64e 的认证指针（__AUTH / __AUTH_CONST）写入裸地址会被 PAC 校验拦下，
         // 直接崩。这类段整个跳过 —— 宁可漏挂，不能把宿主搞崩。
-        if (strstr(seg->segname, "AUTH") != NULL) continue;
+        // 但「本来能命中、却被跳过」的槽数必须记下来：不记的话，日志上
+        // 「镜像里没这个槽」和「槽在认证段里」长得一模一样，修法却完全不同。
+        BOOL isAuthSeg = (strstr(seg->segname, "AUTH") != NULL);
 
         const struct section_64 *sect = (const struct section_64 *)(seg + 1);
         for (uint32_t s = 0; s < seg->nsects; s++, sect++) {
             uint32_t type = sect->flags & SECTION_TYPE;
             if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
-            if (sect->size < sizeof(void *) || sect->reserved1 == 0) continue;
-            if (sect->reserved1 >= dysymtab->nindirectsyms) continue;
+
+            uint32_t count = SLSectionSlotCount(sect, dysymtab);
+            if (count == 0) continue;
+
+            if (isAuthSeg) {
+                // 只读符号表，一个字节都不碰指针槽本身
+                for (uint32_t k = 0; k < count; k++) {
+                    size_t remain = 0;
+                    const char *sname = SLNameAtIndex(indirect[sect->reserved1 + k],
+                                                      syms, strtab, strtabSize,
+                                                      symtab->nsyms, &remain);
+                    if (SLTargetIndexForName(sname, remain) >= 0) (*authSkipped)++;
+                }
+                continue;
+            }
 
             // sect->addr 必须落在本镜像的 VM 区间内。
             // 图片被裁过 / 结构损坏时这个字段可能是垃圾，落进堆里也照样「可读可写」，
@@ -168,57 +235,47 @@ static int SLScanImage(const struct mach_header_64 *hdr) {
             if ((uintptr_t)sect->addr < imgVMLo) continue;
             if ((uintptr_t)sect->addr + (uintptr_t)sect->size > imgVMHi) continue;
 
-            uint32_t count = (uint32_t)(sect->size / sizeof(void *));
-            if (sect->reserved1 + count > dysymtab->nindirectsyms) {
-                count = dysymtab->nindirectsyms - sect->reserved1;
-            }
-
             // 关键：用 VM 地址（sect->addr），不是文件偏移（sect->offset）
             void **slots = (void **)(imageBase + (uintptr_t)sect->addr);
             if (!SLRangeReadable(slots, (size_t)count * sizeof(void *))) continue;
 
             for (uint32_t k = 0; k < count; k++) {
-                uint32_t symIdx = indirect[sect->reserved1 + k];
-                if (symIdx == INDIRECT_SYMBOL_LOCAL || symIdx == INDIRECT_SYMBOL_ABS) continue;
-                if (symIdx >= symtab->nsyms) continue;
+                size_t remain = 0;
+                const char *sname = SLNameAtIndex(indirect[sect->reserved1 + k],
+                                                  syms, strtab, strtabSize,
+                                                  symtab->nsyms, &remain);
+                int t = SLTargetIndexForName(sname, remain);
+                if (t < 0) continue;
 
-                uint32_t strx = syms[symIdx].n_un.n_strx;
-                // n_strx 越界时 strtab + strx 落在 __LINKEDIT 外，读一下就崩
-                if (strx == 0 || strx >= strtabSize) continue;
+                void *curAddr = slots[k];
+                // 注意：这里到循环体末尾都用 continue，不能用 break ——
+                // 一个 section 里可能有多个我们要的符号，break 会漏掉后面的槽
+                if (!curAddr || curAddr == sTargets[t].replacement) continue;
 
-                const char *sname = strtab + strx;
-                if (!*sname) continue;
-                if (sname[0] == '_') { sname++; if (!*sname) continue; }   // Mach-O 符号带前导下划线
+                // 先把原函数地址交出去，再改槽 —— 顺序反了会出现
+                // 「已经走我们的实现，但 gOrig 还是 NULL」的窗口
+                BOOL tookOrig = NO;
+                if (!sTargets[t].original) {
+                    sTargets[t].original = curAddr;
+                    if (sTargets[t].originalOut) *sTargets[t].originalOut = curAddr;
+                    tookOrig = YES;
+                }
 
-                size_t remain = (size_t)(strtabSize - strx);
-
-                for (int t = 0; t < sTargetCount; t++) {
-                    size_t need = strlen(sTargets[t].name);
-                    // 剩余长度装不下名字（含结尾 NUL）就说明这条字符串不完整，别比
-                    if (remain <= need) continue;
-                    if (strcmp(sname, sTargets[t].name) != 0) continue;
-
-                    void *curAddr = slots[k];
-                    if (!curAddr || curAddr == sTargets[t].replacement) break;
-
-                    // 先把原函数地址交出去，再改槽 —— 顺序反了会出现
-                    // 「已经走我们的实现，但 gOrig 还是 NULL」的窗口
-                    if (!sTargets[t].original) {
-                        sTargets[t].original = curAddr;
-                        if (sTargets[t].originalOut) *sTargets[t].originalOut = curAddr;
-                    }
-
-                    if (!SLMakeWritable(&slots[k], sizeof(void *))) {
-                        // 只读页放不开就放弃，写下去就是闪退
+                if (!SLMakeWritable(&slots[k], sizeof(void *))) {
+                    // 只读页放不开就放弃，写下去就是闪退。
+                    // 只有「这个槽是原函数的来源」时才回收 —— 别的镜像已经成功挂上的话，
+                    // 把 original 清空会让我们的实现拿不到原函数，等于把宿主搞坏。
+                    if (tookOrig) {
                         if (sTargets[t].originalOut) *sTargets[t].originalOut = NULL;
                         sTargets[t].original = NULL;
-                        SLLog(@"符号: %s 的指针槽不可写，已放弃", sTargets[t].name);
-                        break;
                     }
-                    slots[k] = sTargets[t].replacement;
-                    hits++;
-                    break;
+                    SLLog(@"符号: %s 的指针槽不可写，已放弃（%s）", sTargets[t].name, imgName);
+                    continue;
                 }
+                slots[k] = sTargets[t].replacement;
+                hits++;
+                // 打镜像名：只命中 1 处时，得知道这 1 处在哪个二进制里
+                SLLog(@"符号: 命中 %s ← %s", sTargets[t].name, imgName);
             }
         }
     }
@@ -231,6 +288,7 @@ int SLSymbolHookRescan(void) {
     static int sLogCount = 0;
     int hits = 0;
     int scanned = 0;
+    int authSkipped = 0;
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const struct mach_header *h = _dyld_get_image_header(i);
@@ -241,12 +299,17 @@ int SLSymbolHookRescan(void) {
         const char *path = _dyld_get_image_name(i);
         if (!path || !strstr(path, ".app/")) continue;
 
+        const char *slash = strrchr(path, '/');
+        const char *base = slash ? slash + 1 : path;
+
         scanned++;
-        hits += SLScanImage((const struct mach_header_64 *)h);
+        hits += SLScanImage((const struct mach_header_64 *)h, base, &authSkipped);
     }
-    // 每次会话加输出都会补扫一次，别把日志刷满：命中必记，没命中只记前三次
-    if (hits > 0 || sLogCount++ < 3) {
-        SLLog(@"符号: 扫过 %d 个 App 镜像，命中 %d 处", scanned, hits);
+    // 每次会话加输出都会补扫一次，别把日志刷满：有命中/有认证槽跳过就必记，
+    // 什么都没有的只记前三次
+    if (hits > 0 || authSkipped > 0 || sLogCount++ < 3) {
+        SLLog(@"符号: 扫过 %d 个 App 镜像，命中 %d 处，认证 GOT 跳过 %d 处",
+              scanned, hits, authSkipped);
     }
     return hits;
 }

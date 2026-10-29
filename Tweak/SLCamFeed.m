@@ -323,6 +323,16 @@
     wantAudio = _hasAudioDstASBD;
     [_lock unlock];
 
+    // 每次换素材探一次音轨，单独打一行。
+    // 不这样的话，日志里 `(video=Y audio=N)` 会有歧义 —— 那个 N 只表示
+    // 「宿主还没来要音频」，跟素材有没有音轨是两回事。
+    static NSString *sLastAudioProbePath = nil;
+    if (![sLastAudioProbePath isEqualToString:path]) {
+        sLastAudioProbePath = path;
+        AVAssetTrack *probe = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+        SLLog(@"feed 素材音轨: %@（%@）", probe ? @"有" : @"无", path.lastPathComponent);
+    }
+
     AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
     if (vt) {
         NSDictionary *settings = @{ (id)kCVPixelBufferPixelFormatTypeKey : @(pf) };
