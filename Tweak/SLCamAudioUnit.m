@@ -151,9 +151,33 @@ static OSStatus SLCamAudioQueueNewInput(const AudioStreamBasicDescription *fmt,
 
 #pragma mark - 安装
 
+// 崩溃哨兵。
+// 扫符号表这一步是整个插件里唯一「可能把宿主搞死」的操作 —— 一旦算错地址就是
+// EXC_BAD_ACCESS，用户看到的就是「装了插件 App 打不开」。
+// 所以装之前先落一个哨兵文件，装完再撤掉；下次启动如果还看到它，
+// 说明上个进程正是死在这一步，那就这一次别装了 —— 画面链路走的是
+// method_setImplementation，跟这里无关，照常能用。
+// 用 tmp 目录：每个 App 各一份，重启设备也不影响。
+static NSString *const kSLSymHookGuard = @"shenglin_vcam_symhook.lock";
+
+static NSString *SLSymHookGuardPath(void) {
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:kSLSymHookGuard];
+}
+
 void SLCamInstallAudioUnitHook(void) {
     if (!gSLRegistered) {
         gSLRegistered = YES;
+
+        NSString *guard = SLSymHookGuardPath();
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        if ([fm fileExistsAtPath:guard]) {
+            [fm removeItemAtPath:guard error:NULL];
+            SLLog(@"守护: 上次启动在扫描符号表时崩溃过，本次跳过 C 函数 hook（画面不受影响）");
+            return;
+        }
+
+        [fm createFileAtPath:guard contents:[NSData data] attributes:nil];
 
         int hits = SLSymbolHook("AudioUnitRender", (void *)SLCamAudioUnitRender,
                                 (void **)&gSLRenderOrig);
@@ -166,6 +190,9 @@ void SLCamInstallAudioUnitHook(void) {
 
         SLSymbolHook("AudioQueueNewInput", (void *)SLCamAudioQueueNewInput,
                      (void **)&gSLAQOrig);
+
+        // 走完了，撤哨兵 —— 下次正常启动不该再看到它
+        [fm removeItemAtPath:guard error:NULL];
         return;
     }
 

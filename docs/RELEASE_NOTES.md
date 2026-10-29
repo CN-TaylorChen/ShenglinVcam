@@ -1,48 +1,76 @@
-## 0.2.4 —— 补上「不经过 AVCapture 的麦克风」
+## 0.2.5 —— 修「装上就闪退」，App 打不开了
 
-### 两份日志对比出来的结论
+### 症状
 
-| | 陌陌 | QQ |
-|---|---|---|
-| 音频输出 | `AVCaptureAudioDataOutput` | **没有** |
-| 会话里的输出 | Video + Audio | Video + StillImage + Metadata |
-| 音频是否被拦 | ✅ `_handleSampleBufferEventForSampleBuffer:` | ❌ 从来没有音频流过 |
-| 结果 | 能换、能静音 | 只能录入原声 |
+装 0.2.4 之后，陌陌和 QQ **启动即闪退**，连启动页都看不到。
+不是替换功能出问题，是 App 根本进不去。
 
-也就是说：**音频能不能换，取决于 App 用不用 `AVCaptureAudioDataOutput`。**
-陌陌用，所以 0.2.3 一挂就通；QQ 的语音走自己的音频栈（RTC SDK 那套），
-`AVCapture` 这条链路对它完全无效。
+### 根因：`section->offset` 是文件偏移，不是运行时偏移
 
-### 这一版新增：AudioUnit 链路
+0.2.4 为了接管 QQ 那种不走 `AVCapture` 的麦克风，自己写了个 fishhook 精简版，
+遍历已加载镜像的 `__la_symbol_ptr` / `__got` 找 `AudioUnitRender`。
+算指针槽地址时用的是：
 
-自签环境没有 CydiaSubstrate，`MSHookFunction` 用不了，所以自己实现了一个
-fishhook 精简版（`SLCamSymbolHook`）：遍历已加载镜像的
-`__la_symbol_ptr` / `__got`，按符号名把指针换成我们的实现。
-
-挂的是 `AudioUnitRender` —— 所有用 RemoteIO / VoiceProcessingIO 采麦克风的 App
-都要经过它：
-
-- **只处理输入元素（bus 1）**，而且该单元必须确实开了麦克风输入。
-  bus 0 是播放方向，碰一下就会把对方的声音也改掉。
-- **让路机制**：一旦发现宿主音频已经在走 AVCapture（`SLCamAVCaptureAudioSeen`），
-  AudioUnit 链路立刻退出。两条链路同时消费同一个 PCM 池，声音会被撕成两半。
-- 按 `(unit, bus)` 缓存格式与「是否输入」的判断，不在 10ms 的采集回调里反复查属性。
-- 先让宿主把数据拿到手，再就地覆盖内容 —— 时间戳、错误码、静音标志一概不动。
-
-顺带挂了 `AudioQueueNewInput` 的探针（**只记日志不接管**）。AudioQueue 是另一套
-回调机制，AudioUnitRender 覆盖不到；万一哪个 App 用它，日志里能直接看出来，
-不用再猜。
-
-### 装了之后看这几行
-
-```
-音频: AudioUnitRender 已接管（N 处符号槽）      ← 链路装上了
-音频: AudioUnit 输入 48000Hz 1ch 4B/帧 ...      ← 宿主的麦克风格式
-音频: 已接管 AudioUnit 麦克风输入                ← 真的替换进去了
-音频: 宿主使用 AudioQueue 录音（...）            ← 如果出现这行，说明还得再补一条链路
+```c
+void **slots = (void **)(base + sect->offset);   // ❌
 ```
 
-陌陌那边应该仍然只看到 AVCapture 那条（AudioUnit 会静默让路），属正常。
+`section->offset` 是**文件内偏移**。只有「本镜像的 fileoff 恰好等于 vmaddr」时
+它才等于运行时偏移 —— App 自己的主二进制满足这个条件，所以本地看着像没问题。
+
+但 `_dyld_image_count()` 返回的是**所有**已加载镜像，其中绝大多数是系统库。
+iOS 的系统库全在 dyld 共享缓存里，fileoff 和运行时布局毫无关系。
+照这个公式算出来的指针是野指针，`slots[k]` 一读就是 `EXC_BAD_ACCESS`，
+而这段代码跑在 `%ctor`（dylib 加载时），所以是**启动即崩**。
+
+### 修法
+
+```c
+uintptr_t imageBase = (uintptr_t)hdr - textVM;      // textVM = __TEXT.vmaddr
+void **slots = (void **)(imageBase + sect->addr);   // ✅ VM 地址
+```
+
+`__LINKEDIT` 里的 `symoff` / `stroff` / `indirectsymoff` 同样是文件偏移，
+换成运行时地址要 `linkBase + (off - linkedit->fileoff)`。
+
+顺带补了五道防线，每一道都是「宁可漏挂，不能把宿主搞崩」：
+
+| 防线 | 拦的是什么 |
+|---|---|
+| 只扫路径含 `.app/` 的镜像 | 系统库在 dyld 共享缓存里，碰它必崩 |
+| 跳过 `__AUTH` / `__AUTH_CONST` 段 | arm64e PAC 认证指针，写裸地址会被校验拦下 |
+| `sect->addr` 必须落在本镜像 VM 区间内 | 结构损坏时字段是垃圾，落进堆里也「可读可写」，光查可读性拦不住 |
+| `SLRangeReadable()` 首尾各查一次 `vm_region` | 区间跨页跨 region 时单点查询会漏判 |
+| `n_strx` / `reserved1 + count` 越界检查 | 字符串表、间接符号表读越界 |
+| `vm_protect` 失败就放弃写入 | 只读页写下去一样崩 |
+
+### 再加一道「崩溃哨兵」
+
+万一以后还有别的地方算错，绝不能再让用户面对「App 打不开、只能卸载」。
+
+装符号钩子之前先往 App 的 tmp 目录落一个哨兵文件，装完立刻撤掉：
+
+```
+正常启动：  落哨兵 → 装钩子 → 撤哨兵
+崩在这里：  落哨兵 → 装钩子 → 💥（哨兵留在磁盘上）
+下次启动：  看到哨兵 → 本次不装 C 函数 hook → App 正常打开
+```
+
+画面替换走的是 `method_setImplementation`，跟符号扫描无关，**照常工作**。
+日志里会有一行：
+
+```
+守护: 上次启动在扫描符号表时崩溃过，本次跳过 C 函数 hook（画面不受影响）
+```
+
+看到这行就说明踩到兜底了，把日志发我，我再修真正的原因。
+
+### 这一版能用的功能
+
+- 视频替换：正常（陌陌已验证）
+- 音频替换 / 静音：陌陌正常；QQ 待验证 —— 装好 0.2.5 后开一次语音，
+  看日志有没有 `音频: 已接管 AudioUnit 麦克风输入`
+- 旋转（0/90/180/270）、镜像、循环、音频开关：都在设置里
 
 ## 装法
 
