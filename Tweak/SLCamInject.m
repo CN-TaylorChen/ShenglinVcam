@@ -14,22 +14,42 @@
 
 typedef void (*SLProcessSampleBufferFn)(id, SEL, CMSampleBufferRef);
 
-static NSMapTable<NSValue *, NSValue *> *gSLOrigIMPs = nil;
+// 原始 IMP 用固定数组存，按 Method 指针线性比对。
+//
+// 别用 NSMapTable + NSPointerFunctionsOpaqueMemory 存这个：那套 key 语义是「裸指针」，
+// 每次查询都新建一个 NSValue 对象、地址不同，永远查不到 —— 查不到就会把原始实现整个
+// 跳过，表现为「Hook 装上了、日志也对、但摄像头全黑」。Method 数量个位数，线性扫足够。
+#define SL_MAX_HOOKS 8
+static Method gSLHookMethods[SL_MAX_HOOKS];
+static IMP    gSLHookIMPs[SL_MAX_HOOKS];
+
 static BOOL sSLCamInjecting = NO;
 static BOOL sSLCamHooksInstalled = NO;
-static int sSLCamHookCount = 0;
+static int  sSLCamHookCount = 0;
+static BOOL sLoggedMissingOrig = NO;
+static BOOL sLoggedFirstVideo = NO;
+static BOOL sLoggedFirstAudio = NO;
 
 /// 音视频输出可能各自重写了 _processSampleBuffer:，必须按 Method 分别保存原始 IMP，
 /// 否则音频会走到视频的原始实现上去（表现为只有画面变、声音还在）。
 static IMP SLCamOriginalIMP(id self, SEL _cmd) {
     Method m = class_getInstanceMethod([self class], _cmd);
     if (!m) return NULL;
-    NSValue *v = [gSLOrigIMPs objectForKey:[NSValue valueWithPointer:m]];
-    return v ? (IMP)[v pointerValue] : NULL;
+    for (int i = 0; i < sSLCamHookCount; i++) {
+        if (gSLHookMethods[i] == m) return gSLHookIMPs[i];
+    }
+    if (!sLoggedMissingOrig) {
+        sLoggedMissingOrig = YES;
+        SLLog(@"注入: 找不到 %s 的原始 IMP，将原样放行", sel_getName(_cmd));
+    }
+    return NULL;
 }
 
 static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) {
     IMP orig = SLCamOriginalIMP(self, _cmd);
+
+    // 拿不到原始实现只能放弃（SLCamOriginalIMP 里已记日志）。这种情况只会在
+    // hook 表被破坏时出现 —— 正常情况下查表是纯指针比对，不会失手。
     if (!orig) return;
 
     SLCamFeed *feed = [SLCamFeed shared];
@@ -52,6 +72,11 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
             CGSize size = CGSizeMake((CGFloat)CVPixelBufferGetWidth(img),
                                      (CGFloat)CVPixelBufferGetHeight(img));
 
+            if (!sLoggedFirstVideo) {
+                sLoggedFirstVideo = YES;
+                SLLog(@"首帧 视频 %zux%zu pf=%u", (size_t)size.width, (size_t)size.height, (unsigned)pf);
+            }
+
             CMSampleTimingInfo timing = {0};
             timing.presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(sbuf);
             timing.decodeTimeStamp       = CMSampleBufferGetDecodeTimeStamp(sbuf);
@@ -61,6 +86,7 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
             CVPixelBufferRef frame = [feed copyFrameForPixelFormat:pf size:size];
             if (frame) {
                 if (CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, frame, fmt, &timing, &fake) != noErr) {
+                    SLLog(@"注入: CMSampleBuffer 构造失败（fmt 与帧不匹配）");
                     fake = NULL;
                 }
                 CVPixelBufferRelease(frame);
@@ -73,6 +99,13 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
             CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sbuf);
             size_t len = bb ? CMBlockBufferGetDataLength(bb) : 0;
 
+            if (!sLoggedFirstAudio) {
+                sLoggedFirstAudio = YES;
+                SLLog(@"首帧 音频 %.0fHz %uch %uB/帧 len=%zu",
+                      asbd ? asbd->mSampleRate : 0,
+                      asbd ? (unsigned)asbd->mChannelsPerFrame : 0,
+                      asbd ? (unsigned)asbd->mBytesPerFrame : 0, len);
+            }
             if (asbd && asbd->mBytesPerFrame > 0 && len > 0) {
                 NSData *pcm = [feed audioForFormat:asbd numBytes:len];
                 if (pcm.length == len) {
@@ -107,15 +140,18 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
 }
 
 static void SLCamHookMethod(Class owner, Method m) {
-    if (!m || !gSLOrigIMPs) return;
+    if (!m) return;
+    if (sSLCamHookCount >= SL_MAX_HOOKS) return;
 
-    NSValue *key = [NSValue valueWithPointer:m];
-    if ([gSLOrigIMPs objectForKey:key]) return;          // 已经 hook 过
+    for (int i = 0; i < sSLCamHookCount; i++) {
+        if (gSLHookMethods[i] == m) return;              // 已经 hook 过
+    }
 
     IMP old = method_getImplementation(m);
     if (old == (IMP)SLCamProcessSampleBuffer) return;
 
-    [gSLOrigIMPs setObject:[NSValue valueWithPointer:old] forKey:key];
+    gSLHookMethods[sSLCamHookCount] = m;
+    gSLHookIMPs[sSLCamHookCount] = old;
     sSLCamHookCount++;
 
     SLLog(@"hook -[%s %s] types=%s", class_getName(owner),
@@ -127,9 +163,6 @@ static void SLCamHookMethod(Class owner, Method m) {
 void SLCamInstallHooks(void) {
     if (sSLCamHooksInstalled) return;
     sSLCamHooksInstalled = YES;
-
-    gSLOrigIMPs = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsOpaqueMemory
-                                        valueOptions:NSPointerFunctionsOpaqueMemory];
 
     // 不写死 selector：这几个类及其父类上凡是名字带 processSampleBuffer 的都挂上
     NSArray<NSString *> *classNames = @[
