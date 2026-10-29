@@ -35,6 +35,8 @@ static int  sSLCamFailCount = 0;
 static int  sSLCamAudioFailCount = 0;
 static int  sSLCamBadPTS = 0;
 static int  sSLCamTimingFixLogged = 0;
+static int  sSLCamOwnFmtLogged = 0;
+static int  sSLCamDTSFixLogged = 0;
 
 /// 四字符码转可读串（'BGRA' / '420f'），日志里比裸数字好认
 static NSString *SLFourCC(OSType v) {
@@ -124,7 +126,7 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
                 timing.duration = CMTimeMake(1, 30);
             }
             if (!CMTIME_IS_VALID(timing.decodeTimeStamp)) {
-                if (sSLCamTimingFixLogged++ == 0) {
+                if (sSLCamDTSFixLogged++ == 0) {
                     SLLog(@"注入: 真帧 dts 非法（value=%lld scale=%d flags=%u），已置为 invalid",
                           timing.decodeTimeStamp.value, timing.decodeTimeStamp.timescale,
                           timing.decodeTimeStamp.flags);
@@ -149,6 +151,14 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
                     if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &ownFmt) == noErr
                         && ownFmt) {
                         useFmt = ownFmt;
+                        if (sSLCamOwnFmtLogged++ == 0) {
+                            CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions((CMVideoFormatDescriptionRef)fmt);
+                            SLLog(@"注入: 假帧与宿主 fmt 不匹配，已自建 fmt（帧 %ux%u %@ / fmt %dx%d %@）",
+                                  (unsigned)CVPixelBufferGetWidth(frame),
+                                  (unsigned)CVPixelBufferGetHeight(frame),
+                                  SLFourCC(CVPixelBufferGetPixelFormatType(frame)),
+                                  d.width, d.height, SLFourCC(CMFormatDescriptionGetMediaSubType(fmt)));
+                        }
                     }
                 }
 
