@@ -54,13 +54,15 @@ jobs:
           VER=$(grep '^Version:' control | awk '{print $2}' | tr -d '\r')
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
           echo "name=ShenglinVcam-v${VER}" >> "$GITHUB_OUTPUT"
+          # 交付件一律带版本号：手上同时留好几个版本时，靠文件名就能分清
+          cp -f ShenglinVcam.dylib "ShenglinVcam-v${VER}.dylib"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.art.outputs.name }}
           path: |
-            ShenglinVcam.dylib
+            ShenglinVcam-v*.dylib
             ShenglinVcam.plist
             ShenglinVcam-v*.deb
 
@@ -73,6 +75,6 @@ jobs:
           name: ShenglinVcam ${{ steps.art.outputs.ver }}
           body_path: docs/RELEASE_NOTES.md
           files: |
-            ShenglinVcam.dylib
+            ShenglinVcam-v${{ steps.art.outputs.ver }}.dylib
             ShenglinVcam-v${{ steps.art.outputs.ver }}.deb
           fail_on_unmatched_files: true

@@ -46,8 +46,8 @@ fishhook 精简版（`SLCamSymbolHook`）：遍历已加载镜像的
 
 ## 装法
 
-自签注入：把 `ShenglinVcam.dylib` 注入目标 App 的 IPA 后重签安装。
-越狱环境直接装 `ShenglinVcam-v*.deb`。
+自签注入：把 `ShenglinVcam-v<版本>.dylib` 注入目标 App 的 IPA 后重签安装。
+越狱环境直接装 `ShenglinVcam-v<版本>.deb`。
 
 > 本包与底包（声临）**包名和 dylib 名完全一致**，装这个会把底包覆盖掉。
 > 两个都要用的话别同时装。
