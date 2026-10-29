@@ -1,0 +1,48 @@
+name: Build ShenglinVcam
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Precheck (lint, fails fast before downloading Theos)
+        run: python3 precheck.py --skip-version
+
+      - name: Set up Theos
+        uses: Randomblock1/theos-action@v1
+        with:
+          theos-sdks: 'https://github.com/theos/sdks'
+          theos-sdks-branch: 'master'
+
+      - name: Build dylib
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: make
+
+      - name: Package deb
+        run: |
+          VER=$(grep '^Version:' control | awk '{print $2}' | tr -d '\r')
+          python3 make_deb.py --control control \
+            --dylib ShenglinVcam.dylib --plist ShenglinVcam.plist \
+            --dylib-name ShenglinVcam.dylib \
+            --out "ShenglinVcam-v${VER}.deb"
+
+      - name: Resolve artifact name
+        id: art
+        run: echo "name=ShenglinVcam-v$(grep '^Version:' control | awk '{print $2}' | tr -d '\r')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.art.outputs.name }}
+          path: |
+            ShenglinVcam.dylib
+            ShenglinVcam.plist
+            ShenglinVcam-v*.deb
