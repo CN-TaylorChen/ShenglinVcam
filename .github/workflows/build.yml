@@ -24,7 +24,17 @@ jobs:
       - name: Build dylib
         env:
           THEOS: ${{ github.workspace }}/theos
-        run: make
+        run: |
+          set -o pipefail
+          make 2>&1 | tee build.log
+
+      # 失败时把日志回传到 commit comment —— Actions 日志接口要鉴权，
+      # 公开可读的 commit comment 是唯一能匿名取到的通道
+      - name: Report build log on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh tools/ci_report.sh
 
       - name: Package deb
         run: |
