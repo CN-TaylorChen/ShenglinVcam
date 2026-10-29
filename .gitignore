@@ -1,0 +1,12 @@
+# 构建产物
+*.dylib
+*.deb
+deliveries/
+.theos/
+obj/
+_build/
+
+# 本地临时
+_tmp*/
+*.bak
+.DS_Store
