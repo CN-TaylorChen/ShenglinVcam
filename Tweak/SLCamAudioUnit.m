@@ -39,7 +39,6 @@ static BOOL sLoggedRenderFail = NO;
 static BOOL sLoggedNotInjecting = NO;
 static BOOL sLoggedYieldAVCap = NO;
 static BOOL sLoggedCacheFull = NO;
-static BOOL sLoggedNotInput = NO;
 static BOOL sLoggedNoASBD = NO;
 static BOOL sLoggedNotPCM = NO;
 static int  sAddOutputLogs = 0;
@@ -48,17 +47,50 @@ static int  sAddOutputLogs = 0;
 
 // 采集回调每 10ms 就要跑一次，不能每次都去 AudioUnitGetProperty（那是加锁的）。
 // 按 (unit, bus) 缓存一次查询结果即可。
+//
+// 0.2.7 的教训：以前把 EnableIO 当硬门用 —— 查不到就整条链路放行。
+// 可这个查询有两个坑：① 返回错误和返回 enabled=0 在我们这边长得一样；
+// ② 首次 bus=1 调用恰好是麦克风 unit 刚启动的时刻，属性查不到很正常，
+// 而这个否定结果被永久缓存了，后面几千次调用再也翻不了身。
+// 现在 EnableIO 只作参考信息，真正的判据是「bus==1 且能拿到有效的 PCM 格式」。
 typedef struct {
     AudioUnit unit;
     UInt32 bus;
-    BOOL isInput;
+    OSStatus enableSt;         // EnableIO 查询返回码
+    UInt32 enableVal;          // EnableIO 查询值
     BOOL hasASBD;
+    OSStatus asbdSt;           // StreamFormat 查询返回码
+    int  attempts;             // ASBD 失败次数
+    int  calls;                // 这条缓存被命中的次数（用于周期性补试）
+    BOOL logged;               // 「unit 就绪」这行只打一次
     AudioStreamBasicDescription asbd;
 } SLUnitCache;
 
 #define SL_UNIT_CACHE 8
+#define SL_ASBD_MAX_TRIES 200
+
 static SLUnitCache sUnitCache[SL_UNIT_CACHE];
 static int sUnitCacheCount = 0;
+
+/// 查一次 StreamFormat。失败不缓存否定结论 —— unit 可能还没初始化完，下次再来。
+static void SLTryASBD(SLUnitCache *c) {
+    if (c->hasASBD) return;
+
+    AudioStreamBasicDescription a;
+    memset(&a, 0, sizeof(a));
+    UInt32 sz = sizeof(a);
+    OSStatus st = AudioUnitGetProperty(c->unit, kAudioUnitProperty_StreamFormat,
+                                       kAudioUnitScope_Output, c->bus, &a, &sz);
+    c->asbdSt = st;
+
+    // 格式字段必须自洽，全零的 ASBD 当失败处理，否则后面算字节数会出错
+    if (st == noErr && a.mSampleRate > 0 && a.mChannelsPerFrame > 0 && a.mBytesPerFrame > 0) {
+        c->asbd = a;
+        c->hasASBD = YES;
+    } else {
+        c->attempts++;
+    }
+}
 
 static SLUnitCache *SLCacheFor(AudioUnit unit, UInt32 bus, BOOL *isNew) {
     if (isNew) *isNew = NO;
@@ -71,20 +103,20 @@ static SLUnitCache *SLCacheFor(AudioUnit unit, UInt32 bus, BOOL *isNew) {
     memset(c, 0, sizeof(*c));
     c->unit = unit;
     c->bus = bus;
+    c->enableSt = -1;
+    c->asbdSt = -1;
 
-    // 是不是「开了麦克风输入的输出单元」？不是就直接判定为非输入，后面全部跳过
+    // EnableIO 只查一次、只用来解释日志：
+    // 「App 有没有显式打开输入」是旁证，不是判据。
     UInt32 enabled = 0, sz = sizeof(enabled);
-    if (AudioUnitGetProperty(unit, kAudioOutputUnitProperty_EnableIO,
-                             kAudioUnitScope_Input, 1, &enabled, &sz) == noErr && enabled) {
-        c->isInput = YES;
+    c->enableSt = AudioUnitGetProperty(unit, kAudioOutputUnitProperty_EnableIO,
+                                       kAudioUnitScope_Input, 1, &enabled, &sz);
+    if (c->enableSt == noErr) {
+        c->enableVal = enabled;
     }
 
-    sz = sizeof(c->asbd);
-    if (c->isInput &&
-        AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
-                             kAudioUnitScope_Output, bus, &c->asbd, &sz) == noErr) {
-        c->hasASBD = YES;
-    }
+    // ASBD 无条件查 —— 以前被 isInput 短路，连试都没试过，等于自断信息
+    SLTryASBD(c);
 
     sUnitCacheCount++;
     if (isNew) *isNew = YES;
@@ -153,8 +185,7 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
         return st;
     }
 
-    BOOL isNew = NO;
-    SLUnitCache *c = SLCacheFor(unit, bus, &isNew);
+    SLUnitCache *c = SLCacheFor(unit, bus, NULL);
     if (!c) {
         if (!sLoggedCacheFull) {
             sLoggedCacheFull = YES;
@@ -162,17 +193,32 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
         }
         return st;
     }
-    if (!c->isInput) {
-        if (!sLoggedNotInput) {
-            sLoggedNotInput = YES;
-            SLLog(@"音频: 跳过 —— 这个 unit 的输入元素没开，不是麦克风采集");
-        }
-        return st;
+
+    // 格式还没拿到就再试。首次 bus=1 调用时 unit 往往刚启动，属性暂时查不到很正常，
+    // 不能像 0.2.6 那样一次失败就永久放弃。
+    // 前 200 次密集重试（约 2 秒），之后每 3000 次补一次 —— 属性查询要加锁，
+    // 不能每 10ms 都去问。
+    c->calls++;
+    if (!c->hasASBD && (c->attempts < SL_ASBD_MAX_TRIES || (c->calls % 3000) == 0)) {
+        SLTryASBD(c);
     }
+
+    // 拿到格式就说明这条 bus 确实在往外送音频数据，可以干活了。
+    // EnableIO 只写进日志：它是旁证，不是判据。
+    if (c->hasASBD && !c->logged) {
+        c->logged = YES;
+        SLLog(@"音频: unit 就绪 bus=%u EnableIO st=%d val=%u · ASBD st=%d fmt=%u %.0fHz %uch %uB/帧 交错=%@",
+              (unsigned)bus, (int)c->enableSt, (unsigned)c->enableVal,
+              (int)c->asbdSt, (unsigned)c->asbd.mFormatID, c->asbd.mSampleRate,
+              (unsigned)c->asbd.mChannelsPerFrame, (unsigned)c->asbd.mBytesPerFrame,
+              (c->asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) ? @"N" : @"Y");
+    }
+
     if (!c->hasASBD) {
         if (!sLoggedNoASBD) {
             sLoggedNoASBD = YES;
-            SLLog(@"音频: 跳过 —— 拿不到输入格式（StreamFormat 查询失败）");
+            SLLog(@"音频: 跳过 —— 试了 %d 次仍拿不到 bus=%u 的格式（st=%d）",
+                  c->attempts, (unsigned)bus, (int)c->asbdSt);
         }
         return st;
     }
@@ -183,14 +229,6 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
                   (unsigned)c->asbd.mFormatID, (unsigned)c->asbd.mBytesPerFrame);
         }
         return st;
-    }
-
-    if (isNew) {
-        SLLog(@"音频: AudioUnit 输入 %.0fHz %uch %uB/帧 交错=%@ flags=0x%x",
-              c->asbd.mSampleRate, (unsigned)c->asbd.mChannelsPerFrame,
-              (unsigned)c->asbd.mBytesPerFrame,
-              (c->asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) ? @"N" : @"Y",
-              (unsigned)c->asbd.mFormatFlags);
     }
 
     SLCamFeed *feed = [SLCamFeed shared];

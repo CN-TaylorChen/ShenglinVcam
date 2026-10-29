@@ -21,7 +21,7 @@
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVersion @"0.2.6"
+#define SLVersion @"0.2.7"
 
 // kSLCamLoopKey / kSLCamMirrorKey 现在由 SLCamCore.m 统一导出（SLCamBridge.h 里 extern），
 // 帧源要读同样的键，不能再各定义一份 static。
