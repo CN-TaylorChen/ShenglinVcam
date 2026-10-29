@@ -27,6 +27,8 @@ ShenglinVcam_FILES = Tweak/SLCam.x \
 	Tweak/SLCamCore.m \
 	Tweak/SLCamFeed.m \
 	Tweak/SLCamInject.m \
+	Tweak/SLCamSymbolHook.m \
+	Tweak/SLCamAudioUnit.m \
 	Tweak/SLTarget.m
 
 ShenglinVcam_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function

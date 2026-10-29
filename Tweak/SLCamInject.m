@@ -5,6 +5,7 @@
 
 #import "SLCamInject.h"
 #import "SLCamFeed.h"
+#import "SLCamAudioUnit.h"
 #import "SLLog.h"
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
@@ -25,6 +26,7 @@ static IMP    gSLHookIMPs[SL_MAX_HOOKS];
 
 static BOOL sSLCamInjecting = NO;
 static BOOL sSLCamHooksInstalled = NO;
+static BOOL sSLCamAVCaptureAudioSeen = NO;
 static int  sSLCamHookCount = 0;
 static BOOL sLoggedMissingOrig = NO;
 static BOOL sLoggedFirstVideo = NO;
@@ -176,6 +178,10 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
             }
         }
     } else if (mediaType == kCMMediaType_Audio) {
+        // 只要这里有音频流过，就说明宿主的采集音频是走 AVCapture 的，
+        // AudioUnit 那条链路必须让路（否则同一个 PCM 池被两处消费，声音会碎）
+        sSLCamAVCaptureAudioSeen = YES;
+
         // 只处理未压缩 PCM；AAC 之类的压缩音频直接放行，避免格式错乱
         if (CMFormatDescriptionGetMediaSubType(fmt) == kAudioFormatLinearPCM) {
             const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
@@ -304,6 +310,9 @@ static void SLCamAddOutput(id self, SEL _cmd, id output) {
     if (gSLAddOutputOrig) {
         ((SLAddOutputFn)gSLAddOutputOrig)(self, _cmd, output);
     }
+    // 会话开始装配输出，往往意味着 RTC / 录音 SDK 已经加载完了，
+    // 这时候补扫一次符号，把刚才还不存在的镜像覆盖上
+    SLCamInstallAudioUnitHook();
 }
 
 static void SLCamHookSessionOutputs(void) {
@@ -355,6 +364,9 @@ void SLCamInstallHooks(void) {
     SLCamDumpCandidates("AVCaptureAudioPreviewOutput");
     SLCamHookSessionOutputs();
 
+    // 第二条链路：不经过 AVCapture 的麦克风（QQ 这类自建音频栈的 App）
+    SLCamInstallAudioUnitHook();
+
     if (sSLCamHookCount == 0) {
         SLLog(@"注入: 没找到 _processSampleBuffer: —— 该系统版本可能改了私有 API，"
               @"可用日志页确认后换挂点");
@@ -379,4 +391,8 @@ BOOL SLCamHooksInstalled(void) {
 
 int SLCamHookCount(void) {
     return sSLCamHookCount;
+}
+
+BOOL SLCamAVCaptureAudioSeen(void) {
+    return sSLCamAVCaptureAudioSeen;
 }

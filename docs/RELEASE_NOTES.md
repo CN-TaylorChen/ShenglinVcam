@@ -1,49 +1,48 @@
-## 0.2.3 —— 音频探测版
+## 0.2.4 —— 补上「不经过 AVCapture 的麦克风」
 
-画面替换已经确认可用（陌陌真机：`自洽=Y`，打包零失败）。这一版不碰画面逻辑，
-只做两件事：**把音频为什么没被拦查清楚**，以及**把日志降噪**。
+### 两份日志对比出来的结论
 
-### 日志里发现的两件事
+| | 陌陌 | QQ |
+|---|---|---|
+| 音频输出 | `AVCaptureAudioDataOutput` | **没有** |
+| 会话里的输出 | Video + Audio | Video + StillImage + Metadata |
+| 音频是否被拦 | ✅ `_handleSampleBufferEventForSampleBuffer:` | ❌ 从来没有音频流过 |
+| 结果 | 能换、能静音 | 只能录入原声 |
 
-**1. 只挂上了 1 个方法，而且是 `AVCaptureVideoDataOutput` 自己的**
+也就是说：**音频能不能换，取决于 App 用不用 `AVCaptureAudioDataOutput`。**
+陌陌用，所以 0.2.3 一挂就通；QQ 的语音走自己的音频栈（RTC SDK 那套），
+`AVCapture` 这条链路对它完全无效。
+
+### 这一版新增：AudioUnit 链路
+
+自签环境没有 CydiaSubstrate，`MSHookFunction` 用不了，所以自己实现了一个
+fishhook 精简版（`SLCamSymbolHook`）：遍历已加载镜像的
+`__la_symbol_ptr` / `__got`，按符号名把指针换成我们的实现。
+
+挂的是 `AudioUnitRender` —— 所有用 RemoteIO / VoiceProcessingIO 采麦克风的 App
+都要经过它：
+
+- **只处理输入元素（bus 1）**，而且该单元必须确实开了麦克风输入。
+  bus 0 是播放方向，碰一下就会把对方的声音也改掉。
+- **让路机制**：一旦发现宿主音频已经在走 AVCapture（`SLCamAVCaptureAudioSeen`），
+  AudioUnit 链路立刻退出。两条链路同时消费同一个 PCM 池，声音会被撕成两半。
+- 按 `(unit, bus)` 缓存格式与「是否输入」的判断，不在 10ms 的采集回调里反复查属性。
+- 先让宿主把数据拿到手，再就地覆盖内容 —— 时间戳、错误码、静音标志一概不动。
+
+顺带挂了 `AudioQueueNewInput` 的探针（**只记日志不接管**）。AudioQueue 是另一套
+回调机制，AudioUnitRender 覆盖不到；万一哪个 App 用它，日志里能直接看出来，
+不用再猜。
+
+### 装了之后看这几行
 
 ```
-hook -[AVCaptureVideoDataOutput _processSampleBuffer:] types=v24@0:8^{opaqueCMSampleBuffer=}16
-注入: 共 hook 1 个方法
+音频: AudioUnitRender 已接管（N 处符号槽）      ← 链路装上了
+音频: AudioUnit 输入 48000Hz 1ch 4B/帧 ...      ← 宿主的麦克风格式
+音频: 已接管 AudioUnit 麦克风输入                ← 真的替换进去了
+音频: 宿主使用 AudioQueue 录音（...）            ← 如果出现这行，说明还得再补一条链路
 ```
 
-也就是说 `AVCaptureOutput` 基类上并没有这个方法，音频输出类也没有自己的同名方法。
-**音频这条路目前完全没有被拦**（日志里从来没有出现过「首帧 音频」）。素材带音轨也换不了声。
-
-**2. 上一版的归因错了一半**
-
-```
-首帧 视频 1080x1920 pf=1111970369(BGRA) · fmt 1080x1920 BGRA · 自洽=Y
-```
-
-`自洽=Y` 说明宿主自己的 fmt 和 buffer 完全一致——**「旋转导致 fmt 与 buffer 尺寸不符」
-这个推测对陌陌不成立**。真正让打包失败的是时间戳：采集帧的 `duration` 不是
-`kCMTimeInvalid`（旧代码拦得住）而是「有效位为真、但不是正常数值」的形态，
-旧代码的 `CMTIME_IS_INVALID` 判不出来，`CMSampleBufferCreateReady` 就报
-`InvalidSampleTimingInfo`。这一版会把**原始的 duration/dts 打出来**，下次就能坐实。
-
-### 这一版新增的诊断
-
-- `探测: AVCaptureAudioDataOutput → ...`：列出音频输出类上所有名字带 sample/buffer 的方法
-- `会话加输出: <类名>`：App 往 `AVCaptureSession` 里加了哪些输出（看音频到底走哪条路）
-- `注入: 真帧 duration 非法（value=... scale=... flags=...）`：时间戳归一化时记下原值
-- 扫描挂点从「名字含 processSampleBuffer」放宽到「名字含 samplebuffer」，
-  但**只挂 `void` + 单个指针参数**的方法——签名不符的会打印「跳过」而不是硬挂
-  （硬挂会把多余参数丢掉，宿主当场行为异常）
-
-### 顺手降噪
-
-`feed 管线就绪` 不再每轮循环都刷（11 秒一条 → 只在首次/格式变化/每 20 轮打一次）。
-
-### 下一步
-
-把这一版装上跑一次，日志里那三行探测结果发我，就能确定音频该挂哪个方法，
-然后 0.2.4 把「带语音」补齐。
+陌陌那边应该仍然只看到 AVCapture 那条（AudioUnit 会静默让路），属正常。
 
 ## 装法
 

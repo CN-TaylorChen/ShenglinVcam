@@ -34,4 +34,8 @@ BOOL SLCamHooksInstalled(void);
 /// 实际命中的方法个数（0 = 这台系统上没找到 _processSampleBuffer:）
 int SLCamHookCount(void);
 
+/// 宿主的音频是否确实从 AVCapture 走（见过 AVCapture 的音频采样缓冲）。
+/// AudioUnit 那条链路据此让路，避免两条链路同时消费同一个 PCM 池。
+BOOL SLCamAVCaptureAudioSeen(void);
+
 NS_ASSUME_NONNULL_END
