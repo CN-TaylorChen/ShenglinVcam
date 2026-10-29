@@ -50,7 +50,10 @@ jobs:
 
       - name: Resolve artifact name
         id: art
-        run: echo "name=ShenglinVcam-v$(grep '^Version:' control | awk '{print $2}' | tr -d '\r')" >> "$GITHUB_OUTPUT"
+        run: |
+          VER=$(grep '^Version:' control | awk '{print $2}' | tr -d '\r')
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          echo "name=ShenglinVcam-v${VER}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -60,3 +63,16 @@ jobs:
             ShenglinVcam.dylib
             ShenglinVcam.plist
             ShenglinVcam-v*.deb
+
+      # 构建成功就发 Release —— Actions 的 artifact 下载要登录，
+      # Release 资产是公开直链，手机/电脑都能直接下
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.art.outputs.ver }}
+          name: ShenglinVcam ${{ steps.art.outputs.ver }}
+          body_path: docs/RELEASE_NOTES.md
+          files: |
+            ShenglinVcam.dylib
+            ShenglinVcam-v${{ steps.art.outputs.ver }}.deb
+          fail_on_unmatched_files: true
