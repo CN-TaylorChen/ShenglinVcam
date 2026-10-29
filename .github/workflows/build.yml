@@ -5,6 +5,10 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+# 默认 token 只有只读权限，回传 commit comment 需要 contents: write
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-latest

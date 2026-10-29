@@ -113,7 +113,7 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
             // kCMSampleBufferError_InvalidSampleTimingInfo 失败 —— 这个错跟格式无关，
             // 但表现和格式错一模一样（每帧都失败）。采集帧的 duration 经常是 indefinite，
             // 光判 CMTIME_IS_INVALID 拦不住。
-            if (!CMTIME_IS_VALID(timing.duration) || CMTIME_IS_NEGATIVE(timing.duration)) {
+            if (!CMTIME_IS_VALID(timing.duration) || CMTimeCompare(timing.duration, kCMTimeZero) < 0) {
                 timing.duration = CMTimeMake(1, 30);
             }
             if (!CMTIME_IS_VALID(timing.decodeTimeStamp)) {
