@@ -1,3 +1,79 @@
+## 0.2.16 —— 拍照方向 / 抖音拍照 / toast 收短
+
+0.2.15 上机后的三项。抖音导航栏那层多出来的胶囊**本版不动**（结论见文末附录）。
+
+### 一、拍照跟着旋转 / 镜像设置走
+
+`SLCamCaptureStill` 里取帧用的是 `copyNextFrame` —— 那是解码器吐的**原始帧**，
+既没转角度也没镜像。预览画面是走 `sl_render:` 转正的，所以出现
+「预览正、拍出来歪」。
+
+不能直接把这里换成 `copyFrameForPixelFormat:size:`：那个方法会写
+`_pipelineKey` / `_reconfigRequested`，让解码线程按新格式**重建管线**。
+拍一张照片就把预览管线换掉，紧接着几帧取不到数据（返回 NULL → 放行真画面），
+画面上会闪一下真实摄像头。
+
+新增 `-[SLCamFeed copyOrientedFrameForPixelFormat:size:]`：同样按当前
+旋转/镜像摆好，但**一根手指都不碰管线状态**。`size` 传 `CGSizeZero` 表示按素材
+自身尺寸出图（转 90/270 时宽高互换），1:1 直出、不做铺满裁切，拍出来就是素材
+原始分辨率。代价是每次拍照现场做一次 CI 渲染（十几毫秒），拍照是低频操作，
+拿这点开销换「预览不闪」值得。
+
+### 二、抖音拍照补上 AVCapturePhotoOutput
+
+QQ 和抖音的拍照是**两条完全独立的路**：
+
+| App | 类 | 我们的钩子 |
+|---|---|---|
+| QQ | `AVCaptureStillImageOutput` | 0.2.15 已接 |
+| 抖音 | `AVCapturePhotoOutput` | 本版新增 |
+
+只挂 `StillImageOutput` 对抖音一点作用都没有 —— 它的日志里那句
+「会话加输出: AVCapturePhotoOutput」就是证据。
+
+接法不走 delegate（delegate 是宿主私有类，每次启动可能不同，还得处理中途被替换），
+改成直接挂在 `-[AVCapturePhoto fileDataRepresentation]` 和
+`fileDataRepresentationWithCustomizer:` 上：宿主不管怎么拍、委托给谁、
+要 HEIC 还是 JPEG，最后总得向 `AVCapturePhoto` 要字节，那一刻换成我们的。
+一个方法覆盖所有调用方式，也不用管它内部编码格式。
+
+另加一条探针 `capturePhotoWithSettings:delegate:`，只打一行日志记录 delegate 类。
+下次再出「拍了没换」，看日志就能分清卡在哪一步：
+
+- 有 `命中 AVCapturePhotoOutput 拍照`、没有 `拍照已接管（AVCapturePhotoOutput）`
+  → 宿主读的是 `photo.pixelBuffer` 而不是 `fileDataRepresentation`，要换挂点；
+- 两条都有但照片还是真的 → 宿主把 `photo.metadata` 里的 EXIF 方向又套了一遍。
+
+### 三、扩展球 toast 收成一行
+
+原来每条都带解释（「替换已开启 · 摄像头画面换成素材」），松手后弹一大段反而看不清
+到底切成什么状态。改成只报状态：
+
+| 开关 | toast |
+|---|---|
+| 替换 | `替换：开` / `替换：关` |
+| 声音 | `声音：开` / `声音：关` |
+| 方向 | `方向：不旋转` / `方向：90°` / `方向：180°` / `方向：270°` |
+| 镜像 | `镜像：开` / `镜像：关` |
+| 循环 | `循环：开` / `循环：关` |
+
+### 附录：抖音导航栏那层多出来的胶囊（本版未改）
+
+结论是**系统画的，不是我们的**。iOS 26 给 `UIBarButtonItem` 加了
+`sharesBackground`（默认 `YES`）—— 一个导航栏里有多个 item 时，系统会把它们
+框进同一个液态玻璃胶囊；单个 item（返回键）则拿到一颗自己的玻璃圆。我们在
+`customView` 里已经画了胶囊，于是叠成两层。
+
+只有抖音有，是因为液态玻璃**按宿主 App 的构建 SDK 决定**：用 iOS 26 SDK 编、
+且 Info.plist 没写 `UIDesignRequiresCompatibility = YES` 的 App 才走新设计。
+QQ/陌陌是老 SDK 编的，系统完全不画按钮背景。
+
+我们这边代码在每个 App 里完全一样（全工程只有 `SLGlass.m` 两处创建
+`UIBarButtonItem`，没有任何按 App 分支的判断），所以这不是「没统一」。
+
+以后要改的话：在这两个构造函数里给每个 item 设 `hidesSharedBackground = YES`。
+CI 的 Theos SDK 没有 iOS 26 头文件，得用 `respondsToSelector` + KVC 探测着设。
+
 ## 0.2.15 —— 坐标系收口 / 扇几何重做 / 拍照接管 / 音频布点
 
 0.2.14 上机后的一批问题。这一版有两条是**功能新增**（拍照替换、录制链路探测），

@@ -51,6 +51,18 @@ NS_ASSUME_NONNULL_BEGIN
                                                 size:(CGSize)size
     CF_RETURNS_RETAINED;
 
+/// 拍照专用：按当前「旋转 / 镜像」设置摆好，但**不重建解码管线**地取一帧。
+///
+/// 为什么不能直接用 copyFrameForPixelFormat:size:：那个方法会记下目标格式并让
+/// 解码线程按它重建管线。拍一张照片就把预览管线换掉，代价是紧接着的几帧预览
+/// 取不到数据（返回 NULL → 放行真画面），画面上会闪一下真实摄像头。
+///
+/// size 传 CGSizeZero 表示按素材自身尺寸（旋转 90/270 时宽高互换），
+/// 此时是 1:1 直出，不做铺满裁切，拍出来的就是素材原始分辨率。
+- (nullable CVPixelBufferRef)copyOrientedFrameForPixelFormat:(OSType)pixelFormat
+                                                        size:(CGSize)size
+    CF_RETURNS_RETAINED;
+
 /// 按宿主音频格式取一段 PCM（素材音频不够长时尾部补静音）。
 /// 没有音频轨、或还没解出数据时返回 nil，注入层放行真实麦克风。
 - (nullable NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd

@@ -536,6 +536,54 @@
     return 0;
 }
 
+// 拍照专用出帧。跟 copyFrameForPixelFormat:size: 的区别只有一点：
+// **不动 _pipelineKey / _reconfigRequested**，所以预览管线一根手指都不碰。
+//
+// 代价是每次拍照都要现场做一次 CI 渲染（约十几毫秒），但拍照是低频操作，
+// 拿这点开销换「预览不闪一下真摄像头」完全值得。
+- (CVPixelBufferRef)copyOrientedFrameForPixelFormat:(OSType)pixelFormat size:(CGSize)size {
+    if (pixelFormat == 0) return NULL;
+
+    [_lock lock];
+    CVPixelBufferRef pb = _latestVideo ? (CVPixelBufferRef)CVPixelBufferRetain(_latestVideo) : NULL;
+    [_lock unlock];
+    if (!pb) return NULL;
+
+    size_t sw = CVPixelBufferGetWidth(pb);
+    size_t sh = CVPixelBufferGetHeight(pb);
+    if (sw < 1 || sh < 1) { CVPixelBufferRelease(pb); return NULL; }
+
+    NSInteger rot = [self sl_normalizedRotation];
+    BOOL mirror = self.mirrorEnabled;
+
+    size_t w, h;
+    if (size.width >= 1 && size.height >= 1) {
+        w = (size_t)size.width;
+        h = (size_t)size.height;
+    } else if (rot == 90 || rot == 270) {
+        w = sh;   // 转 90/270 之后宽高互换
+        h = sw;
+    } else {
+        w = sw;
+        h = sh;
+    }
+
+    // 格式、尺寸都对上又没开镜像/旋转 → 原样直出，省一次渲染
+    if (rot == 0 && !mirror && CVPixelBufferGetPixelFormatType(pb) == pixelFormat
+        && sw == w && sh == h) {
+        return pb;
+    }
+
+    CVPixelBufferRef out = [self sl_render:pb
+                                   toWidth:w
+                                    height:h
+                                    format:pixelFormat
+                                    mirror:mirror
+                                  rotation:rot];
+    CVPixelBufferRelease(pb);
+    return out;
+}
+
 - (CVPixelBufferRef)sl_render:(CVPixelBufferRef)src
                       toWidth:(size_t)w
                        height:(size_t)h

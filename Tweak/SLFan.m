@@ -773,8 +773,7 @@ void SLFanCommit(NSInteger sw, NSInteger angle) {
         case SLFanSwitchEnabled: {
             BOOL on = !SLFanBool(kSLCamEnabledKey, YES);
             SLFanSetBool(kSLCamEnabledKey, on);
-            msg = on ? @"替换已开启 · 摄像头画面换成素材"
-                     : @"替换已关闭 · 恢复真实摄像头";
+            msg = on ? @"替换：开" : @"替换：关";
             changed = YES;
             break;
         }
@@ -783,8 +782,7 @@ void SLFanCommit(NSInteger sw, NSInteger angle) {
             // 关掉 = 素材不发声，真麦克风原样放行。
             BOOL on = !SLFanBool(kSLCamAudioKey, YES);
             SLFanSetBool(kSLCamAudioKey, on);
-            msg = on ? @"素材声音：开 · 对方听到素材里的音频"
-                     : @"素材声音：关 · 对方听到你的真麦克风";
+            msg = on ? @"声音：开" : @"声音：关";
             changed = YES;
             break;
         }
@@ -793,23 +791,22 @@ void SLFanCommit(NSInteger sw, NSInteger angle) {
             // 原来这里把 -1 当 0 处理，一次误触就会把用户设好的 180° 清成「不旋转」。
             if (angle < 0) break;
             SLFanSetInt(kSLCamRotateKey, angle * 90);
-            NSArray<NSString *> *names = @[@"不旋转", @"顺时针 90°", @"180°", @"顺时针 270°"];
-            msg = [NSString stringWithFormat:@"画面方向：%@", names[angle % 4]];
+            NSArray<NSString *> *names = @[@"方向：不旋转", @"方向：90°", @"方向：180°", @"方向：270°"];
+            msg = names[angle % 4];
             changed = YES;
             break;
         }
         case SLFanSwitchMirror: {
             BOOL on = !SLFanBool(kSLCamMirrorKey, NO);
             SLFanSetBool(kSLCamMirrorKey, on);
-            msg = on ? @"镜像：开 · 画面左右翻转" : @"镜像：关";
+            msg = on ? @"镜像：开" : @"镜像：关";
             changed = YES;
             break;
         }
         case SLFanSwitchLoop: {
             BOOL on = !SLFanBool(kSLCamLoopKey, YES);
             SLFanSetBool(kSLCamLoopKey, on);
-            msg = on ? @"循环播放：开 · 播完从头再来"
-                     : @"循环播放：关 · 播完停在最后一帧";
+            msg = on ? @"循环：开" : @"循环：关";
             changed = YES;
             break;
         }

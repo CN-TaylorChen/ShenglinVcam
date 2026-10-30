@@ -724,14 +724,20 @@ static void SLCamCaptureStill(id self, SEL _cmd, id connection,
 
     void (^wrapped)(CMSampleBufferRef, NSError *) = ^(CMSampleBufferRef buf, NSError *err) {
         if (!handler) return;
-        CVPixelBufferRef pb = [[SLCamFeed shared] copyNextFrame];
+        // 0.2.16：这里原来用 copyNextFrame，拿的是解码器吐的**原始帧** ——
+        // 既没转角度也没镜像，所以预览里画面已经转正了，拍出来还是歪的。
+        // 改用拍照专用出帧：按当前旋转/镜像摆好，但不碰预览管线。
+        CVPixelBufferRef pb = [[SLCamFeed shared]
+            copyOrientedFrameForPixelFormat:kCVPixelFormatType_32BGRA size:CGSizeZero];
         CMSampleBufferRef fake = pb ? SLCamJPEGSampleBuffer(pb) : NULL;
         if (pb) CVPixelBufferRelease(pb);
         if (fake) {
             static BOOL logged = NO;
             if (!logged) {
                 logged = YES;
-                SLLog(@"注入: 拍照已接管 · 返回素材画面");
+                SLLog(@"注入: 拍照已接管 · 返回素材画面（已按 %ld° / 镜像%@）",
+                      (long)([SLCamFeed shared].rotation % 360),
+                      [SLCamFeed shared].mirrorEnabled ? @"开" : @"关");
             }
             handler(fake, err);
             CFRelease(fake);
@@ -754,6 +760,90 @@ static void SLCamInstallStillImageHook(void) {
     SLCamHookSel(cls, NSSelectorFromString(@"captureStillImageAsynchronouslyFromConnection:completionHandler:"),
                  (IMP)SLCamCaptureStill, (IMP *)&gSLStillOrig);
     SLLog(@"注入: 拍照链路已布点 still=%d", gSLStillOrig != nil);
+}
+
+#pragma mark - 拍照接管之二：AVCapturePhotoOutput（抖音走这条）
+
+// QQ 用 AVCaptureStillImageOutput，抖音用 AVCapturePhotoOutput —— 两条完全独立的路径。
+// 抖音日志里那句「会话加输出: AVCapturePhotoOutput」就是它，只挂 StillImageOutput
+// 对它一点作用都没有，所以拍出来还是真实画面。
+//
+// 接法不走 delegate：delegate 是宿主私有类，每次启动可能不同，还得处理中途被替换。
+// 改成直接挂在 -[AVCapturePhoto fileDataRepresentation] 上 —— 宿主不管怎么拍、
+// 委托给谁、要 HEIC 还是 JPEG，最后总得向 AVCapturePhoto 要字节，那一刻换成我们的。
+// 一个方法覆盖所有调用方式，也不用管它内部编码格式。
+
+static NSData *(*gSLPhotoDataOrig)(id, SEL);
+static NSData *(*gSLPhotoDataCustomOrig)(id, SEL, id);
+static void   (*gSLPhotoCaptureOrig)(id, SEL, id, id);
+
+/// 从素材取一帧、按当前旋转/镜像摆好、转成 JPEG。
+/// 条件不满足返回 nil，调用方原样放行真照片。
+static NSData *SLCamPhotoJPEG(void) {
+    if (!SLCamInjecting() || !SLCamArmed()) return nil;
+    CVPixelBufferRef pb = [[SLCamFeed shared]
+        copyOrientedFrameForPixelFormat:kCVPixelFormatType_32BGRA size:CGSizeZero];
+    if (!pb) return nil;
+    NSData *jpeg = SLCamJPEGFromPixelBuffer(pb, 0.92);
+    CVPixelBufferRelease(pb);
+    return jpeg.length ? jpeg : nil;
+}
+
+static void SLCamPhotoLogOnce(void) {
+    static BOOL logged = NO;
+    if (logged) return;
+    logged = YES;
+    SLLog(@"注入: 拍照已接管（AVCapturePhotoOutput）· 返回素材画面 %ld° / 镜像%@",
+          (long)([SLCamFeed shared].rotation % 360),
+          [SLCamFeed shared].mirrorEnabled ? @"开" : @"关");
+}
+
+static NSData *SLCamPhotoFileData(id self, SEL _cmd) {
+    NSData *fake = SLCamPhotoJPEG();
+    if (fake) { SLCamPhotoLogOnce(); return fake; }
+    return gSLPhotoDataOrig ? gSLPhotoDataOrig(self, _cmd) : nil;
+}
+
+static NSData *SLCamPhotoFileDataCustom(id self, SEL _cmd, id customizer) {
+    NSData *fake = SLCamPhotoJPEG();
+    if (fake) { SLCamPhotoLogOnce(); return fake; }
+    return gSLPhotoDataCustomOrig ? gSLPhotoDataCustomOrig(self, _cmd, customizer) : nil;
+}
+
+// 只做一次探针：记录宿主到底调不调 capturePhotoWithSettings:delegate:，
+// 以及 delegate 是什么类。下次再出「拍了没换」的日志，一眼就知道走到哪一步了。
+static void SLCamPhotoCapture(id self, SEL _cmd, id settings, id delegate) {
+    static BOOL logged = NO;
+    if (!logged) {
+        logged = YES;
+        SLLog(@"注入: 命中 AVCapturePhotoOutput 拍照 · delegate=%@",
+              delegate ? NSStringFromClass([delegate class]) : @"(nil)");
+    }
+    if (gSLPhotoCaptureOrig) gSLPhotoCaptureOrig(self, _cmd, settings, delegate);
+}
+
+static void SLCamInstallPhotoOutputHook(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    Class photo = objc_getClass("AVCapturePhoto");
+    Class output = objc_getClass("AVCapturePhotoOutput");
+    if (!photo || !output) {
+        SLLog(@"注入: AVCapturePhoto/PhotoOutput 不存在，拍照跳过 photo=%d output=%d",
+              photo != nil, output != nil);
+        return;
+    }
+
+    SLCamHookSel(photo, NSSelectorFromString(@"fileDataRepresentation"),
+                 (IMP)SLCamPhotoFileData, (IMP *)&gSLPhotoDataOrig);
+    SLCamHookSel(photo, NSSelectorFromString(@"fileDataRepresentationWithCustomizer:"),
+                 (IMP)SLCamPhotoFileDataCustom, (IMP *)&gSLPhotoDataCustomOrig);
+    SLCamHookSel(output, NSSelectorFromString(@"capturePhotoWithSettings:delegate:"),
+                 (IMP)SLCamPhotoCapture, (IMP *)&gSLPhotoCaptureOrig);
+
+    SLLog(@"注入: 拍照链路已布点 photo=%d custom=%d capture=%d",
+          gSLPhotoDataOrig != nil, gSLPhotoDataCustomOrig != nil, gSLPhotoCaptureOrig != nil);
 }
 
 void SLCamInstallHooks(void) {
@@ -812,6 +902,9 @@ void SLCamInstallHooks(void) {
 
     // 拍照（AVCaptureStillImageOutput）走的是另一条路，上面那套启发式挂不到
     SLCamInstallStillImageHook();
+
+    // 抖音拍照走 AVCapturePhotoOutput，又是另一条 —— 两条都要挂
+    SLCamInstallPhotoOutputHook();
 
     if (sSLCamHookCount == 0) {
         SLLog(@"注入: 没找到 _processSampleBuffer: —— 该系统版本可能改了私有 API，"
