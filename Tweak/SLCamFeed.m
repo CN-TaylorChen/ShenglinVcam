@@ -74,7 +74,7 @@
 - (void)sl_buildReaderForKey:(NSString *)key;
 - (BOOL)sl_pumpAudio;
 - (BOOL)sl_audioBelowHighWater;
-- (NSData *)sl_audioLocked:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes;
+- (NSData *)sl_audioLocked:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes configure:(BOOL)configure;
 - (NSData *)sl_convertAudio:(NSData *)input;
 - (NSInteger)sl_normalizedRotation;
 - (CVPixelBufferRef)sl_render:(CVPixelBufferRef)src
