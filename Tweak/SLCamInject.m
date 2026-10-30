@@ -12,6 +12,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
+#import <os/lock.h>
 
 typedef void (*SLProcessSampleBufferFn)(id, SEL, CMSampleBufferRef);
 
@@ -69,6 +70,71 @@ static IMP SLCamOriginalIMP(id self, SEL _cmd) {
     return NULL;
 }
 
+/// 自建 fmt 的缓存。
+///
+/// 为什么需要：`CMVideoFormatDescriptionMatchesImageBuffer(宿主 fmt, 假帧)` 每帧都为假
+/// —— 宿主 fmt 带着自己的 CVBytesPerRow，和我们的帧天生对不上。所以每帧都会走进自建
+/// 分支。不缓存的话 30fps 下每秒白建 60 个 fmt，而且是在采集队列上。
+///
+/// 自建 fmt 只跟「子类型 + 宽 + 高 + 帧的色彩矩阵」有关，这四样不变就一直复用。
+/// 把色彩矩阵也算进 key 是因为自建 fmt 的扩展是从帧的附件反推的 —— 换素材后色彩
+/// 矩阵可能变，复用旧 fmt 会让色彩偏一点。
+#define SL_FMT_CACHE 4
+
+typedef struct {
+    OSType subType;
+    int32_t width;
+    int32_t height;
+    uintptr_t colorHash;
+    CMVideoFormatDescriptionRef fmt;      // 缓存自己持有一份引用
+} SLFmtCacheEntry;
+
+static SLFmtCacheEntry gSLFmtCache[SL_FMT_CACHE];
+static int gSLFmtCacheCount = 0;
+static int gSLFmtCacheNext = 0;           // 满了就轮换覆盖
+static os_unfair_lock gSLFmtCacheLock = OS_UNFAIR_LOCK_INIT;
+
+/// 帧的色彩矩阵哈希，用来区分「同一尺寸但色彩标注不同」的帧
+static uintptr_t SLCamFrameColorHash(CVPixelBufferRef frame) {
+    CFTypeRef m = CVBufferGetAttachment(frame, kCVImageBufferYCbCrMatrixKey, NULL);
+    return m ? (uintptr_t)CFHash(m) : 0;
+}
+
+static CMVideoFormatDescriptionRef SLCamCachedFormat(OSType subType, int32_t w, int32_t h,
+                                                     uintptr_t colorHash) {
+    CMVideoFormatDescriptionRef hit = NULL;
+    os_unfair_lock_lock(&gSLFmtCacheLock);
+    for (int i = 0; i < gSLFmtCacheCount; i++) {
+        if (gSLFmtCache[i].subType == subType && gSLFmtCache[i].width == w
+            && gSLFmtCache[i].height == h && gSLFmtCache[i].colorHash == colorHash) {
+            hit = (CMVideoFormatDescriptionRef)CFRetain(gSLFmtCache[i].fmt);
+            break;
+        }
+    }
+    os_unfair_lock_unlock(&gSLFmtCacheLock);
+    return hit;
+}
+
+static void SLCamStoreFormat(OSType subType, int32_t w, int32_t h,
+                             uintptr_t colorHash, CMVideoFormatDescriptionRef fmt) {
+    if (!fmt) return;
+    os_unfair_lock_lock(&gSLFmtCacheLock);
+    int slot;
+    if (gSLFmtCacheCount < SL_FMT_CACHE) {
+        slot = gSLFmtCacheCount++;
+    } else {
+        slot = gSLFmtCacheNext;
+        gSLFmtCacheNext = (gSLFmtCacheNext + 1) % SL_FMT_CACHE;
+        if (gSLFmtCache[slot].fmt) CFRelease(gSLFmtCache[slot].fmt);
+    }
+    gSLFmtCache[slot].subType = subType;
+    gSLFmtCache[slot].width = w;
+    gSLFmtCache[slot].height = h;
+    gSLFmtCache[slot].colorHash = colorHash;
+    gSLFmtCache[slot].fmt = (CMVideoFormatDescriptionRef)CFRetain(fmt);
+    os_unfair_lock_unlock(&gSLFmtCacheLock);
+}
+
 /// 从宿主 extensions 里剔除「描述内存布局」的 key，只留色彩类。
 ///
 /// CVBytesPerRow / CVFieldCount 描述的是缓冲区**怎么摆放**，必须由帧自己决定。
@@ -110,16 +176,24 @@ static CMVideoFormatDescriptionRef SLCamMakeFormatDescription(CMFormatDescriptio
     OSType subType = CMFormatDescriptionGetMediaSubType(hostFmt);
     if (subType == 0) subType = CVPixelBufferGetPixelFormatType(frame);
 
+    int32_t w = (int32_t)CVPixelBufferGetWidth(frame);
+    int32_t h = (int32_t)CVPixelBufferGetHeight(frame);
+    uintptr_t colorHash = SLCamFrameColorHash(frame);
+
+    // 命中缓存就直接返回（返回的是 CFRetain 过的，调用方照常 CFRelease）
+    CMVideoFormatDescriptionRef cached = SLCamCachedFormat(subType, w, h, colorHash);
+    if (cached) return cached;
+
     CFDictionaryRef ext = SLCamColorExtensions(CMFormatDescriptionGetExtensions(hostFmt));
     CMVideoFormatDescriptionRef out = NULL;
-    OSStatus st = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, subType,
-                                                 (int32_t)CVPixelBufferGetWidth(frame),
-                                                 (int32_t)CVPixelBufferGetHeight(frame),
-                                                 ext, &out);
+    OSStatus st = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, subType, w, h, ext, &out);
     if (ext) CFRelease(ext);
 
     if (st == noErr && out) {
-        if (CMVideoFormatDescriptionMatchesImageBuffer(out, frame)) return out;
+        if (CMVideoFormatDescriptionMatchesImageBuffer(out, frame)) {
+            SLCamStoreFormat(subType, w, h, colorHash, out);
+            return out;
+        }
         CFRelease(out);                       // 和帧对不上，宁可不要
         out = NULL;
     }
@@ -131,6 +205,7 @@ static CMVideoFormatDescriptionRef SLCamMakeFormatDescription(CMFormatDescriptio
     if (sSLCamOwnFmtExtFailLogged++ == 0) {
         SLLog(@"注入: 带宿主扩展建 fmt 不自洽 st=%d，已退回帧反推（宿主可能取不到内参）", (int)st);
     }
+    SLCamStoreFormat(subType, w, h, colorHash, out);
     return out;
 }
 

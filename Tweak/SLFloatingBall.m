@@ -15,6 +15,7 @@
 #import "SLSettingsPanel.h"
 #import "SLMediaListController.h"
 #import "SLCamBridge.h"
+#import "SLFan.h"
 #import "SLUtil.h"
 #import "SLLog.h"
 #import "SLGlass.h"
@@ -227,8 +228,6 @@ static BOOL sSLFloatSettleMuted = NO;
 // 就绪不再自动回空闲，发出去的那一刻外扩一圈涟漪再回空闲。
 
 #define SLBallSide 48.0
-#define SLPillMaxW 196.0
-#define SLPillMinW 146.0   // v0.4.77：展开态定宽，就是 146 / 196 里最短的那一档
 
 // v0.4.44：下压留白改成 0。
 // 之前留 14pt 是为了让搜索栏不压圆角，但导航栏是透明的 —— 那 14pt 成了整张卡片上
@@ -256,7 +255,6 @@ static UIImage *SLTransparentImage(void) {
 }
 
 @interface SLFloatButton : UIButton
-@property (nonatomic, assign) BOOL slExpanded;
 @property (nonatomic, assign) SLFloatState slState;
 - (void)sl_loadIcon;
 - (void)sl_applyState:(SLFloatState)state;
@@ -264,20 +262,9 @@ static UIImage *SLTransparentImage(void) {
 - (void)sl_layoutBars;
 - (void)sl_updateBarMotion;
 /// v0.4.74：自定义图片的图标动效（四态律动）
-/// v0.4.75：色晕（胶囊底色）挂载与刷新
 - (void)sl_updateIconMotion;
-- (void)sl_expand:(BOOL)expanded animated:(BOOL)animated;
-/// v0.4.76：当前自定义图标（没选图返回 nil）。语音包列表要拿它铺同源底色。
-- (UIImage *)sl_customIconImage;
-/// v0.4.76：名字滚动 / 换名后重算宽度
-- (void)sl_layoutNameMarquee;
-- (void)sl_startNameMarquee;
-- (void)sl_resizePillForName;
 /// v0.4.45：回到前台重挂呼吸光晕（后台期间动画会被系统整条移除）
 - (void)sl_restartHalo;
-/// v0.4.46：拖动中越过中线翻面 / 松手贴边
-- (void)sl_updateMirrorDuringDrag;
-- (void)sl_settlePillToEdge;
 @end
 
 @implementation SLFloatButton {
@@ -290,28 +277,16 @@ static UIImage *SLTransparentImage(void) {
     UIView *_bars;
     UIView *_barCell[4];
     UIImageView *_thumb;
-    // v0.4.76：照片的裁剪路径。跟胶囊遮罩同一条曲线（左端圆头 / 球态正圆），
-    // 不再让照片自己 cornerRadius 裁一次，两条边对不齐就会露出半截白线。
     // v0.4.76：白勾边。原来挂在 _glassHost 的 border 上（在照片下面，被吃掉半截），
     // 现在单独一层放在最顶上，底下是玻璃还是照片都画完整一圈。
     CAShapeLayer *_hairline;
-    // v0.4.76：名字的裁剪窗口。名字超宽时内层 label 加宽、跑平移动画。
-    UIView *_nameClip;
-    // v0.4.75：胶囊底色（图标色晕）。铺在毛玻璃内容层之上、状态色之下。
-    UIImageView *_haze;
-    UILabel *_name;
-    UIButton *_menuBtn;
-    // v0.4.45：中间文字区热区 —— 只接触摸，点它不做任何事
-    UIButton *_midBtn;
-    UIImageView *_chev;
-    UIButton *_homeBtn;
-    UIView *_homeHit;
     CAShapeLayer *_haloIn;
     CAShapeLayer *_haloOut;
     UIView *_readyDot;
     CFTimeInterval _longPressAt;
-    // v0.4.40：球在哪半边，胶囊就往哪边「挂」—— 图标端留在球原位，箭头端伸向屏内
-    BOOL _mirrored;
+    // 长按期间要临时关掉它，否则手指在扇上滑动会同时把球拖走
+    UIPanGestureRecognizer *_pan;
+    SLFanView *_fan;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -353,18 +328,8 @@ static UIImage *SLTransparentImage(void) {
         // 铺在聊天背景上基本看不到背后内容；换成超薄材质后是真正的玻璃感（透 + 轻模糊），
         // 玻璃的边界靠 _glassHost 那圈 0.8pt 高光勾出来。
         _chrome = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial]];
-        _chrome.frame = CGRectMake(0, 0, SLPillMaxW, SLBallSide);
+        _chrome.frame = CGRectMake(0, 0, SLBallSide, SLBallSide);
         [_glassHost addSubview:_chrome];
-
-        // v0.4.75：胶囊底色。铺在毛玻璃之上、状态色之下：
-        // 默认四杠图形没有色晕（胶囊还是纯玻璃），只有选了自定义图片才有。
-        // alpha 0.36 等价于「白覆盖 64%」——浅色下胶囊底落在 #B1B4B9 附近，
-        // 能看出一条横向色带，文字对比度又还够；深色下同一数值只是略微压暗，不会糊死。
-        _haze = [[UIImageView alloc] initWithFrame:CGRectZero];
-        _haze.contentMode = UIViewContentModeScaleToFill;
-        _haze.userInteractionEnabled = NO;
-        _haze.alpha = 0.36;
-        [_chrome.contentView addSubview:_haze];
 
         _tint = [[UIView alloc] initWithFrame:CGRectZero];
         _tint.userInteractionEnabled = NO;
@@ -410,63 +375,6 @@ static UIImage *SLTransparentImage(void) {
         [self.layer insertSublayer:_hairline below:_thumb.layer];
 
 
-        _name = [[UILabel alloc] initWithFrame:CGRectZero];
-        _name.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold];
-        _name.textColor = [UIColor labelColor];
-        _name.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        // v0.4.40：两端各留 48 热区，名字在中间 100pt 里居中 —— 原来贴左对齐，
-        // 右边空一大片，看着像没排好。
-        _name.textAlignment = NSTextAlignmentCenter;
-        _name.userInteractionEnabled = NO;
-        // v0.4.76：套一层裁剪窗口。名字放得下就居中静止；放不下就把内层 label 拉宽、
-        // 跑 transform.translation.x 的滚动动画（动 transform 而不是 frame，layout 不会拍回去）。
-        _nameClip = [[UIView alloc] initWithFrame:CGRectZero];
-        _nameClip.clipsToBounds = YES;
-        _nameClip.userInteractionEnabled = NO;
-        _nameClip.hidden = YES;
-        [_nameClip addSubview:_name];
-        [self addSubview:_nameClip];
-
-        // v0.4.45：中间文字区只是一块「接住触摸」的空壳，点它不做任何事。
-        // 它存在的唯一意义：别让触摸落到 self（本身是 UIButton）上，
-        // 否则中间又会被 self 的 touchUpInside 收走。收球只认图标那一端。
-        // 按住拖动照样能拖 —— 手势识别器挂在 self 上，子视图接走触摸不影响它。
-        _midBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-        _midBtn.frame = CGRectZero;
-        _midBtn.hidden = YES;
-
-        _menuBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-        _menuBtn.frame = CGRectZero;
-        [_menuBtn addTarget:self action:@selector(sl_menuTap) forControlEvents:UIControlEventTouchUpInside];
-        [self addSubview:_menuBtn];
-        // v0.4.79：名字窗口右移后（54 → 111.5）会压到箭头热区的左界（98）。
-        // _midBtn 提到 _menuBtn 之上 —— 名字那一段仍然「点了什么都不发生」，
-        // 箭头热区实际收窄到 111.5 起（34.5pt；字形 11pt 居中，两侧余量仍够点）。
-        [self addSubview:_midBtn];
-
-        _chev = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.down"]];
-        _chev.contentMode = UIViewContentModeScaleAspectFit;
-        _chev.tintColor = [UIColor secondaryLabelColor];
-        _chev.userInteractionEnabled = NO;
-        [_menuBtn addSubview:_chev];
-
-        // v0.4.39：展开后只有左端这块 48pt 圆形热区能收回成球。
-        // 之前整个胶囊都挂了 touchUpInside，点名字中间也会"啪"一下缩回去。
-        _homeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-        _homeBtn.frame = CGRectZero;
-        _homeBtn.hidden = YES;
-        [_homeBtn addTarget:self action:@selector(sl_homeTap) forControlEvents:UIControlEventTouchUpInside];
-        [_homeBtn addTarget:self action:@selector(sl_homeDown) forControlEvents:UIControlEventTouchDown];
-        [_homeBtn addTarget:self action:@selector(sl_homeUp)
-           forControlEvents:UIControlEventTouchUpOutside | UIControlEventTouchCancel];
-        [self addSubview:_homeBtn];
-
-        _homeHit = [[UIView alloc] initWithFrame:CGRectZero];
-        _homeHit.backgroundColor = [UIColor clearColor];
-        _homeHit.layer.cornerRadius = 24.0;
-        _homeHit.userInteractionEnabled = NO;
-        [_homeBtn addSubview:_homeHit];
-
         // 就绪小蓝点：状态常亮时一直在，提醒「这次说的是包里那条」
         _readyDot = [[UIView alloc] initWithFrame:CGRectZero];
         _readyDot.backgroundColor = [UIColor systemGreenColor];   // v0.4.57：就绪态是绿，亮点也跟着绿，别冒出一颗蓝点
@@ -478,9 +386,10 @@ static UIImage *SLTransparentImage(void) {
         [self addSubview:_readyDot];
 
         [self addTarget:self action:@selector(sl_tap) forControlEvents:UIControlEventTouchUpInside];
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(sl_pan:)];
-        [self addGestureRecognizer:pan];
+        _pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(sl_pan:)];
+        [self addGestureRecognizer:_pan];
         UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(sl_longPress:)];
+        // 0.45 而不是 0.35：球本身能拖动，按得太浅会在「想拖」的时候误开扇
         lp.minimumPressDuration = 0.45;
         lp.allowableMovement = 12;   // 拖动换位置时不会误触
         [self addGestureRecognizer:lp];
@@ -524,11 +433,7 @@ static UIImage *SLTransparentImage(void) {
     if (img) {
         _thumb.image = img;
         _thumb.hidden = NO;
-        _haze.image = SLHazeImage(img, 32, 6);
-        // v0.4.77：色晕不随状态让位，这里也兜一次 —— 换图前若被旧逻辑压到 0 会一直不显。
-        _haze.alpha = 0.36;
     } else {
-        _haze.image = nil;
         // 48pt 里六根条太密，前 3 根 30% 的几乎看不见，糊成一团。
         // 球和胶囊上换成四根（两淡两实）、条更粗；大尺寸仍用六根。
         _glyph.image = [SLBrandGlyphCompact(44, [UIColor blackColor]) imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
@@ -536,8 +441,6 @@ static UIImage *SLTransparentImage(void) {
         _glyph.hidden = NO;
         _glyph.alpha = 0.0;   // v0.4.49：静态图不显示，实际由 _bars 逐根绘制 + 动画
     }
-    _name.text = SLCamCurrentName();
-    [self sl_resizePillForName];
     [self setNeedsLayout];
     // v0.4.74：换图标后要按新形态重挂（换成自定义图片才动，换回四杠就清干净）
     [self sl_updateIconMotion];
@@ -736,7 +639,6 @@ static UIImage *SLTransparentImage(void) {
         self->_tint.alpha = useTint ? 1.0 : 0.0;
         // v0.4.77：色晕不再让位（见上），整块胶囊从头到尾是同一个底，没有「白一下」的过渡。
         self->_glyph.tintColor = accent ?: [UIColor labelColor];
-        self->_name.textColor = accent ?: [UIColor labelColor];
         // 四杠跟着换色：几何不变，只有背景色随动画块交叉淡入淡出（as[i] 透明度恒定）
         [self sl_layoutBars];
     } completion:nil];
@@ -772,10 +674,6 @@ static UIImage *SLTransparentImage(void) {
     _haloOut.strokeColor = halo.CGColor;
     [CATransaction commit];
     [self sl_startBreath:state];
-    // v0.4.41：状态一变就重读名字。原来只改颜色不改文字，发完那一发胶囊还挂着
-    // 刚才的包名 —— 用户以为没发出去，实际问题只是字没刷新。
-    _name.text = SLCamCurrentName();
-    [self sl_resizePillForName];
     [self setNeedsLayout];
 }
 
@@ -846,135 +744,42 @@ static UIImage *SLTransparentImage(void) {
     [self.layer addAnimation:b forKey:@"slSettle"];
 }
 
-#pragma mark 展开 / 收起
+#pragma mark 长按扇
 
-- (CGSize)sl_pillSize {
-    // v0.4.37：原来固定撑满 196，「原声」两个字也占 196，中间空 66pt。
-    // v0.4.76：宽度跟着名字走（146~196 自适应）。
-    // v0.4.77：定回固定 146 —— 要的是「胶囊最短的那一档」，尺寸恒定，
-    // 展开动画、换音色都不再跳。
-    // v0.4.79：窗口改成 146 - 54（图标侧）- 34.5（箭头侧）= 57.5pt，
-    // 12.5pt 字号下四个汉字（50pt）能完整静止，五个字起才滚。
-    _name.text = SLCamCurrentName();
-    return CGSizeMake(SLPillMinW, SLBallSide);
+// 球贴哪条边：取四个方向里最近的那条。贴角落时上下 / 左右距离接近，
+// 取到哪条都不算错 —— SLFanView 内部会把扇角收窄、半径缩小，保证不出屏。
+- (SLFanEdge)sl_edgeForCenter:(CGPoint)c inSize:(CGSize)sz {
+    CGFloat dL = c.x, dR = sz.width - c.x, dT = c.y, dB = sz.height - c.y;
+    CGFloat m = MIN(MIN(dL, dR), MIN(dT, dB));
+    if (m == dL) return SLFanEdgeLeft;
+    if (m == dR) return SLFanEdgeRight;
+    if (m == dT) return SLFanEdgeTop;
+    return SLFanEdgeBottom;
 }
 
-/// v0.4.76：名字放得下就居中静止，放不下就把 label 拉宽跑滚动。
-/// 动的是 transform.translation.x，layoutSubviews 重排不会把它拍回 0。
-- (void)sl_layoutNameMarquee {
-    CGFloat cw = CGRectGetWidth(_nameClip.bounds);
-    CGFloat chh = CGRectGetHeight(_nameClip.bounds);
-    if (cw <= 0.0 || chh <= 0.0) return;
-    [_name.layer removeAnimationForKey:@"slNameMarquee"];
-    CGSize sz = [_name sizeThatFits:CGSizeMake(CGFLOAT_MAX, chh)];
-    CGFloat tw = ceil(sz.width);
-    // v0.4.77：窗口窄，不能再要求「左右各留 6pt」—— 本来放得下的名字会被判成
-    // 溢出，然后挤出几 pt 的空滚，肉眼看就是「名字抖一下」。放得下就居中，真溢出才滚。
-    if (tw <= cw + 0.5) {
-        _name.frame = CGRectMake(0, 0, cw, chh);
-        _name.textAlignment = NSTextAlignmentCenter;
-        _name.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        return;
+- (void)sl_showFan {
+    UIView *sv = self.superview;
+    if (!sv) return;
+    if (_fan) {
+        [_fan removeFromSuperview];
+        _fan = nil;
     }
-    _name.frame = CGRectMake(0, 0, tw, chh);
-    _name.textAlignment = NSTextAlignmentLeft;
-    _name.lineBreakMode = NSLineBreakByClipping;
-    if (!self.slExpanded || self.window == nil) return;
-    [self sl_startNameMarquee];
+    CGSize sz = sv.bounds.size;
+    _fan = [[SLFanView alloc] initWithHostSize:sz ballCenter:self.center
+                                          edge:[self sl_edgeForCenter:self.center inSize:sz]];
+    // 扇压在球下面：手指是从球心出发的，球本身不能被盖住
+    [sv insertSubview:_fan belowSubview:self];
+    [_fan sl_show];
 }
 
-- (void)sl_startNameMarquee {
-    CGFloat cw = CGRectGetWidth(_nameClip.bounds);
-    CGFloat tw = CGRectGetWidth(_name.frame);
-    CGFloat dist = tw - cw + 6.0;
-    if (dist <= 1.0) return;
-    // 停 1.2s → 匀速左移（26pt/s）→ 末尾停 1.2s → 跳回
-    // v0.4.77：定宽后需要滚的距离普遍只有十几 pt，原来 MAX(1.6, …) 会把 15pt 拉成 1.6s
-    //（≈9pt/s，看着像在爬）。改成按速度算，上下各卡一道：0.9s 下限、2.4s 上限。
-    CGFloat hold = 1.2, move = MAX(0.9, MIN(2.4, dist / 26.0)), total = hold + move + hold;
-    CAKeyframeAnimation *a = [CAKeyframeAnimation animationWithKeyPath:@"transform.translation.x"];
-    a.values = @[@0.0, @0.0, @(-dist), @(-dist), @0.0];
-    a.keyTimes = @[@0.0, @(hold / total), @((hold + move) / total), @0.999, @1.0];
-    a.duration = total;
-    a.repeatCount = HUGE_VALF;
-    a.removedOnCompletion = NO;
-    [_name.layer addAnimation:a forKey:@"slNameMarquee"];
-}
-
-/// v0.4.76：换包 / 状态变化后名字变了，展开态要跟着改宽度（否则会留一段空白或多截一截）
-- (void)sl_resizePillForName {
-    if (!self.slExpanded || self.window == nil) return;
-    CGSize sz = [self sl_pillSize];
-    CGRect f = self.frame;
-    if (fabs(sz.width - CGRectGetWidth(f)) < 0.5) return;
-    if (_mirrored) f.origin.x = CGRectGetMaxX(f) - sz.width;
-    f.size = sz;
-    if (self.superview) {
-        CGFloat minX = 6.0, maxX = CGRectGetWidth(self.superview.bounds) - 6.0;
-        if (CGRectGetMaxX(f) > maxX) f.origin.x = maxX - sz.width;
-        if (f.origin.x < minX) f.origin.x = minX;
-    }
-    [UIView animateWithDuration:0.22 delay:0
-                        options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionCurveEaseOut
-                     animations:^{ self.frame = f; }
-                     completion:nil];
-}
-
-- (void)sl_expand:(BOOL)expanded animated:(BOOL)animated {
-    if (self.slExpanded == expanded) return;
-    if (expanded) _name.text = SLCamCurrentName();
-    BOOL wasMirrored = _mirrored;
-    self.slExpanded = expanded;
-
-    CGSize target = expanded ? [self sl_pillSize] : CGSizeMake(SLBallSide, SLBallSide);
-    CGRect f = self.frame;
-    CGRect nf = f;
-    nf.size = target;
-    if (expanded) {
-        // 贴右边就向左长，贴左边就向右长，尽量不越出屏幕。
-        // v0.4.40：这个方向同时决定胶囊内部镜像 —— 图标端永远停在球原来的位置，
-        // 否则球在右边时图标被顶到最左、箭头正好压在球原位上，看起来像整颗球瞬移了。
-        BOOL growLeft = YES;
-        if (self.superview) growLeft = (CGRectGetMidX(f) > CGRectGetMidX(self.superview.bounds));
-        _mirrored = growLeft;
-        if (growLeft) nf.origin.x = CGRectGetMaxX(f) - target.width;
-        if (self.superview) {
-            CGFloat minX = 6.0, maxX = CGRectGetWidth(self.superview.bounds) - 6.0;
-            if (CGRectGetMaxX(nf) > maxX) nf.origin.x = maxX - target.width;
-            if (nf.origin.x < minX) nf.origin.x = minX;
-        }
-    } else {
-        // v0.4.41：收起时球要落回「图标那一端」，不是胶囊的左边缘。
-        // 向左长（镜像）的胶囊图标在右端，直接缩 origin.x 会让球无视觉地跳到左边去。
-        if (wasMirrored) nf.origin.x = CGRectGetMaxX(f) - SLBallSide;
-        _mirrored = NO;
-        if (self.superview) {
-            CGPoint c = SLClampFloatPos(CGPointMake(CGRectGetMidX(nf), CGRectGetMidY(nf)),
-                                        self.superview.bounds.size);
-            nf.origin = CGPointMake(c.x - SLBallSide / 2.0, c.y - SLBallSide / 2.0);
-            // 拖动过的胶囊，收起来之后这个位置就是球以后的新家
-            SLStoreFloatPos(c, self.superview.bounds.size);
-        }
-    }
-
-    // 直接换尺寸，不做插值：形变过程中玻璃层会被系统重新采样，反而留残影。
-    // 手感靠文字淡入补回来。
-    self.frame = nf;
-    [self setNeedsLayout];
-    [self layoutIfNeeded];
-
-    if (animated) {
-        _name.alpha = 0.0;
-        _chev.alpha = 0.0;
-        [UIView animateWithDuration:0.15 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
-            self->_name.alpha = 1.0;
-            self->_chev.alpha = 1.0;
-        } completion:nil];
-    } else {
-        _name.alpha = 1.0;
-        _chev.alpha = 1.0;
-    }
-    [self sl_startBreath:self.slState];
+- (void)sl_hideFan {
+    SLFanView *f = _fan;
+    _fan = nil;
+    if (!f) return;
+    [f sl_hide];
+    // 等收起动画跑完再摘，直接 remove 会「啪」地消失
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [f removeFromSuperview]; });
 }
 
 #pragma mark 手势
@@ -983,33 +788,6 @@ static UIImage *SLTransparentImage(void) {
     UIView *sv = self.superview;
     if (!sv) return;
     CGSize sz = sv.bounds.size;
-
-    // v0.4.46：展开态拖动 = 「跟手 + 翻面 + 贴边」三件事。
-    // v0.4.41 那版故意不吸附、且镜像只在展开那一刻算一次，结果把胶囊拖到另一边时
-    // 内部布局一动不动 —— 看着就是「不贴边、不镜像」。
-    if (self.slExpanded) {
-        if (g.state == UIGestureRecognizerStateChanged) {
-            CGPoint t = [g translationInView:sv];
-            CGRect f = self.frame;
-            f.origin.x += t.x;
-            f.origin.y += t.y;
-            CGFloat minX = 6.0, maxX = sz.width - 6.0 - f.size.width;
-            if (maxX < minX) maxX = minX;
-            if (f.origin.x < minX) f.origin.x = minX;
-            if (f.origin.x > maxX) f.origin.x = maxX;
-            CGFloat minY = 8.0, maxY = sz.height - 8.0 - f.size.height;
-            if (maxY < minY) maxY = minY;
-            if (f.origin.y < minY) f.origin.y = minY;
-            if (f.origin.y > maxY) f.origin.y = maxY;
-            self.frame = f;
-            [g setTranslation:CGPointZero inView:sv];
-            [self sl_updateMirrorDuringDrag];            // 越过中线就翻面
-        } else if (g.state == UIGestureRecognizerStateEnded
-                   || g.state == UIGestureRecognizerStateCancelled) {
-            [self sl_settlePillToEdge];                  // 松手贴到最近那条边
-        }
-        return;
-    }
 
     if (g.state == UIGestureRecognizerStateChanged) {
         CGPoint t = [g translationInView:sv];
@@ -1034,218 +812,77 @@ static UIImage *SLTransparentImage(void) {
     }
 }
 
-// v0.4.46：拖动中翻面。以屏幕中线为界，带 10pt 滞后 ——
-// 没有滞回的话，胶囊中心在准线上时手指的微小抖动会让内部布局左右乱跳。
-- (void)sl_updateMirrorDuringDrag {
-    UIView *sv = self.superview;
-    if (!sv) return;
-    CGFloat mid = CGRectGetMidX(sv.bounds);
-    CGFloat cx = CGRectGetMidX(self.frame);
-    static const CGFloat kHyst = 10.0;
-
-    BOOL want = _mirrored;
-    if (!_mirrored && cx > mid + kHyst) want = YES;
-    else if (_mirrored && cx < mid - kHyst) want = NO;
-    if (want == _mirrored) return;
-
-    _mirrored = want;
-    // 直接换布局，不做插值：玻璃层跟着重排会留残影，而拖动时手指本身就在动，
-    // 瞬间换边看着是「翻了个面」，比插值更像一体的 196pt 条。
-    [self setNeedsLayout];
-    [self layoutIfNeeded];
-}
-
-// v0.4.46：松手贴边，贴哪条边由图标端决定（图标端就是收起后球的位置）。
-// v0.4.80：回退 v0.4.79 的「离边 40pt 内才吸 / 中心判定 / 0.2s 无过冲」，
-// 恢复一律贴边 + 弹簧回弹。垂直方向不吸附（上下位置保持用户放的样子），
-// 只把新球位记下来。
-- (void)sl_settlePillToEdge {
-    UIView *sv = self.superview;
-    if (!sv) return;
-    CGSize sz = sv.bounds.size;
-    CGRect f = self.frame;
-    static const CGFloat kEdgePad = 6.0;
-    CGFloat leftX = kEdgePad;
-    CGFloat rightX = sz.width - kEdgePad - f.size.width;
-    if (rightX < leftX) rightX = leftX;   // 胶囊比屏还宽时只保证左缘不越界
-
-    BOOL wasMirrored = _mirrored;
-    // 图标端落在哪半屏就贴哪条边 —— 收起后球就长在图标端，看着是「球滑到最近的边」
-    CGFloat iconX = _mirrored ? (CGRectGetMaxX(f) - SLBallSide / 2.0)
-                              : (CGRectGetMinX(f) + SLBallSide / 2.0);
-    BOOL toLeft = (iconX < sz.width / 2.0);
-    _mirrored = !toLeft;
-
-    CGRect nf = f;
-    nf.origin.x = toLeft ? leftX : rightX;
-
-    if (_mirrored != wasMirrored) {
-        // 先把内部翻好再滑动：两步都在一帧里完成，但顺序上「先确定面孔再挪位置」，
-        // 不会出现滑到一半内部还在旧朝向。
-        [self setNeedsLayout];
-        [self layoutIfNeeded];
-    }
-
-    [UIView animateWithDuration:0.22 delay:0
-         usingSpringWithDamping:0.86 initialSpringVelocity:0
-                        options:UIViewAnimationOptionBeginFromCurrentState
-                     animations:^{ self.frame = nf; }
-                     completion:nil];
-
-    CGPoint c = CGPointMake(_mirrored ? (CGRectGetMaxX(nf) - SLBallSide / 2.0)
-                                      : (CGRectGetMinX(nf) + SLBallSide / 2.0),
-                            CGRectGetMidY(nf));
-    SLStoreFloatPos(SLClampFloatPos(c, sz), sz);
-}
-
 - (void)sl_tap {
-    // 长按刚结束时个别机型还会补一次 touchUpInside，这里挡掉，免得胶囊一展开就被收回
+    // 长按结束后个别机型还会补一次 touchUpInside，这里挡掉，
+    // 否则「长按出扇 → 松手」会顺带把素材库也弹出来。
     if (CFAbsoluteTimeGetCurrent() - _longPressAt < 0.7) return;
-    // v0.4.45：展开态点中间不做任何事 —— 用户要的是「点名字毫无反应，只有按住能拖」。
-    // 收回成球只认图标那一端（_homeBtn → sl_homeTap）。
-    if (self.slExpanded) return;
-    // 关掉「启用语音包」后点球不展开，也不弹任何提示：想让球消失是用户的选择，
-    // 不需要每次点都被告知一遍怎么打开设置。
-    if (!SLCamEnabled()) return;
-    [self sl_expand:YES animated:YES];
-}
-
-- (void)sl_homeDown {
-    _homeHit.backgroundColor = [[UIColor labelColor] colorWithAlphaComponent:0.08];
-}
-
-- (void)sl_homeUp {
-    _homeHit.backgroundColor = [UIColor clearColor];
-}
-
-- (void)sl_homeTap {
-    _homeHit.backgroundColor = [UIColor clearColor];
-    if (CFAbsoluteTimeGetCurrent() - _longPressAt < 0.7) return;
-    [self sl_expand:NO animated:YES];
-}
-
-- (void)sl_menuTap {
-    // 底包不管箭头后面是什么：业务侧在这个回调里弹自己的面板
-    // （素材列表 / 参数面板都行），没接就什么都不发生。
+    // 关掉「启用」之后球也要能点：素材库跟启用状态无关，
+    // 用户常常是「先换素材，再打开开关」，这里不能拦。
     SLCamHandleArrowTap(self);
 }
 
 - (void)sl_longPress:(UILongPressGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateBegan) return;
-    _longPressAt = CFAbsoluteTimeGetCurrent();
-    // v0.4.47：球态长按任意处进设置；胶囊态仅 logo 端（图标那一端）长按进设置，
-    // 中段长按留给拖动——「长按 logo 进设置」与「长按中段拖动」互不冲突。
-    if (self.slExpanded) {
-        CGPoint p = [g locationInView:self];
-        if (!CGRectContainsPoint(_homeBtn.frame, p)) return;
-    }
-    // v0.4.65：设置已开着时长按球 = 关闭设置（不必再点「完成」）
-    if ([SLFloatPanelController isSettingsOpen]) {
-        [SLFloatPanelController dismissSettings];
+    UIView *sv = self.superview;
+    if (!sv) return;
+
+    if (g.state == UIGestureRecognizerStateBegan) {
         _longPressAt = CFAbsoluteTimeGetCurrent();
+        // 扇展开期间手指要在扇上滑动，pan 必须停掉，否则球会跟着手指跑
+        _pan.enabled = NO;
+        [self sl_showFan];
         return;
     }
-    UIViewController *top = SLTopViewController();
-    if (!top) return;
-    [SLFloatPanelController presentSettingsFrom:top];
-    // 重新打时间戳：松手时的 touchUpInside 不会再误触发「展开 / 收起」
-    _longPressAt = CFAbsoluteTimeGetCurrent();
+    if (g.state == UIGestureRecognizerStateChanged) {
+        if (_fan) [_fan sl_trackPoint:[g locationInView:sv]];
+        return;
+    }
+    if (g.state == UIGestureRecognizerStateEnded ||
+        g.state == UIGestureRecognizerStateCancelled) {
+        _longPressAt = CFAbsoluteTimeGetCurrent();
+        _pan.enabled = YES;
+        if (_fan) {
+            NSInteger sw = _fan.slPickedSwitch;
+            NSInteger ang = _fan.slPickedAngle;
+            [self sl_hideFan];
+            if (g.state == UIGestureRecognizerStateEnded) SLFanCommit(sw, ang);
+        }
+    }
 }
 
 #pragma mark 布局
 
-// v0.4.77：只画「看得见玻璃」的那一段轮廓。
-// 照片当端帽时，它朝外那一侧与胶囊轮廓是同一条曲线 —— 线画上去只会压在照片上，
-// 所以从照片直边起笔、绕到另一端再收在直边；球态照片铺满整颗球，没有玻璃可勾，返回 nil
-// （边界交给外圈光环）。半圆用两段三次贝塞尔拼，避开 addArc 的 clockwise 方向坑。
+// 球态只有一种形状：正圆。原来这里是一整套「球 / 胶囊」两套布局，
+// 胶囊移除后 _chrome 不用再铺成 196 宽靠 mask 裁，直接等于 bounds。
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGRect b = self.bounds;
     CGFloat w = CGRectGetWidth(b);
     CGFloat h = SLBallSide;
-    BOOL exp = self.slExpanded;
 
     _glassHost.frame = b;
     _glassHost.layer.cornerRadius = h / 2.0;
-    // v0.4.76：去掉 cornerCurve = continuous。描边曾经走连续曲率、遮罩走正圆，
-    // 两条曲线在圆头两端差 0.3~0.5pt，正是「白线只剩中间一段」的另一半原因。
     _glassMask.path = [UIBezierPath bezierPathWithRoundedRect:b cornerRadius:h / 2.0].CGPath;
-    // 玻璃始终是最大尺寸，只靠 mask 露出当前形状，右对齐
-    // v0.4.40：镜像开关。MX(x, wd) 把「距左 x」翻成「距右 x」，宽度不变的居中元素不要用它。
-    BOOL mir = exp ? _mirrored : NO;
-#define SLMX(x, wd) (mir ? (w - (x) - (wd)) : (x))
-    _chrome.frame = CGRectMake(mir ? 0 : (w - SLPillMaxW), 0, SLPillMaxW, h);
+    _chrome.frame = b;
 
-    // v0.4.39：左图标与球态同尺寸（22pt，不再缩水到 18），头像 32 → 42
-    _glyph.frame = exp ? CGRectMake(SLMX(13.0, 22.0), (h - 22.0) / 2.0, 22.0, 22.0)
-                       : CGRectMake((w - 22.0) / 2.0, (h - 22.0) / 2.0, 22.0, 22.0);
+    _glyph.frame = CGRectMake((w - 22.0) / 2.0, (h - 22.0) / 2.0, 22.0, 22.0);
     _glyph.hidden = (_thumb.hidden == NO);
-    // v0.4.49：四杠容器跟随 _glyph 的位置与显隐；自定义头像时自动让位
     _bars.frame = _glyph.frame;
     _bars.hidden = _glyph.hidden;
     [self sl_layoutBars];
-    // v0.4.44：自定义图标在球态是铺满 48 的，展开态原来缩到 42，切胶囊时明显小一圈。
-    // 改成两种形态都用满 48（左端留出一整块圆形），球和胶囊的图标视觉尺寸就一致了。
-    CGFloat iconS = SLBallSide;
-    _thumb.frame = exp ? CGRectMake(SLMX(0.0, iconS), 0, iconS, iconS) : b;
-    // v0.4.79：端帽遮罩已回退，这里不再重建 thumbMask，只给 _hairline 换路径。
+
+    _thumb.frame = b;
+
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    // v0.4.76：勾边路径跟着胶囊外形走，内缩 0.4 让 0.8pt 描边正好压在边界上。
-    // v0.4.79：照片回正圆后不再需要「绕开照片」的开放路径 —— 正圆和胶囊圆头是
-    // 同一条曲线，那个「直边起点」不存在了，硬用开放路径会让照片右侧空出 20pt 没描边。
-    // 现在一律画整圈圆角矩形；_hairline 排在 _thumb 之下，左端那半圈被照片吃掉，
-    // 只露出照片外面 0.4pt 那一环 —— 既不会白线压脸，也不会有断头。
     _hairline.frame = b;
     _hairline.path = [UIBezierPath bezierPathWithRoundedRect:CGRectInset(b, 0.4, 0.4)
                                                 cornerRadius:MAX(0.0, h / 2.0 - 0.4)].CGPath;
     [CATransaction commit];
-    // v0.4.75：色晕跟玻璃同尺寸铺满（球态被 _glassMask 裁成圆）。
-    // v0.4.78：色晕必须铺满整块玻璃（196），不能只铺「可见的那 146」。
-    // v0.4.77 曾把左边界对齐到可见区起点 —— 那个点在 _chrome 坐标里正好是胶囊最左端，
-    // 也就是照片圆头的最左切点，色晕在切线处断成一条竖直硬边，放大就是照片边上那道细线。
-    // 铺满 196 后硬边落在 _glassMask 之外（玻璃左边被裁掉的那 50pt），永远看不见。
-    _haze.frame = CGRectMake(0, 0, SLPillMaxW, h);
 
-    // v0.4.37：状态色铺满整条胶囊。原来展开态只盖左侧 48pt 圆，
-    // 球是蓝的、胶囊还是白玻璃，中间像被切断。
     _tint.frame = b;
     _tint.layer.cornerRadius = h / 2.0;
 
-    // v0.4.40：两端各一块 48pt 热区，中间 100pt 给名字（居中）。
-    // 镜像时两端互换、中间不动 —— 图标端跟着球走，箭头端永远在远端。
-    // v0.4.79：删掉 57 那条竖分隔线（0.5pt 宽、和底色只差 4 个色阶，本来就看不见，
-    // 却正好贴在文字左边界上，把名字往图片那边推）。
-    // 名字窗口 54 → 111.5（宽 57.5）：原来右边界卡在箭头热区的左界 98，而箭头字形
-    // 116.5 才起笔 —— 中间 18.5pt 全空，看着就是「离图标太近、右边太空」。
-    // 现在两侧留白对称（靠图标 54 / 靠箭头 34.5），文字中心 82.75 落在视觉中轴上。
-    const CGFloat kNearIcon = 54.0;    // 靠图标那一侧的留白
-    const CGFloat kNearChev = 34.5;    // 靠箭头那一侧的留白（箭头字形 18.5 起笔、11pt 宽）
-    const CGFloat kNameW = MAX(0.0, w - kNearIcon - kNearChev);
-    {
-        CGFloat nx = mir ? kNearChev : kNearIcon;
-        _nameClip.frame = CGRectMake(nx, 0, kNameW, h);
-        [self sl_layoutNameMarquee];
-    }
-    // v0.4.45：中间这块必须有个真的控件接走触摸，否则触摸落到 self 上会被收走。
-    // 这里只接触摸、不挂 target —— 点名字什么都不该发生。
-    // v0.4.79：范围从「48 → w-48」改成「图标端余量 → 名字窗口右界」，跟着窗口走。
-    {
-        CGFloat midX0 = mir ? kNearChev : 48.0;
-        CGFloat midX1 = mir ? (w - 48.0) : (kNearIcon + kNameW);
-        _midBtn.frame = exp ? CGRectMake(midX0, 0, MAX(0.0, midX1 - midX0), h) : CGRectZero;
-    }
-    _menuBtn.frame = exp ? CGRectMake(SLMX(w - 48.0, 48.0), 0, 48.0, h) : CGRectZero;
-    _chev.frame = CGRectMake(18.5, (h - 11.0) / 2.0, 11.0, 11.0);
-    _homeBtn.frame = exp ? CGRectMake(SLMX(0.0, 48.0), 0, 48.0, h) : CGRectZero;
-    _homeHit.frame = _homeBtn.bounds;
-    _readyDot.frame = CGRectMake(mir ? 5.0 : (w - 14.0), 3.0, 9.0, 9.0);
-#undef SLMX
-
-    _nameClip.hidden = !exp;
-    _midBtn.hidden = !exp;
-    _menuBtn.hidden = !exp;
-    _homeBtn.hidden = !exp;
+    _readyDot.frame = CGRectMake(w - 14.0, 3.0, 9.0, 9.0);
 
     // 光晕路径：胶囊就是「圆角 = 高一半」的矩形，球是它的特例
     _haloIn.path = [UIBezierPath bezierPathWithRoundedRect:CGRectInset(b, -2.5, -2.5)

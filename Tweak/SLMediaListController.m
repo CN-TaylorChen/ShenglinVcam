@@ -20,6 +20,28 @@
 @property (nonatomic, strong) NSArray<SLMediaItem *> *items;
 @end
 
+// 素材页和设置页住的是同一个浮窗容器，不能「在浮窗里再叠一个浮窗」——
+// 必须先把素材页关掉，再推设置页。
+//
+// 但 dismiss 是带 0.3s 动画的，`presentFrom:` 里那句 `host.presentedViewController`
+// 在动画跑完之前一直为真，写死一个 delay 赌时间会赌输（CrossDissolve 实测 0.35s 上下）。
+// 所以改成轮询：每 0.1s 试一次，最多 1.5s。
+//
+// 用 C 函数而不是方法，是因为素材页在 dismiss 之后立刻就被释放了，
+// 捕获 self 的 weak 指针到这里已经是 nil，设置页就永远打不开。
+static void SLPresentSettingsWhenFree(UIViewController *host, NSInteger attempt) {
+    if (!host) return;
+    if (host.presentedViewController == nil) {
+        [SLFloatPanelController presentSettingsFrom:host];
+        return;
+    }
+    if (attempt >= 15) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        SLPresentSettingsWhenFree(host, attempt + 1);
+    });
+}
+
 @implementation SLMediaListController
 
 - (instancetype)init {
@@ -36,6 +58,9 @@
         SLPillBarItem(@"完成", self, @selector(sl_done)),
         SLPillIconBarItem(@"plus", nil, self, @selector(sl_pick)),
     ];
+    // 胶囊移除后，设置面板的入口挪到这里：单击球 → 素材页 → 左上角齿轮 → 设置。
+    // 放左边是因为右边「完成 / ＋」两个位置都占满了，而「完成」必须留在最右。
+    self.navigationItem.leftBarButtonItem = SLPillIconBarItem(@"gearshape", @"设置", self, @selector(sl_openSettings));
     self.tableView.estimatedSectionFooterHeight = 28;
     self.tableView.estimatedSectionHeaderHeight = 26;
     [self sl_reload];
@@ -53,6 +78,14 @@
 
 - (void)sl_done {
     SLCloseHostingPanel(self);
+}
+
+// 胶囊移除后，设置面板的入口挪到这里：单击球 → 素材页 → 左上角齿轮 → 设置。
+- (void)sl_openSettings {
+    UIViewController *host = self.presentingViewController;
+    if (!host) return;
+    [SLFloatPanelController dismissSettings];
+    SLPresentSettingsWhenFree(host, 0);
 }
 
 - (void)sl_pick {
