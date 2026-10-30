@@ -213,6 +213,15 @@ static BOOL SLSaveFloatIconImage(UIImage *img) {
 }
 
 static void SLApplyFloatIcon(UIButton *btn);
+
+// 0.2.27：球贴边时离屏幕边缘留多少。
+//
+// 原来写死 4pt，但外圈光晕是 CGRectInset(b, -7, -7) + 2pt 描边 —— 向外要 8pt。
+// 留 4pt 装 8pt 的东西，贴边那一侧的光晕就被屏幕切掉一条弧，看着像缺了一块。
+// 10pt = 光晕 8pt + 2pt 余量，阴影（radius 9 / offset y+3）也基本容得下。
+// 拖动的实时夹取和松手贴边都用这一个值，别各写一份。
+static const CGFloat SLBallEdgeInset = 10.0;
+
 // v0.4.40：位置相关的三个工具（定义在文件后面，拖动手势要用到）
 static CGSize SLHostSizeFor(UIView *sv);
 static CGPoint SLClampFloatPos(CGPoint c, CGSize size);
@@ -855,7 +864,7 @@ static void SLShowMediaPreview(void);
         CGPoint t = [g translationInView:sv];
         // 原来只做 center += 位移，没有任何边界判断 → 能整颗拖出屏幕，
         // 存下来的又是绝对坐标，换设备/横屏恢复后就在屏外。
-        // 现在实时夹在界内（左右各留 4pt，上让状态栏，下让底部安全区）。
+        // 现在实时夹在界内（左右各留 SLBallEdgeInset，上让状态栏，下让底部安全区）。
         self.center = SLClampFloatPos(CGPointMake(self.center.x + t.x, self.center.y + t.y), sz);
         [g setTranslation:CGPointZero inView:sv];
     } else if (g.state == UIGestureRecognizerStateEnded
@@ -863,7 +872,8 @@ static void SLShowMediaPreview(void);
         // 松手吸附到最近的一条边，避免球卡在屏幕中间挡住内容
         CGFloat half = SLBallSide / 2.0;
         CGPoint c = self.center;
-        c.x = (c.x < sz.width / 2.0) ? (half + 4.0) : (sz.width - half - 4.0);
+        c.x = (c.x < sz.width / 2.0) ? (half + SLBallEdgeInset)
+                                     : (sz.width - half - SLBallEdgeInset);
         c = SLClampFloatPos(c, sz);
         [UIView animateWithDuration:0.22 delay:0
              usingSpringWithDamping:0.85 initialSpringVelocity:0
@@ -1416,8 +1426,8 @@ static CGSize SLHostSizeFor(UIView *sv) {
 static CGPoint SLClampFloatPos(CGPoint c, CGSize size) {
     if (size.width <= 0 || size.height <= 0) return c;
     CGFloat half = SLBallSide / 2.0;
-    CGFloat minX = half + 4.0;
-    CGFloat maxX = size.width - half - 4.0;
+    CGFloat minX = half + SLBallEdgeInset;
+    CGFloat maxX = size.width - half - SLBallEdgeInset;
     CGFloat minY = half + 56.0;                 // 让开状态栏 / 刘海
     CGFloat maxY = size.height - half - 34.0;   // 让开底部安全区
     if (maxX < minX) { c.x = size.width / 2.0; }
