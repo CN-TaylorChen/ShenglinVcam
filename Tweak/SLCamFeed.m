@@ -84,6 +84,11 @@
 - (NSData *)sl_audioLocked:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes configure:(BOOL)configure;
 - (NSData *)sl_convertAudio:(NSData *)input;
 - (NSInteger)sl_normalizedRotation;
+- (nullable CIImage *)sl_image:(CIImage *)img
+                       toWidth:(size_t)w
+                        height:(size_t)h
+                        mirror:(BOOL)mirror
+                      rotation:(NSInteger)rotation;
 - (CVPixelBufferRef)sl_render:(CVPixelBufferRef)src
                       toWidth:(size_t)w
                        height:(size_t)h
@@ -599,34 +604,12 @@
     size_t sh = CVPixelBufferGetHeight(src);
     if (sw < 1 || sh < 1) { CVPixelBufferRelease(dst); return NULL; }
 
-    CIImage *img = [CIImage imageWithCVPixelBuffer:src];
-
-    // 1) 旋转。CI 是 y 轴向上的坐标系，视觉上的「顺时针」要取负角度。
-    //    旋转后 extent 会跑到负象限，必须平移回 (0,0)，否则后面缩放会按错的框算。
-    if (rotation != 0) {
-        img = [img imageByApplyingTransform:CGAffineTransformMakeRotation(-rotation * M_PI / 180.0)];
-        CGRect e = img.extent;
-        img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(-e.origin.x, -e.origin.y)];
-    }
-
-    // 2) 铺满目标框再居中裁切（aspect-fill）。直接拉伸会把人脸拉扁，
-    //    竖屏素材塞进横屏预览时尤其明显。
-    CGRect re = img.extent;
-    if (re.size.width < 1 || re.size.height < 1) { CVPixelBufferRelease(dst); return NULL; }
-    CGFloat s = MAX((CGFloat)w / re.size.width, (CGFloat)h / re.size.height);
-    img = [img imageByApplyingTransform:CGAffineTransformMakeScale(s, s)];
-
-    CGRect se = img.extent;
-    img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(
-        ((CGFloat)w - se.size.width) / 2.0,
-        ((CGFloat)h - se.size.height) / 2.0)];
-
-    // 3) 镜像：在目标坐标系里水平翻转，翻转后再平移回 (0,0)
-    if (mirror) {
-        img = [img imageByApplyingTransform:CGAffineTransformConcat(
-            CGAffineTransformMakeScale(-1, 1),
-            CGAffineTransformMakeTranslation((CGFloat)w, 0))];
-    }
+    CIImage *img = [self sl_image:[CIImage imageWithCVPixelBuffer:src]
+                          toWidth:w
+                           height:h
+                           mirror:mirror
+                         rotation:rotation];
+    if (!img) { CVPixelBufferRelease(dst); return NULL; }
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     [_ciContext render:img
@@ -647,6 +630,80 @@
         CFRelease(srcAtts);
     }
     return dst;
+}
+
+/// 旋转 + 铺满裁切 + 镜像，全部在 CI 坐标系里做完，返回摆好姿势的图。
+/// `sl_render:`（自己建 buffer）和 `renderIntoPixelBuffer:`（改写宿主 buffer）
+/// 共用这一份数学 —— 两处各写一遍迟早会不一致。
+- (CIImage *)sl_image:(CIImage *)img
+              toWidth:(size_t)w
+               height:(size_t)h
+               mirror:(BOOL)mirror
+             rotation:(NSInteger)rotation {
+    if (!img) return nil;
+
+    // 1) 旋转。CI 是 y 轴向上的坐标系，视觉上的「顺时针」要取负角度。
+    //    旋转后 extent 会跑到负象限，必须平移回 (0,0)，否则后面缩放会按错的框算。
+    if (rotation != 0) {
+        img = [img imageByApplyingTransform:CGAffineTransformMakeRotation(-rotation * M_PI / 180.0)];
+        CGRect e = img.extent;
+        img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(-e.origin.x, -e.origin.y)];
+    }
+
+    // 2) 铺满目标框再居中裁切（aspect-fill）。直接拉伸会把人脸拉扁，
+    //    竖屏素材塞进横屏预览时尤其明显。
+    CGRect re = img.extent;
+    if (re.size.width < 1 || re.size.height < 1) return nil;
+    CGFloat s = MAX((CGFloat)w / re.size.width, (CGFloat)h / re.size.height);
+    img = [img imageByApplyingTransform:CGAffineTransformMakeScale(s, s)];
+
+    CGRect se = img.extent;
+    img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(
+        ((CGFloat)w - se.size.width) / 2.0,
+        ((CGFloat)h - se.size.height) / 2.0)];
+
+    // 3) 镜像：在目标坐标系里水平翻转，翻转后再平移回 (0,0)
+    if (mirror) {
+        img = [img imageByApplyingTransform:CGAffineTransformConcat(
+            CGAffineTransformMakeScale(-1, 1),
+            CGAffineTransformMakeTranslation((CGFloat)w, 0))];
+    }
+    return img;
+}
+
+/// 把当前素材帧画进**调用方给的** buffer，原地改写内容，不换指针、不改所有权。
+///
+/// 为什么要这个方法：`-[AVCapturePhoto pixelBuffer]` 返回的 buffer 归 AVCapturePhoto
+/// 自己所有，调用方拿到的是借用引用。如果我们返回自己 new 出来的 buffer，
+/// 一是调用方不会 CFRelease（每次拍照泄 8MB），二是尺寸/格式跟真照片对不上，
+/// 宿主按 resolvedSettings 算出来的宽高会跟 buffer 打架。
+/// 原地画进去两个问题都不存在：指针、尺寸、格式全是宿主熟悉的那个。
+- (BOOL)renderIntoPixelBuffer:(CVPixelBufferRef)dst {
+    if (!dst) return NO;
+    size_t w = CVPixelBufferGetWidth(dst);
+    size_t h = CVPixelBufferGetHeight(dst);
+    if (w < 1 || h < 1) return NO;
+
+    [_lock lock];
+    CVPixelBufferRef src = _latestVideo ? (CVPixelBufferRef)CVPixelBufferRetain(_latestVideo) : NULL;
+    [_lock unlock];
+    if (!src) return NO;
+
+    CIImage *img = [self sl_image:[CIImage imageWithCVPixelBuffer:src]
+                          toWidth:w
+                           height:h
+                           mirror:self.mirrorEnabled
+                         rotation:[self sl_normalizedRotation]];
+    CVPixelBufferRelease(src);
+    if (!img) return NO;
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    [_ciContext render:img
+       toCVPixelBuffer:dst
+                bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)
+            colorSpace:cs];
+    CGColorSpaceRelease(cs);
+    return YES;
 }
 
 #pragma mark - 出音频

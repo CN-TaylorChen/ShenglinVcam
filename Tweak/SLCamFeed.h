@@ -63,6 +63,13 @@ NS_ASSUME_NONNULL_BEGIN
                                                         size:(CGSize)size
     CF_RETURNS_RETAINED;
 
+/// 把当前素材帧画进**调用方给的** buffer，原地改写内容，不换指针、不改所有权。
+///
+/// 给 `-[AVCapturePhoto pixelBuffer]` 这类「buffer 归宿主所有、只能改内容」的场景用。
+/// 返回自己 new 的 buffer 是不行的：调用方不会 CFRelease（每次拍照泄 8MB），
+/// 而且尺寸/格式跟真照片对不上，宿主按 resolvedSettings 算出的宽高会跟 buffer 打架。
+- (BOOL)renderIntoPixelBuffer:(CVPixelBufferRef)dst;
+
 /// 按宿主音频格式取一段 PCM（素材音频不够长时尾部补静音）。
 /// 没有音频轨、或还没解出数据时返回 nil，注入层放行真实麦克风。
 - (nullable NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd

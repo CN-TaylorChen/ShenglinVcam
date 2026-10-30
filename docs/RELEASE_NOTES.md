@@ -1,3 +1,38 @@
+## 0.2.17 —— 抖音拍照改走 pixelBuffer
+
+0.2.16 的日志把范围缩小到了一行：
+
+```
+16:31:21 注入: 命中 AVCapturePhotoOutput 拍照 · delegate=IESMMCaptureKit
+（之后没有「拍照已接管（AVCapturePhotoOutput）」）
+```
+
+`capturePhotoWithSettings:delegate:` 命中了，`fileDataRepresentation` 没被调用。
+说明抖音（IESMMCaptureKit，字节自家采集 SDK）拍完**不向 AVCapturePhoto 要文件字节**，
+而是直接读 `-pixelBuffer` 拿像素去跑它自己的处理链。只挂 `fileDataRepresentation`
+对它无效。
+
+### 为什么不能直接返回自己 new 的 buffer
+
+`-pixelBuffer` 返回的是**借用**引用（buffer 归 AVCapturePhoto 所有，调用方不负责释放）。
+如果我们返回自己 new 的：
+
+- 调用方不会 `CFRelease` → 每次拍照泄一张 8MB；
+- 尺寸/格式跟真照片对不上 → 宿主按 `resolvedSettings` 算出的宽高会跟 buffer 打架。
+
+### 改法：原地改写
+
+新增 `-[SLCamFeed renderIntoPixelBuffer:]`：拿宿主那个 buffer，把素材帧
+**按当前旋转/镜像摆好后直接画进去**。指针、尺寸、格式全是宿主熟悉的那个，
+调用方完全无感。
+
+顺带把 `sl_render:` 里那套「旋转 → 铺满裁切 → 镜像」的数学抽成
+`sl_image:toWidth:height:mirror:rotation:`，两条出图路径共用一份 ——
+各写一遍迟早会不一致。
+
+日志会打一行 `拍照已接管（AVCapturePhoto.pixelBuffer 原地改写）· 宽x高 · 角度 / 镜像`，
+下次一眼就能确认走的是哪条路。
+
 ## 0.2.16 —— 拍照方向 / 抖音拍照 / toast 收短
 
 0.2.15 上机后的三项。抖音导航栏那层多出来的胶囊**本版不动**（结论见文末附录）。

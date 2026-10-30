@@ -776,6 +776,7 @@ static void SLCamInstallStillImageHook(void) {
 static NSData *(*gSLPhotoDataOrig)(id, SEL);
 static NSData *(*gSLPhotoDataCustomOrig)(id, SEL, id);
 static void   (*gSLPhotoCaptureOrig)(id, SEL, id, id);
+static CVPixelBufferRef (*gSLPhotoPBOrig)(id, SEL);
 
 /// 从素材取一帧、按当前旋转/镜像摆好、转成 JPEG。
 /// 条件不满足返回 nil，调用方原样放行真照片。
@@ -822,6 +823,32 @@ static void SLCamPhotoCapture(id self, SEL _cmd, id settings, id delegate) {
     if (gSLPhotoCaptureOrig) gSLPhotoCaptureOrig(self, _cmd, settings, delegate);
 }
 
+// 抖音（IESMMCaptureKit）读的是 -[AVCapturePhoto pixelBuffer]，不是
+// fileDataRepresentation —— 0.2.16 的日志里「命中 AVCapturePhotoOutput 拍照」有了，
+// 「拍照已接管（AVCapturePhotoOutput）」一行没有，就是证据：它压根没来要文件字节。
+//
+// 这条路上不能返回我们自己 new 的 buffer：
+//   · pixelBuffer 返回的是**借用**引用，调用方不会 CFRelease → 每次拍照泄 8MB；
+//   · 尺寸/格式跟真照片对不上，宿主按 resolvedSettings 算出的宽高会跟 buffer 打架。
+// 所以改成「拿宿主那个 buffer，把素材帧原地画进去」—— 指针、尺寸、格式全是它熟悉的。
+static CVPixelBufferRef SLCamPhotoPixelBuffer(id self, SEL _cmd) {
+    CVPixelBufferRef real = gSLPhotoPBOrig ? gSLPhotoPBOrig(self, _cmd) : NULL;
+    if (!real) return real;
+    if (!SLCamInjecting() || !SLCamArmed()) return real;
+
+    if (![[SLCamFeed shared] renderIntoPixelBuffer:real]) return real;
+
+    static BOOL logged = NO;
+    if (!logged) {
+        logged = YES;
+        SLLog(@"注入: 拍照已接管（AVCapturePhoto.pixelBuffer 原地改写）· %zux%zu · %ld° / 镜像%@",
+              CVPixelBufferGetWidth(real), CVPixelBufferGetHeight(real),
+              (long)([SLCamFeed shared].rotation % 360),
+              [SLCamFeed shared].mirrorEnabled ? @"开" : @"关");
+    }
+    return real;
+}
+
 static void SLCamInstallPhotoOutputHook(void) {
     static BOOL done = NO;
     if (done) return;
@@ -839,11 +866,14 @@ static void SLCamInstallPhotoOutputHook(void) {
                  (IMP)SLCamPhotoFileData, (IMP *)&gSLPhotoDataOrig);
     SLCamHookSel(photo, NSSelectorFromString(@"fileDataRepresentationWithCustomizer:"),
                  (IMP)SLCamPhotoFileDataCustom, (IMP *)&gSLPhotoDataCustomOrig);
+    SLCamHookSel(photo, NSSelectorFromString(@"pixelBuffer"),
+                 (IMP)SLCamPhotoPixelBuffer, (IMP *)&gSLPhotoPBOrig);
     SLCamHookSel(output, NSSelectorFromString(@"capturePhotoWithSettings:delegate:"),
                  (IMP)SLCamPhotoCapture, (IMP *)&gSLPhotoCaptureOrig);
 
-    SLLog(@"注入: 拍照链路已布点 photo=%d custom=%d capture=%d",
-          gSLPhotoDataOrig != nil, gSLPhotoDataCustomOrig != nil, gSLPhotoCaptureOrig != nil);
+    SLLog(@"注入: 拍照链路已布点 photo=%d custom=%d pb=%d capture=%d",
+          gSLPhotoDataOrig != nil, gSLPhotoDataCustomOrig != nil,
+          gSLPhotoPBOrig != nil, gSLPhotoCaptureOrig != nil);
 }
 
 void SLCamInstallHooks(void) {
