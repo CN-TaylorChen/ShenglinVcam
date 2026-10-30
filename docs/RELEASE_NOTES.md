@@ -1,3 +1,71 @@
+## 0.2.11 —— 修 0.2.10 的视频替换失效
+
+0.2.10 修闪退，结果把画面换坏了：**装上之后视频完全不被替换，画面就是真实摄像头**。
+QQ、陌陌、抖音三家一起中招。
+
+### 一、现场
+
+```
+注入: 打包失败 #1 st=-12743 · fmt 1920x1080 420f · 帧 1920x1080 420f · 自洽=Y · 兜底fmt=Y
+```
+
+`-12743` = `kCMSampleBufferError_InvalidMediaFormat`。每一帧都失败 → 假帧是 NULL →
+走「放行真帧」分支 → 画面当然还是摄像头。
+
+三种尺寸、两种像素格式全都挂在同一个码上：
+
+| App | 真帧 | 结果 |
+|---|---|---|
+| QQ | 1920×1080 `420f` | -12743 |
+| 陌陌 | 1080×1920 `BGRA` | -12743 |
+| 抖音 | 1080×1920 `420f` | -12743 |
+
+跟格式无关，只跟 fmt 里的某一项有关。
+
+### 二、根因
+
+0.2.10 把宿主 fmt 的 5 个 extensions **整包**塞进了 `CMVideoFormatDescriptionCreate`：
+
+```
+CVImageBufferYCbCrMatrix, CVImageBufferTransferFunction, Version, CVBytesPerRow, CVImageBufferColorPrimaries
+```
+
+问题出在 **`CVBytesPerRow`**。它描述的是缓冲区**怎么摆放**，必须由帧自己决定。
+宿主的 BPR 是它自己采集 buffer 的（IOSurface 按 32/64 字节对齐），我们的假帧是
+`CVPixelBufferCreate` 造的（CoreVideo 取最小对齐），两者不一样 → 校验不过。
+
+判断依据很硬：真帧那行是 `自洽=Y`，说明宿主 fmt 和宿主自己的 buffer 是配的；而假帧
+尺寸、子类型和宿主 fmt 完全相同却仍被判「不匹配」—— 唯一可能不同的就是 bytesPerRow。
+这也说明 `CMVideoFormatDescriptionMatchesImageBuffer` **确实在比 BPR**。
+
+0.2.9 从没出过这个错，因为它是用 `CreateForImageBuffer` 从帧反推的，BPR 天生自洽。
+
+### 三、这一版怎么改
+
+1. **只搬色彩类扩展，剔除布局类** —— 去掉 `CVBytesPerRow` / `CVFieldCount`。
+2. **建完立刻自检** —— `CMVideoFormatDescriptionMatchesImageBuffer` 不过就丢掉，
+   退回 `CreateForImageBuffer`。有了这道自检，任何扩展组合导致的 -12743 都不可能漏出去。
+3. **打包失败前再兜一层** —— 自建 fmt 万一仍被拒，换成帧反推 fmt 重试一次。
+   宁可丢扩展，也不能整帧放弃：打包失败是最坏的降级。
+4. **日志补自建 fmt 的扩展 key 列表** —— 万一抖音那边还崩，能直接看出它取不取得到内参。
+
+### 四、一个必须说清楚的遗留
+
+0.2.10 的抖音日志里**没崩**，但那不代表闪退修好了 —— 是因为每帧打包都失败，
+假帧根本没交出去。0.2.9 是打包成功 → 假帧被交付 → AwemeCore 代理 `CFRelease(NULL)` 崩。
+
+所以 0.2.11 装上后请重点看抖音：**如果点开录制又闪退，那就是 CFRelease 那一条还没修好**，
+日志里的 `自建扩展 N 项` 会告诉我们 fmt 里到底有什么。
+
+### 装上之后验证
+
+1. QQ / 陌陌 / 抖音，**画面是素材**（这是本版重点）
+2. 抖音点开录制**不闪退**
+3. 日志里不该再有「打包失败」
+4. 声音速度正常，没有「丢弃」行
+
+---
+
 ## 0.2.10 —— 修抖音闪退，修声音加速
 
 两个独立的 bug，一个是崩溃，一个是听感。

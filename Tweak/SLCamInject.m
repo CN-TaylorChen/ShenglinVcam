@@ -40,6 +40,7 @@ static int  sSLCamDTSFixLogged = 0;
 static int  sSLCamAttachLogged = 0;
 static int  sSLCamSetAttachFailLogged = 0;
 static int  sSLCamOwnFmtExtFailLogged = 0;
+static int  sSLCamOwnFmtRejectedLogged = 0;
 
 /// 四字符码转可读串（'BGRA' / '420f'），日志里比裸数字好认
 static NSString *SLFourCC(OSType v) {
@@ -68,17 +69,40 @@ static IMP SLCamOriginalIMP(id self, SEL _cmd) {
     return NULL;
 }
 
-/// 自建一个「和假帧自洽、又保留宿主 extensions」的 fmt。
+/// 从宿主 extensions 里剔除「描述内存布局」的 key，只留色彩类。
 ///
-/// 这里绝对不能用 CMVideoFormatDescriptionCreateForImageBuffer：它是从像素缓冲区
-/// 反推 extensions 的，而我们手上的帧是 CVPixelBufferCreate 干净造出来的，
-/// 反推出来就是空字典。宿主（抖音尤其）会去 CMFormatDescriptionGetExtension
-/// 取相机内参、色彩矩阵这类 key，拿到 NULL 之后是不判空直接 CFRelease 的 ——
-/// CoreFoundation 对 CFRelease(NULL) 是硬断言，当场 SIGTRAP。
-/// 0.2.9「点开录制就闪退」的栈就是：我们的假帧 → _processSampleBuffer: →
-/// AwemeCore 代理 → CFRelease(NULL)。所以必须把宿主 fmt 的 extensions 整包搬过去。
+/// CVBytesPerRow / CVFieldCount 描述的是缓冲区**怎么摆放**，必须由帧自己决定。
+/// 从宿主 fmt 抄过来就会和我们的帧对不上，于是
+/// CMSampleBufferCreateReadyWithImageBuffer 直接返回
+/// kCMSampleBufferError_InvalidMediaFormat(-12743)，整帧打包失败 → 画面不被替换。
 ///
-/// 尺寸用假帧自己的，这样 CMVideoFormatDescriptionMatchesImageBuffer 才过。
+/// 0.2.10 就是整包抄了扩展，三个 App 全挂在 -12743。当时日志里真帧是「自洽=Y」，
+/// 而假帧尺寸、子类型都和宿主 fmt 一样却仍判不匹配 —— 差异只在 bytesPerRow，
+/// 这也是 CMVideoFormatDescriptionMatchesImageBuffer 会比的唯一一项。
+static CFDictionaryRef SLCamColorExtensions(CFDictionaryRef hostExt) {
+    if (!hostExt) return NULL;
+    // 用可变类型接着：CFDictionaryRemoveValue 要的是 CFMutableDictionaryRef，
+    // 声明成 CFDictionaryRef 再传进去会丢 const，-Werror 下直接编译失败。
+    CFMutableDictionaryRef out = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, hostExt);
+    if (!out) return NULL;
+    CFDictionaryRemoveValue(out, CFSTR("CVBytesPerRow"));
+    CFDictionaryRemoveValue(out, CFSTR("CVFieldCount"));
+    return out;
+}
+
+/// 自建一个「和假帧自洽、又尽量保留宿主扩展」的 fmt。
+///
+/// 为什么不能只用 CMVideoFormatDescriptionCreateForImageBuffer：它是从像素缓冲区
+/// 反推 extensions 的，反推出来往往只有寥寥几项。宿主（抖音尤其）会去
+/// CMFormatDescriptionGetExtension 取相机内参、色彩矩阵这类 key，拿到 NULL 之后
+/// 是不判空直接 CFRelease 的 —— CoreFoundation 对 CFRelease(NULL) 是硬断言。
+/// 0.2.9「点开录制就闪退」的栈就是：假帧 → _processSampleBuffer: →
+/// AwemeCore 代理 → CFRelease(NULL)。
+///
+/// 但也不能像 0.2.10 那样整包抄 —— 布局 key 会让 fmt 和帧对不上（-12743）。
+///
+/// 所以：先用「宿主扩展去掉布局 key」建一个，**建完立刻自检**，和帧自洽才用；
+/// 不自洽就退回帧反推。有了这道自检，任何扩展组合导致的 -12743 都不可能漏出去。
 static CMVideoFormatDescriptionRef SLCamMakeFormatDescription(CMFormatDescriptionRef hostFmt,
                                                               CVPixelBufferRef frame) {
     if (!hostFmt || !frame) return NULL;
@@ -86,22 +110,26 @@ static CMVideoFormatDescriptionRef SLCamMakeFormatDescription(CMFormatDescriptio
     OSType subType = CMFormatDescriptionGetMediaSubType(hostFmt);
     if (subType == 0) subType = CVPixelBufferGetPixelFormatType(frame);
 
+    CFDictionaryRef ext = SLCamColorExtensions(CMFormatDescriptionGetExtensions(hostFmt));
     CMVideoFormatDescriptionRef out = NULL;
     OSStatus st = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, subType,
                                                  (int32_t)CVPixelBufferGetWidth(frame),
                                                  (int32_t)CVPixelBufferGetHeight(frame),
-                                                 CMFormatDescriptionGetExtensions(hostFmt),
-                                                 &out);
-    if (st == noErr && out) return out;
+                                                 ext, &out);
+    if (ext) CFRelease(ext);
 
-    // 带着宿主 extensions 造不出来（个别 key 和尺寸不自洽），退回系统那套：
-    // extensions 是空的，但至少 fmt 和帧自洽，画面不会黑。
-    out = NULL;
+    if (st == noErr && out) {
+        if (CMVideoFormatDescriptionMatchesImageBuffer(out, frame)) return out;
+        CFRelease(out);                       // 和帧对不上，宁可不要
+        out = NULL;
+    }
+
+    // 退回帧反推：extensions 少一些，但一定自洽
     if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &out) != noErr) {
         return NULL;
     }
     if (sSLCamOwnFmtExtFailLogged++ == 0) {
-        SLLog(@"注入: 带宿主 extensions 建 fmt 失败 st=%d，已退回空 extensions（宿主可能取不到内参）", (int)st);
+        SLLog(@"注入: 带宿主扩展建 fmt 不自洽 st=%d，已退回帧反推（宿主可能取不到内参）", (int)st);
     }
     return out;
 }
@@ -238,19 +266,42 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
                         useFmt = ownFmt;
                         if (sSLCamOwnFmtLogged++ == 0) {
                             CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions((CMVideoFormatDescriptionRef)fmt);
-                            SLLog(@"注入: 假帧与宿主 fmt 不匹配，已自建 fmt（帧 %ux%u %@ / fmt %dx%d %@ · 宿主扩展 %ld 项）",
+                            // 把自建 fmt 的扩展 key 也打出来 —— 万一抖音那边还崩，
+                            // 这一行能直接看出它到底能不能取到内参/色彩矩阵
+                            CFDictionaryRef oe = CMFormatDescriptionGetExtensions(ownFmt);
+                            NSArray *okeys = oe ? [(__bridge NSDictionary *)oe allKeys] : @[];
+                            SLLog(@"注入: 假帧与宿主 fmt 不匹配，已自建 fmt（帧 %ux%u %@ / fmt %dx%d %@）· 自建扩展 %lu 项 %@",
                                   (unsigned)CVPixelBufferGetWidth(frame),
                                   (unsigned)CVPixelBufferGetHeight(frame),
                                   SLFourCC(CVPixelBufferGetPixelFormatType(frame)),
                                   d.width, d.height, SLFourCC(CMFormatDescriptionGetMediaSubType(fmt)),
-                                  (long)(CMFormatDescriptionGetExtensions(fmt)
-                                         ? CFDictionaryGetCount(CMFormatDescriptionGetExtensions(fmt)) : 0));
+                                  (unsigned long)okeys.count, okeys);
                         }
                     }
                 }
 
                 OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, frame, useFmt,
                                                                        &timing, &fake);
+                if (st != noErr && ownFmt) {
+                    // 自建 fmt 被拒（-12743 = InvalidMediaFormat 之类）—— 换成「完全从帧
+                    // 反推」的 fmt 再试一次。宁可丢扩展，也不能让整帧打包失败：
+                    // 打包失败 = 假帧交不出去 = 画面完全不被替换，这是最坏的降级。
+                    CMVideoFormatDescriptionRef rawFmt = NULL;
+                    if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &rawFmt) == noErr
+                        && rawFmt) {
+                        OSStatus st2 = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, frame, rawFmt,
+                                                                               &timing, &fake);
+                        if (st2 == noErr) {
+                            if (sSLCamOwnFmtRejectedLogged++ == 0) {
+                                SLLog(@"注入: 自建 fmt 被拒 st=%d，换帧反推 fmt 重试成功", (int)st);
+                            }
+                            st = noErr;
+                        } else {
+                            st = st2;
+                        }
+                        CFRelease(rawFmt);
+                    }
+                }
                 if (st != noErr) {
                     fake = NULL;
                     sSLCamFailCount++;
