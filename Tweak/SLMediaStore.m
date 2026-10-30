@@ -40,11 +40,15 @@ static NSString *const kSLHashManifestName = @".hashes.plist";
     return [@[@"mp4", @"mov", @"m4v"] containsObject:ext];
 }
 
++ (BOOL)sl_isImageExt:(NSString *)ext {
+    if (!ext.length) return NO;
+    return [@[@"png", @"jpg", @"jpeg", @"heic", @"heif", @"webp", @"bmp", @"tif", @"tiff"]
+            containsObject:ext.lowercaseString];
+}
+
 + (BOOL)isImageFileName:(NSString *)name {
     if (!name.length) return NO;
-    NSString *ext = name.pathExtension.lowercaseString;
-    return [@[@"png", @"jpg", @"jpeg", @"heic", @"heif", @"webp", @"bmp", @"tif", @"tiff"]
-            containsObject:ext];
+    return [self sl_isImageExt:name.pathExtension];
 }
 
 + (NSArray<SLMediaItem *> *)allItems {
@@ -182,7 +186,9 @@ static NSString *const kSLHashManifestName = @".hashes.plist";
 
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *ext = url.pathExtension.lowercaseString;
-    BOOL isImage = [self isImageFileName:ext];
+    // 这里手里是裸扩展名（"png"），不能喂给吃文件名的 isImageFileName: ——
+    // "png".pathExtension 是空串，会导致所有图片都被当成视频。
+    BOOL isImage = [self sl_isImageExt:ext];
     if (!ext.length) {
         // 文件 App 偶尔给没扩展名的临时文件，按内容猜一次
         isImage = [self sl_isDecodableImageAtPath:url.path];

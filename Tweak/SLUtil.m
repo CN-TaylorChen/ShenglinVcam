@@ -30,9 +30,20 @@ NSString *SLStorePath(NSString *name) {
     return [SLStoreDir() stringByAppendingPathComponent:name];
 }
 
+// 同一时刻只留一条。以前每条 toast 都往窗口上加一个 UILabel，两次连发就叠在一起 ——
+// 「正在导入…」还没消失，结果提示就压上去了，两行字糊成一团。
+// 现在新 toast 进来先把旧的摘掉（连带取消它的动画，否则旧的那个还会走完淡出再 remove）。
+static UILabel *sToastLab = nil;
+
 static void SLToastDuration(NSString *message, NSTimeInterval dur) {
     if (!message.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (sToastLab) {
+            [sToastLab.layer removeAllAnimations];
+            [sToastLab removeFromSuperview];
+            sToastLab = nil;
+        }
+
         UIWindow *win = nil;
         for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
             if (![sc isKindOfClass:[UIWindowScene class]]) continue;
@@ -66,14 +77,17 @@ static void SLToastDuration(NSString *message, NSTimeInterval dur) {
                                w, h);
         lab.alpha = 0.0;
         [win addSubview:lab];
+        sToastLab = lab;
 
         [UIView animateWithDuration:0.18 animations:^{
             lab.alpha = 1.0;
         } completion:^(BOOL finished) {
+            if (finished == NO) return;
             [UIView animateWithDuration:0.25 delay:dur options:0 animations:^{
                 lab.alpha = 0.0;
             } completion:^(BOOL done) {
                 [lab removeFromSuperview];
+                if (sToastLab == lab) sToastLab = nil;
             }];
         }];
     });

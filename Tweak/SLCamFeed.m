@@ -540,7 +540,24 @@
     static NSString *sLastAudioProbePath = nil;
     if (![sLastAudioProbePath isEqualToString:path]) {
         sLastAudioProbePath = path;
-        SLLog(@"feed 素材音轨: %@（%@）", audioTrack ? @"有" : @"无", path.lastPathComponent);
+        // 顺手把音轨编码打出来。之前只打「有/无」，遇到「明明有音轨却没声音」时
+        // 完全看不出是编码解不动还是别的原因（Opus / AC-3 这类在 mp4 里很常见）。
+        NSString *codec = @"-", *detail = @"-";
+        if (audioTrack) {
+            CMFormatDescriptionRef fd =
+                (__bridge CMFormatDescriptionRef)audioTrack.formatDescriptions.firstObject;
+            if (fd) {
+                FourCharCode fc = CMFormatDescriptionGetMediaSubType(fd);
+                codec = [NSString stringWithFormat:@"%c%c%c%c",
+                         (char)(fc >> 24), (char)(fc >> 16), (char)(fc >> 8), (char)fc];
+                const AudioStreamBasicDescription *a =
+                    CMAudioFormatDescriptionGetStreamBasicDescription(fd);
+                if (a) detail = [NSString stringWithFormat:@"%.0fHz %uch",
+                                 a->mSampleRate, (unsigned)a->mChannelsPerFrame];
+            }
+        }
+        SLLog(@"feed 素材音轨: %@ · %@ · %@（%@）", audioTrack ? @"有" : @"无",
+              codec, detail, path.lastPathComponent);
     }
 
     AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
@@ -599,6 +616,10 @@
                 [_lock lock];
                 _audioSrcASBD = src;
                 [_lock unlock];
+            } else {
+                // 音轨在，但解不成 float32 / 单声道。表现就是「有音轨却全程静音」，
+                // 必须留一行，否则只能靠猜。
+                SLLog(@"feed 音轨解不成 PCM（编码不支持），这条素材只能静音");
             }
         }
     }
@@ -996,13 +1017,17 @@
     (void)hasAudio;
 
     if (got == 0) {
-        // 素材本来就没音轨 —— 用户预期就是「只换画面、保留原声」，放行真实麦克风
-        if (!hasAudio) {
-            if (!_audioPassLogged) {
-                _audioPassLogged = YES;
-                SLLog(@"音频: 放行真麦克风 —— 素材没有音轨");
-            }
-            return nil;
+        // 素材没有音轨 —— **输出静音**，不再放行真实麦克风。
+        //
+        // 以前这里返回 nil，让真麦克风原样穿过去，本意是「只换画面、保留原声」。
+        // 但实际用起来是反的：打开了「替换音频」，结果录进去的是房间里的声音，
+        // 用户看到的就是「替换没生效 / 这个视频没声音」。图片素材走的也是这条
+        //（图片天然没有音轨），所以选一张图进去同样是环境声。
+        //
+        // 虚拟摄像头的前提是「别把真实环境录进去」，所以这里改成静音。
+        if (!hasAudio && !_audioPassLogged) {
+            _audioPassLogged = YES;
+            SLLog(@"音频: 素材没有音轨，输出静音（不放行真麦克风）");
         }
         // 有音轨但还没解出数据 —— 必须输出静音。
         // 返回 nil 会让注入层放行真麦克风，把环境声原样录进去，

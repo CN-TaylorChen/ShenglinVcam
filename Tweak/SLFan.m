@@ -436,6 +436,21 @@ static NSString *SLFanAngleName(NSInteger i) {
         hair.lineWidth = 0.5;
         [p.layer addSublayer:hair];
 
+        // 底环：一整圈淡色轨道，四档都画。
+        // 以前只有「进度弧」，而 0° 那档 strokeEnd = 0，等于什么都不画 ——
+        // 「不旋转」那行看着像漏了图标，跟旁边三行不在一个语汇里。
+        // 有了底环，0° 显示成一枚空环，1/4、2/4、3/4 则是环上一段实色弧，
+        // 四行是同一个「环形刻度」的四个刻度，视觉上就齐了。
+        CAShapeLayer *track = [CAShapeLayer layer];
+        track.frame = CGRectMake(7.0, (SL_FAN_PILL_H - 22.0) / 2.0, 22.0, 22.0);
+        track.path = [UIBezierPath bezierPathWithArcCenter:CGPointMake(11.0, 11.0) radius:8.5
+                                                startAngle:-M_PI_2 endAngle:M_PI_2 * 3.0
+                                                 clockwise:YES].CGPath;
+        track.fillColor = nil;
+        track.strokeColor = [[self sl_accent] colorWithAlphaComponent:0.20].CGColor;
+        track.lineWidth = 2.2;
+        [p.layer addSublayer:track];
+
         CAShapeLayer *arc = [CAShapeLayer layer];
         arc.frame = CGRectMake(7.0, (SL_FAN_PILL_H - 22.0) / 2.0, 22.0, 22.0);
         arc.path = [UIBezierPath bezierPathWithArcCenter:CGPointMake(11.0, 11.0) radius:8.5
