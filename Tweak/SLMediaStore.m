@@ -20,6 +20,75 @@ static NSString *const kSLHashManifestName = @".hashes.plist";
 @implementation SLMediaItem
 @end
 
+#pragma mark - 文件名
+
+// iOS 只禁 "/" 和 NUL，但冒号、引号、控制字符在别的地方会出事，一并换掉。
+static NSString *SLCleanBaseName(NSString *raw, NSUInteger maxLen) {
+    if (!raw.length) return nil;
+    NSCharacterSet *bad = [NSCharacterSet characterSetWithCharactersInString:@"/\\:*?\"<>|\r\n\t"];
+    NSString *s = [[raw componentsSeparatedByCharactersInSet:bad] componentsJoinedByString:@"_"];
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    // 开头的点会让文件变成隐藏文件，allItems 按扩展名过滤时就看不到它了
+    while ([s hasPrefix:@"."]) s = [s substringFromIndex:1];
+    if (s.length > maxLen) s = [s substringToIndex:maxLen];
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return s.length ? s : nil;
+}
+
+// 相册偶尔给的是纯数字或 UUID 的临时名。这种名字拿来当显示名，跟时间戳一样没法看，
+// 所以判定成「机器名」，退回时间戳命名。
+static BOOL SLLooksMachineName(NSString *s) {
+    if (!s.length) return YES;
+    NSCharacterSet *digits = [NSCharacterSet decimalDigitCharacterSet];
+    if ([s stringByTrimmingCharactersInSet:digits].length == 0) return YES;
+    if (s.length >= 32) {
+        NSString *bare = [s stringByReplacingOccurrencesOfString:@"-" withString:@""];
+        NSCharacterSet *hex = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"];
+        if ([bare stringByTrimmingCharactersInSet:hex].length == 0) return YES;
+    }
+    return NO;
+}
+
+static NSString *SLBaseNameForURL(NSURL *url) {
+    NSString *raw = url.lastPathComponent.stringByDeletingPathExtension;
+    NSString *s = SLCleanBaseName(raw, 60);
+    if (SLLooksMachineName(s)) {
+        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"yyyyMMdd-HHmmss";
+        s = [fmt stringFromDate:[NSDate date]];
+    }
+    return s.length ? s : @"素材";
+}
+
+// 老版本用 Unix 秒当文件名（1793354943），显示成一串数字完全看不出是哪段。
+// 这里把 10 位时间戳翻译成「2026-10-30 19:20」。只影响显示，文件名不动 ——
+// 改名会连带去重指纹表、当前选中项一起失效。
+static NSDateFormatter *SLStampFormatter(void) {
+    static NSDateFormatter *f = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        f = [[NSDateFormatter alloc] init];
+        f.dateFormat = @"yyyy-MM-dd HH:mm";
+    });
+    return f;
+}
+
+static NSString *SLDisplayNameForFile(NSString *fileName) {
+    NSString *base = fileName.stringByDeletingPathExtension;
+    if (base.length == 10 && SLLooksMachineName(base)) {
+        double t = base.doubleValue;
+        if (t > 1500000000.0 && t < 4000000000.0) {
+            NSDateFormatter *f = SLStampFormatter();
+            NSString *s = nil;
+            @synchronized (f) {   // NSDateFormatter 不是线程安全的
+                s = [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:t]];
+            }
+            if (s.length) return s;
+        }
+    }
+    return base;
+}
+
 @implementation SLMediaStore
 
 + (NSString *)mediaDir {
@@ -65,7 +134,7 @@ static NSString *const kSLHashManifestName = @".hashes.plist";
         SLMediaItem *it = [[SLMediaItem alloc] init];
         it.fileName = n;
         it.path = path;
-        it.displayName = n.stringByDeletingPathExtension;
+        it.displayName = SLDisplayNameForFile(n);
         it.isImage = img;
         NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
         it.addedAt = attrs[NSFileModificationDate] ?: [NSDate dateWithTimeIntervalSince1970:0];
@@ -218,7 +287,7 @@ static NSString *const kSLHashManifestName = @".hashes.plist";
                 SLMediaItem *it = [[SLMediaItem alloc] init];
                 it.fileName = hit;
                 it.path = p;
-                it.displayName = hit.stringByDeletingPathExtension;
+                it.displayName = SLDisplayNameForFile(hit);
                 it.isImage = [self isImageFileName:hit];
                 it.addedAt = [fm attributesOfItemAtPath:p error:nil][NSFileModificationDate]
                               ?: [NSDate date];
@@ -234,12 +303,13 @@ static NSString *const kSLHashManifestName = @".hashes.plist";
     }
 
     // ---- 2. 复制进来 ----
-    // 时间戳命名：天然按导入顺序排，不会重名；同一秒导两次加个后缀
-    NSString *name = [NSString stringWithFormat:@"%.0f.%@", [[NSDate date] timeIntervalSince1970], ext];
+    // 0.2.24：保留原始文件名。以前一律用时间戳命名，素材页里全是 1793354943 这种数字，
+    // 完全看不出哪段是哪段。只有拿到机器名（纯数字 / UUID）才退回时间戳。
+    NSString *base = SLBaseNameForURL(url);
+    NSString *name = [NSString stringWithFormat:@"%@.%@", base, ext];
     NSString *dst = [[self mediaDir] stringByAppendingPathComponent:name];
-    for (int i = 2; [fm fileExistsAtPath:dst] && i < 100; i++) {
-        name = [NSString stringWithFormat:@"%.0f-%d.%@",
-                [[NSDate date] timeIntervalSince1970], i, ext];
+    for (int i = 2; [fm fileExistsAtPath:dst] && i < 1000; i++) {
+        name = [NSString stringWithFormat:@"%@-%d.%@", base, i, ext];
         dst = [[self mediaDir] stringByAppendingPathComponent:name];
     }
 
@@ -249,6 +319,12 @@ static NSString *const kSLHashManifestName = @".hashes.plist";
         if (error) *error = copyErr;
         return nil;
     }
+
+    // copyItemAtURL 会连源文件的修改时间一起搬过来，而列表是按修改时间排「最新在前」的 ——
+    // 不重置的话，刚导入的一段老视频会沉到列表最底下，看起来像「没导入成功」。
+    [fm setAttributes:@{ NSFileModificationDate : [NSDate date] }
+          ofItemAtPath:dst
+                 error:nil];
 
     // ---- 3. 拷完体检：解不了的素材留在列表里只会变成一条「点了没反应」的死条目 ----
     BOOL ok = isImage ? [self sl_isDecodableImageAtPath:dst] : [self sl_isDecodableVideoAtPath:dst];
@@ -273,7 +349,7 @@ static NSString *const kSLHashManifestName = @".hashes.plist";
     SLMediaItem *it = [[SLMediaItem alloc] init];
     it.fileName = name;
     it.path = dst;
-    it.displayName = name.stringByDeletingPathExtension;
+    it.displayName = SLDisplayNameForFile(name);
     it.isImage = isImage;
     it.addedAt = [NSDate date];
     // 0.2.20 起：每次导入都自动选中（以前只有库里空着才选，加第二个素材还得再点一次）
