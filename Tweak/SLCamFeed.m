@@ -486,6 +486,14 @@
 
 #pragma mark - 出帧
 
+- (CGSize)latestFrameSize {
+    [_lock lock];
+    CVPixelBufferRef pb = _latestVideo;
+    CGSize s = pb ? CGSizeMake(CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb)) : CGSizeZero;
+    [_lock unlock];
+    return s;
+}
+
 - (CVPixelBufferRef)copyNextFrame {
     [_lock lock];
     CVPixelBufferRef pb = _latestVideo ? (CVPixelBufferRef)CVPixelBufferRetain(_latestVideo) : NULL;
@@ -678,7 +686,7 @@
 /// 一是调用方不会 CFRelease（每次拍照泄 8MB），二是尺寸/格式跟真照片对不上，
 /// 宿主按 resolvedSettings 算出来的宽高会跟 buffer 打架。
 /// 原地画进去两个问题都不存在：指针、尺寸、格式全是宿主熟悉的那个。
-- (BOOL)renderIntoPixelBuffer:(CVPixelBufferRef)dst {
+- (BOOL)renderIntoPixelBuffer:(CVPixelBufferRef)dst extraRotation:(NSInteger)extraRotation {
     if (!dst) return NO;
     size_t w = CVPixelBufferGetWidth(dst);
     size_t h = CVPixelBufferGetHeight(dst);
@@ -689,11 +697,16 @@
     [_lock unlock];
     if (!src) return NO;
 
+    // 用户设的旋转 + 拍照补偿角，归一成 0/90/180/270
+    NSInteger rot = ([self sl_normalizedRotation] + extraRotation) % 360;
+    if (rot < 0) rot += 360;
+    if (rot != 90 && rot != 180 && rot != 270) rot = 0;
+
     CIImage *img = [self sl_image:[CIImage imageWithCVPixelBuffer:src]
                           toWidth:w
                            height:h
                            mirror:self.mirrorEnabled
-                         rotation:[self sl_normalizedRotation]];
+                         rotation:rot];
     CVPixelBufferRelease(src);
     if (!img) return NO;
 

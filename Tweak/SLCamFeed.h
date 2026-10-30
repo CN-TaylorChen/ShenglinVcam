@@ -68,7 +68,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// 给 `-[AVCapturePhoto pixelBuffer]` 这类「buffer 归宿主所有、只能改内容」的场景用。
 /// 返回自己 new 的 buffer 是不行的：调用方不会 CFRelease（每次拍照泄 8MB），
 /// 而且尺寸/格式跟真照片对不上，宿主按 resolvedSettings 算出的宽高会跟 buffer 打架。
-- (BOOL)renderIntoPixelBuffer:(CVPixelBufferRef)dst;
+///
+/// `extraRotation` 是「在用户设的旋转之外再补多少度」。拍照需要它：
+/// 视频输出那条路拿到的是已经转过向的缓冲（1080x1920 竖屏），
+/// 而 AVCapturePhoto 给的是传感器原始方向（3840x2160 横屏），两者差 90°。
+/// 不补的话素材会被塞进一个转了 90° 的框里，拍出来就是歪的。
+- (BOOL)renderIntoPixelBuffer:(CVPixelBufferRef)dst extraRotation:(NSInteger)extraRotation;
 
 /// 按宿主音频格式取一段 PCM（素材音频不够长时尾部补静音）。
 /// 没有音频轨、或还没解出数据时返回 nil，注入层放行真实麦克风。
@@ -92,6 +97,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// 视频原始分辨率；读不出来返回 CGSizeZero
 - (CGSize)frameSize;
+
+/// 当前预览缓冲的尺寸 —— 宿主真正在用的那个（1080x1920 之类），不是素材的。
+/// 拍照要拿它判断「预览是竖屏还是横屏」，从而决定补多少度。没有帧返回 CGSizeZero。
+- (CGSize)latestFrameSize;
 
 /// 素材可用：路径非空且文件存在
 - (BOOL)isReady;

@@ -12,6 +12,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <CoreImage/CoreImage.h>
+#import <ImageIO/ImageIO.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -823,6 +824,37 @@ static void SLCamPhotoCapture(id self, SEL _cmd, id settings, id delegate) {
     if (gSLPhotoCaptureOrig) gSLPhotoCaptureOrig(self, _cmd, settings, delegate);
 }
 
+// 照片缓冲的「方向类别」可能跟预览缓冲不一样：
+// 视频输出那条路拿到的是**已经转过向**的缓冲（抖音是 1080x1920 竖屏），
+// 而 AVCapturePhoto 给的是**传感器原始方向**（3840x2160 横屏）。两者差 90°。
+// 不补这一下，素材就被塞进一个转了 90° 的框里 —— 预览正、拍出来歪。
+//
+// 补哪个方向由照片自己的 EXIF 方向决定：EXIF 说「要顺时针转 90° 才正」（=6），
+// 我们就先逆时针转 90°（=270°），等宿主/系统把它转回来正好抵消。
+static NSInteger SLCamPhotoExtraRotation(id photo, CGSize dstSize) {
+    CGSize vs = [[SLCamFeed shared] latestFrameSize];
+    if (vs.width < 1 || vs.height < 1 || dstSize.width < 1 || dstSize.height < 1) return 0;
+
+    BOOL videoPortrait = vs.height > vs.width;
+    BOOL photoPortrait = dstSize.height > dstSize.width;
+    if (videoPortrait == photoPortrait) return 0;   // 方向类别一致，不用补
+
+    NSInteger cw = 90;   // 拿不到 EXIF 就按最常见的竖拍后摄（EXIF 6）处理
+    @try {
+        NSDictionary *meta = [(AVCapturePhoto *)photo metadata];
+        NSNumber *v = meta[(NSString *)kCGImagePropertyOrientation];
+        switch (v ? v.integerValue : 6) {
+            case 1: case 2: cw = 0;   break;
+            case 3: case 4: cw = 180; break;
+            case 5: case 7: cw = 90;  break;   // 带镜像的那几个按旋转部分算
+            case 6:         cw = 90;  break;
+            case 8:         cw = 270; break;
+            default:        cw = 90;  break;
+        }
+    } @catch (NSException *e) { }
+    return (360 - cw) % 360;
+}
+
 // 抖音（IESMMCaptureKit）读的是 -[AVCapturePhoto pixelBuffer]，不是
 // fileDataRepresentation —— 0.2.16 的日志里「命中 AVCapturePhotoOutput 拍照」有了，
 // 「拍照已接管（AVCapturePhotoOutput）」一行没有，就是证据：它压根没来要文件字节。
@@ -836,14 +868,19 @@ static CVPixelBufferRef SLCamPhotoPixelBuffer(id self, SEL _cmd) {
     if (!real) return real;
     if (!SLCamInjecting() || !SLCamArmed()) return real;
 
-    if (![[SLCamFeed shared] renderIntoPixelBuffer:real]) return real;
+    CGSize sz = CGSizeMake(CVPixelBufferGetWidth(real), CVPixelBufferGetHeight(real));
+    NSInteger extra = SLCamPhotoExtraRotation(self, sz);
+    if (![[SLCamFeed shared] renderIntoPixelBuffer:real extraRotation:extra]) return real;
 
     static BOOL logged = NO;
     if (!logged) {
         logged = YES;
-        SLLog(@"注入: 拍照已接管（AVCapturePhoto.pixelBuffer 原地改写）· %zux%zu · %ld° / 镜像%@",
+        CGSize vs = [[SLCamFeed shared] latestFrameSize];
+        SLLog(@"注入: 拍照已接管（pixelBuffer 原地改写）· 照片 %zux%zu / 预览 %zux%zu · "
+              @"设置 %ld° + 补偿 %ld° / 镜像%@",
               CVPixelBufferGetWidth(real), CVPixelBufferGetHeight(real),
-              (long)([SLCamFeed shared].rotation % 360),
+              (size_t)vs.width, (size_t)vs.height,
+              (long)([SLCamFeed shared].rotation % 360), (long)extra,
               [SLCamFeed shared].mirrorEnabled ? @"开" : @"关");
     }
     return real;

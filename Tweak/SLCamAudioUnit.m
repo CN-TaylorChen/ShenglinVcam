@@ -33,6 +33,12 @@ static int  gSLReplaceCount = 0;
 // 长得一模一样。下面这些标志让每道门第一次拒绝时留一行痕，之后不再刷屏。
 static int  sCalls = 0;         // AudioUnitRender 被调用总次数
 static int  sBus1Calls = 0;     // 其中 bus=1（输入方向）的次数
+// 0.2.18：心跳改成「每 500 次一条 + 报本轮 bus=1 增量」。
+// 原来 3000 次才打一条，而 sCalls 是 bus=0 + bus=1 的总和 —— 一次几十秒的录制
+// 根本攒不到 3000，日志上完全看不出录制期间麦克风有没有走这条路。
+// 现在只要录几秒就能看到「本轮 +N」，N>0 = 走的是我们挂住的 unit。
+static int  sBus1AtLastBeat = 0;
+#define SL_HEARTBEAT_EVERY 500
 static BOOL sLoggedEntry = NO;
 static BOOL sLoggedBus1 = NO;
 static BOOL sLoggedRenderFail = NO;
@@ -195,8 +201,10 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
               (unsigned)frames,
               ioData ? (unsigned)ioData->mNumberBuffers : 0, (int)st);
     }
-    if (sCalls % 3000 == 0) {
-        SLLog(@"音频: 心跳 调用 %d 次 / bus=1 %d 次", sCalls, sBus1Calls);
+    if (sCalls % SL_HEARTBEAT_EVERY == 0) {
+        int delta = sBus1Calls - sBus1AtLastBeat;
+        sBus1AtLastBeat = sBus1Calls;
+        SLLog(@"音频: 心跳 调用 %d / bus=1 累计 %d（本轮 +%d）", sCalls, sBus1Calls, delta);
     }
 
     if (st != noErr || !ioData || ioData->mNumberBuffers == 0) {
