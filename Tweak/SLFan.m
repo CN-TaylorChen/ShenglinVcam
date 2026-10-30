@@ -5,6 +5,7 @@
 
 #import "SLFan.h"
 #import "SLCamBridge.h"
+#import "SLUtil.h"
 #import <math.h>
 #import <string.h>
 
@@ -56,12 +57,20 @@ static void SLFanSetInt(NSString *key, NSInteger v) {
 // 启用和旋转两个图标整体转了 90°，渲染出来是「Ɑ」和「↻钩子」；
 // ② 20pt 画布上两个三角形只差 3.6pt，糊成一个菱形。
 // 换成系统符号之后形状、粗细、光学对齐都是 Apple 调过的，这一类问题从根上没了。
+// 镜像图标：原来用 arrow.left.and.right，就是两根箭头，没有「翻转」的语义，
+// 摆在旋转球旁边更像「左右移动」。flip.horizontal 是一个被左右箭头穿过的方框，
+// 一眼就是左右镜像（iOS 15 起才有，更老的系统退回原来那根箭头）。
+static NSString *SLFanMirrorIconName(void) {
+    if (@available(iOS 15.0, *)) return @"flip.horizontal";
+    return @"arrow.left.and.right";
+}
+
 static NSString *SLFanIconName(NSInteger idx) {
     switch (idx) {
         case SLFanSwitchEnabled: return @"power";
         case SLFanSwitchMute:    return @"speaker.slash.fill";
         case SLFanSwitchRotate:  return @"rotate.right";
-        case SLFanSwitchMirror:  return @"arrow.left.and.right";
+        case SLFanSwitchMirror:  return SLFanMirrorIconName();
         default:                 return @"repeat";
     }
 }
@@ -88,7 +97,8 @@ static NSString *SLFanAngleName(NSInteger i) {
 
 @implementation SLFanView {
     CGSize _hostSize;
-    CGPoint _center;
+    CGPoint _center;        // 主球球心（调用方给的，不动）
+    CGPoint _fanCenter;     // 扇心：贴角时被推进安全区，可能不等于 _center
     SLFanEdge _edge;
     CGFloat _radius;
     CGFloat _spread;
@@ -145,41 +155,6 @@ static NSString *SLFanAngleName(NSInteger i) {
     return self;
 }
 
-// 五个球排在 ±spread 的弧上。越界就缩半径 —— 注意**不能收扇角**：
-// 相邻夹角 = 2*half/4，收 half 会让弦长一起变小，五个球直接叠在一起。
-// 所以半径收到下限（74，保证 44pt 的球不重叠）就停，剩下的交给逐球夹取。
-- (void)sl_layoutGeometry {
-    CGFloat half = SL_FAN_HALF0;
-    CGFloat R = SL_FAN_R0;
-    CGRect safe = CGRectInset(CGRectMake(0, 0, _hostSize.width, _hostSize.height), 8.0, 8.0);
-    CGRect ballSafe = CGRectInset(safe, SL_FAN_BALL_R, SL_FAN_BALL_R);
-    CGPoint pts[5];
-    for (int round = 0; round < 12; round++) {
-        [self sl_pointsInto:pts radius:R half:half];
-        BOOL ok = YES;
-        for (int i = 0; i < 5; i++) {
-            if (!CGRectContainsPoint(ballSafe, pts[i])) { ok = NO; break; }
-        }
-        if (ok) break;
-        if (R > SL_FAN_RMIN) R -= 6.0;
-        else break;
-    }
-    // 循环最后一轮可能改了 R 就退出，这里按最终值再算一次，避免用上一轮的点
-    [self sl_pointsInto:pts radius:R half:half];
-
-    // 兜底：球贴到角上时，把越界的那几个往里推。
-    // 推一下只是让最外侧那一两个球稍微靠内，比整扇缩角（五个球叠在一起）好得多。
-    if (ballSafe.size.width > 0 && ballSafe.size.height > 0) {
-        for (int i = 0; i < 5; i++) {
-            pts[i].x = MIN(MAX(pts[i].x, CGRectGetMinX(ballSafe)), CGRectGetMaxX(ballSafe));
-            pts[i].y = MIN(MAX(pts[i].y, CGRectGetMinY(ballSafe)), CGRectGetMaxY(ballSafe));
-        }
-    }
-    memcpy(_pts, pts, sizeof(pts));
-    _radius = R;
-    _spread = half;
-}
-
 - (CGFloat)sl_dirAngle {
     switch (_edge) {
         case SLFanEdgeLeft:   return 0.0;
@@ -189,7 +164,7 @@ static NSString *SLFanAngleName(NSInteger i) {
     }
 }
 
-- (void)sl_pointsInto:(CGPoint *)out radius:(CGFloat)R half:(CGFloat)half {
+- (void)sl_pointsInto:(CGPoint *)out radius:(CGFloat)R half:(CGFloat)half center:(CGPoint)c {
     CGFloat dirA = [self sl_dirAngle];
     // 贴右边 / 下边时，下标 0 要落在「上 / 右」那一侧，所以角度取反
     BOOL flip = (_edge == SLFanEdgeRight || _edge == SLFanEdgeBottom);
@@ -197,11 +172,84 @@ static NSString *SLFanAngleName(NSInteger i) {
         CGFloat t = -half + half * (i / 2.0);
         CGFloat off = flip ? -t : t;
         CGFloat a = (dirA + off) * M_PI / 180.0;
-        out[i] = CGPointMake(_center.x + R * cos(a), _center.y + R * sin(a));
+        out[i] = CGPointMake(c.x + R * cos(a), c.y + R * sin(a));
     }
 }
 
-- (UIColor *)sl_accent { return [UIColor systemIndigoColor]; }
+// 五个球排在 ±spread 的弧上。
+//
+// 0.2.15 之前是「越界就缩半径 + 逐球夹取」，球贴角落时有两个问题：
+//   ① 半径缩到下限 74 就不再缩，剩下的越界全靠逐个夹 —— 一侧两三个球被推到
+//      同一条竖线上，弧被压成一条直线，看起来就是「展开后错位」；
+//   ② 也不能靠收扇角解决：相邻夹角 = 2*half/4，收 half 会让弦长一起变小，
+//      五个球直接叠在一起。
+// 现在改成**扇心内推**：球心不动，把扇心沿垂直于张开方向的那一维推进安全区。
+// 扇心最多推到「整扇刚好贴住安全区边缘」，弧线形状完全不变，只是整体平移。
+// 只有屏幕比整扇还窄时才按比例缩半径，半径下限仍是 74（再小就叠球），
+// 最后留一道逐球兜底。
+- (void)sl_layoutGeometry {
+    CGFloat half = SL_FAN_HALF0;
+    CGFloat R = SL_FAN_R0;
+    CGRect safe = CGRectInset(CGRectMake(0, 0, _hostSize.width, _hostSize.height), 8.0, 8.0);
+    CGRect ballSafe = CGRectInset(safe, SL_FAN_BALL_R, SL_FAN_BALL_R);
+    CGPoint pts[5];
+    CGPoint c = _center;
+
+    if (ballSafe.size.width > 0 && ballSafe.size.height > 0) {
+        for (int pass = 0; pass < 4; pass++) {
+            [self sl_pointsInto:pts radius:R half:half center:_center];
+            // 五个点相对球心的包围盒 —— 只跟 R 和 half 有关，跟球心落在哪无关
+            CGFloat minDx = 0, maxDx = 0, minDy = 0, maxDy = 0;
+            for (int i = 0; i < 5; i++) {
+                CGFloat dx = pts[i].x - _center.x;
+                CGFloat dy = pts[i].y - _center.y;
+                minDx = MIN(minDx, dx); maxDx = MAX(maxDx, dx);
+                minDy = MIN(minDy, dy); maxDy = MAX(maxDy, dy);
+            }
+            CGFloat spanW = maxDx - minDx;
+            CGFloat spanH = maxDy - minDy;
+
+            // 整扇比安全区还大 → 按比例缩。两个方向取更狠的那个比例。
+            CGFloat k = 1.0;
+            if (spanW > ballSafe.size.width  && spanW > 0) k = MIN(k, ballSafe.size.width  / spanW);
+            if (spanH > ballSafe.size.height && spanH > 0) k = MIN(k, ballSafe.size.height / spanH);
+            if (k < 1.0) {
+                CGFloat next = R * k;
+                if (next >= SL_FAN_RMIN) { R = next; continue; }
+                R = SL_FAN_RMIN;
+                break;   // 到底了，剩下的交给兜底
+            }
+
+            // 放得下 → 把扇心推进安全区。横竖各自独立夹。
+            CGFloat nx = MIN(MAX(_center.x, CGRectGetMinX(ballSafe) - minDx),
+                             CGRectGetMaxX(ballSafe) - maxDx);
+            CGFloat ny = MIN(MAX(_center.y, CGRectGetMinY(ballSafe) - minDy),
+                             CGRectGetMaxY(ballSafe) - maxDy);
+            c = CGPointMake(nx, ny);
+            break;
+        }
+    }
+
+    // 按最终扇心与半径出点
+    [self sl_pointsInto:pts radius:R half:half center:c];
+
+    // 兜底：只有「屏幕比下限半径的整扇还窄」这种极端情况会走到这里
+    if (ballSafe.size.width > 0 && ballSafe.size.height > 0) {
+        for (int i = 0; i < 5; i++) {
+            pts[i].x = MIN(MAX(pts[i].x, CGRectGetMinX(ballSafe)), CGRectGetMaxX(ballSafe));
+            pts[i].y = MIN(MAX(pts[i].y, CGRectGetMinY(ballSafe)), CGRectGetMaxY(ballSafe));
+        }
+    }
+    memcpy(_pts, pts, sizeof(pts));
+    _fanCenter = c;
+    _radius = R;
+    _spread = half;
+}
+
+// 0.2.15：systemIndigoColor（偏紫）→ systemBlueColor。
+// 紫靛在深色背景上跟主球的绿色撞得厉害，蓝色跟「已就绪」的绿是同一套系统色阶，
+// 放在一起更协调；选中态的 pill、弧、光晕都跟着这个走，改一处全变。
+- (UIColor *)sl_accent { return [UIColor systemBlueColor]; }
 
 - (void)sl_buildBalls {
     // 主球那圈 0.8pt 白色高光。小球以前没有它，所以看着像平涂的色块。
@@ -709,6 +757,10 @@ static NSString *SLFanAngleName(NSInteger i) {
     return _angleIndex;
 }
 
+- (CGPoint)slFanCenter {
+    return _fanCenter;
+}
+
 @end
 
 #pragma mark - 提交
@@ -716,14 +768,23 @@ static NSString *SLFanAngleName(NSInteger i) {
 void SLFanCommit(NSInteger sw, NSInteger angle) {
     if (sw < 0) return;
     BOOL changed = NO;
+    NSString *msg = nil;
     switch (sw) {
-        case SLFanSwitchEnabled:
-            SLFanSetBool(kSLCamEnabledKey, !SLFanBool(kSLCamEnabledKey, YES));
+        case SLFanSwitchEnabled: {
+            BOOL on = !SLFanBool(kSLCamEnabledKey, YES);
+            SLFanSetBool(kSLCamEnabledKey, on);
+            msg = on ? @"替换已开启 · 摄像头画面换成素材"
+                     : @"替换已关闭 · 恢复真实摄像头";
             changed = YES;
             break;
+        }
         case SLFanSwitchMute: {
-            BOOL useAudio = SLFanBool(kSLCamAudioKey, YES);
-            SLFanSetBool(kSLCamAudioKey, !useAudio);
+            // 这个开关管的是「素材里的声音」，不是「麦克风静音」：
+            // 关掉 = 素材不发声，真麦克风原样放行。
+            BOOL on = !SLFanBool(kSLCamAudioKey, YES);
+            SLFanSetBool(kSLCamAudioKey, on);
+            msg = on ? @"素材声音：开 · 对方听到素材里的音频"
+                     : @"素材声音：关 · 对方听到你的真麦克风";
             changed = YES;
             break;
         }
@@ -732,19 +793,32 @@ void SLFanCommit(NSInteger sw, NSInteger angle) {
             // 原来这里把 -1 当 0 处理，一次误触就会把用户设好的 180° 清成「不旋转」。
             if (angle < 0) break;
             SLFanSetInt(kSLCamRotateKey, angle * 90);
+            NSArray<NSString *> *names = @[@"不旋转", @"顺时针 90°", @"180°", @"顺时针 270°"];
+            msg = [NSString stringWithFormat:@"画面方向：%@", names[angle % 4]];
             changed = YES;
             break;
         }
-        case SLFanSwitchMirror:
-            SLFanSetBool(kSLCamMirrorKey, !SLFanBool(kSLCamMirrorKey, NO));
+        case SLFanSwitchMirror: {
+            BOOL on = !SLFanBool(kSLCamMirrorKey, NO);
+            SLFanSetBool(kSLCamMirrorKey, on);
+            msg = on ? @"镜像：开 · 画面左右翻转" : @"镜像：关";
             changed = YES;
             break;
-        case SLFanSwitchLoop:
-            SLFanSetBool(kSLCamLoopKey, !SLFanBool(kSLCamLoopKey, YES));
+        }
+        case SLFanSwitchLoop: {
+            BOOL on = !SLFanBool(kSLCamLoopKey, YES);
+            SLFanSetBool(kSLCamLoopKey, on);
+            msg = on ? @"循环播放：开 · 播完从头再来"
+                     : @"循环播放：关 · 播完停在最后一帧";
             changed = YES;
             break;
+        }
         default:
             break;
     }
-    if (changed) SLCamReloadAll();
+    if (changed) {
+        SLCamReloadAll();
+        // 松开手指那一刻扇已经收了，屏幕上什么反馈都没有 —— 补一句说明改了什么。
+        if (msg.length) SLToast(msg);
+    }
 }

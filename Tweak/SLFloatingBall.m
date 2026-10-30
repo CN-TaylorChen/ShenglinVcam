@@ -199,6 +199,7 @@ static BOOL SLSaveFloatIconImage(UIImage *img) {
 
 static void SLApplyFloatIcon(UIButton *btn);
 // v0.4.40：位置相关的三个工具（定义在文件后面，拖动手势要用到）
+static CGSize SLHostSizeFor(UIView *sv);
 static CGPoint SLClampFloatPos(CGPoint c, CGSize size);
 static void SLStoreFloatPos(CGPoint c, CGSize size);
 static CGPoint SLLoadFloatPos(CGSize size);
@@ -287,6 +288,9 @@ static UIImage *SLTransparentImage(void) {
     // 长按期间要临时关掉它，否则手指在扇上滑动会同时把球拖走
     UIPanGestureRecognizer *_pan;
     SLFanView *_fan;
+    // 展开前球停在哪。扇心被推进安全区时球会滑过去，收起要滑回原处，
+    // 不然用户拖了半天的位置会被一次长按改掉。
+    CGPoint _fanHomePos;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -764,12 +768,29 @@ static UIImage *SLTransparentImage(void) {
         [_fan removeFromSuperview];
         _fan = nil;
     }
-    CGSize sz = sv.bounds.size;
+    // 几何一律按屏幕量。sv 是 SLKeyWindow() 挑出来的那个窗口，它可能是 QQRTCWindow
+    // 这类只覆盖屏幕一块的浮层 —— 拿它的 bounds 当屏幕，扇就会被夹小、位置也偏。
+    // 但子视图画不到父视图外面，所以实际可用区域取「屏幕」和「sv」里小的那个：
+    // 正常 App 两者相等，退化成屏幕；浮层窗口时至少不会画出界。
+    CGSize scr = SLScreenSize();
+    CGSize sz = CGSizeMake(MIN(sv.bounds.size.width, scr.width),
+                           MIN(sv.bounds.size.height, scr.height));
+    _fanHomePos = self.center;
     _fan = [[SLFanView alloc] initWithHostSize:sz ballCenter:self.center
                                           edge:[self sl_edgeForCenter:self.center inSize:sz]];
     // 扇压在球下面：手指是从球心出发的，球本身不能被盖住
     [sv insertSubview:_fan belowSubview:self];
     [_fan sl_show];
+
+    // 球贴角落时扇心会被推进安全区（五个球才排得下）。这时候球得跟着走，
+    // 否则屏幕上就是「球在一个地方、扇在另一个地方」—— 用户说的「展开后错位」。
+    CGPoint fc = _fan.slFanCenter;
+    if (!CGPointEqualToPoint(fc, self.center)) {
+        [UIView animateWithDuration:0.18 delay:0
+                            options:UIViewAnimationOptionCurveEaseOut
+                         animations:^{ self.center = fc; }
+                         completion:nil];
+    }
 }
 
 - (void)sl_hideFan {
@@ -777,6 +798,13 @@ static UIImage *SLTransparentImage(void) {
     _fan = nil;
     if (!f) return;
     [f sl_hide];
+    // 球滑回展开前的位置
+    if (!CGPointEqualToPoint(_fanHomePos, self.center)) {
+        [UIView animateWithDuration:0.18 delay:0
+                            options:UIViewAnimationOptionCurveEaseOut
+                         animations:^{ self.center = _fanHomePos; }
+                         completion:nil];
+    }
     // 等收起动画跑完再摘，直接 remove 会「啪」地消失
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ [f removeFromSuperview]; });
@@ -787,7 +815,7 @@ static UIImage *SLTransparentImage(void) {
 - (void)sl_pan:(UIPanGestureRecognizer *)g {
     UIView *sv = self.superview;
     if (!sv) return;
-    CGSize sz = sv.bounds.size;
+    CGSize sz = SLHostSizeFor(sv);
 
     if (g.state == UIGestureRecognizerStateChanged) {
         CGPoint t = [g translationInView:sv];
@@ -808,7 +836,7 @@ static UIImage *SLTransparentImage(void) {
                             options:UIViewAnimationOptionBeginFromCurrentState
                          animations:^{ self.center = c; }
                          completion:nil];
-        SLStoreFloatPos(c, sz);
+        SLStoreFloatPos(c, SLScreenSize());
     }
 }
 
@@ -1067,13 +1095,17 @@ static SLFloatPanelController *sSLFloatPanel = nil;
     // 系统在布局周期会重置导航栏外观，这里是必须补刷的一次
     [self sl_applyNavTransparency];
     [self sl_clearOpaqueBackdrops:self.nav.view depth:0];
-    CGSize ss = self.view.bounds.size;
-    if (ss.width < 1.0 || ss.height < 1.0) return;
+    CGSize host = self.view.bounds.size;
+    if (host.width < 1.0 || host.height < 1.0) return;
     self.dim.frame = self.view.bounds;
-    // 宽度留 12pt 边，高度固定占屏幕 66%（上限 560），不做拖拽
-    CGFloat w = MIN(ss.width - 24.0, 380.0);
-    CGFloat h = MIN(ss.height * 0.66, 560.0);
-    CGRect r = CGRectMake(round((ss.width - w) / 2.0), round((ss.height - h) / 2.0) - 18.0, w, h);
+    // 尺寸按屏幕算，不按 self.view.bounds —— 后者是呈现容器的 bounds，
+    // 不同 App 的容器可能不一样（带 inset、formSheet、被 Scene 改过），
+    // 表现就是「设置菜单在每个 App 里大小不同」。
+    // 位置仍按容器居中，因为卡片是加在容器上的，坐标基准是容器。
+    CGSize scr = SLScreenSize();
+    CGFloat w = MIN(scr.width - 24.0, 380.0);
+    CGFloat h = MIN(scr.height * 0.66, 560.0);
+    CGRect r = CGRectMake(round((host.width - w) / 2.0), round((host.height - h) / 2.0) - 18.0, w, h);
     if (!CGRectEqualToRect(self.cardWrap.frame, r)) self.cardWrap.frame = r;
     self.blur.frame = self.cardWrap.bounds;
     // v0.4.44：尺寸变了就重画 mask，否则圆角裁在旧尺寸上（会裁掉一侧）
@@ -1325,6 +1357,20 @@ void SLRefreshFloatButton(void) {
     if (btn) [btn sl_applyState:(SLCamArmed() ? SLFloatStateReady : SLFloatStateIdle)];
 }
 
+// 球/扇能用的那块区域。
+//
+// 不能直接用 sv.bounds：sv 是 SLKeyWindow() 挑的窗口，它挑的是 windowLevel 最高的，
+// 而 iOS 里最高的常常不是主窗口（QQRTCWindow、键盘窗、Alert 窗都排在前面），
+// bounds 只是屏幕的一块。也不能只用屏幕：子视图画不到父视图外面，会裁。
+// 取两者较小的一边，正常 App 退化成屏幕，浮层窗口时至少不出界。
+static CGSize SLHostSizeFor(UIView *sv) {
+    CGSize scr = SLScreenSize();
+    if (!sv) return scr;
+    CGSize s = sv.bounds.size;
+    if (s.width <= 0 || s.height <= 0) return scr;
+    return CGSizeMake(MIN(s.width, scr.width), MIN(s.height, scr.height));
+}
+
 // 把中心点夹在「不会被屏幕边缘切掉」的范围内。
 // 原来那版是「越界就重置」—— 拖到边上会突然跳回中间，而且重置值本身也可能越界。
 static CGPoint SLClampFloatPos(CGPoint c, CGSize size) {
@@ -1343,18 +1389,58 @@ static CGPoint SLClampFloatPos(CGPoint c, CGSize size) {
 
 // 位置存「中心点占屏幕的比例」而不是绝对坐标：换设备、横竖屏、分屏之后
 // 同样的比例仍然落在同一个相对位置，不会跑到屏外。
+//
+// 0.2.15：存储从 NSUserDefaults 换到 CFPreferences 全局域。
+// tweak 注入进每个 App 后，[NSUserDefaults standardUserDefaults] 解析成该进程
+// 自己的 bundle id，落到各自沙盒的 Library/Preferences/<bundleid>.plist ——
+// 抖音存一份、QQ 存一份、陌陌存一份，互不可见。这就是「每个 App 里球位置都不一样」。
+//
+// 这里不能自己用 NSFileManager 拼 /var/mobile/Library/Preferences/xxx.plist 去写：
+// tweak 继承的是 App 沙盒，直接写那个路径会被 sandbox 拒掉。CFPreferencesSetAppValue
+// 走的是 cfprefsd 的 XPC，落盘由 cfprefsd 以用户身份完成，不在 App 沙盒内，所以能成，
+// 顺带也不用判断 rootless 越狱下 /var/jb 的前缀。
+static NSString *const kSLSharedDomain = @"com.taylorchen.shenglinvcam";
+static NSString *const kSLPosRelKey    = @"SLFloatPosRel";
+static NSString *const kSLPosAbsKey    = @"SLFloatPos";
+
+static NSString *SLSharedString(NSString *key) {
+    CFStringRef domain = (__bridge CFStringRef)kSLSharedDomain;
+    CFPreferencesSynchronize(domain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)key, domain);
+    if (!v) return nil;
+    NSString *s = nil;
+    if (CFGetTypeID(v) == CFStringGetTypeID()) s = [(__bridge NSString *)v copy];
+    CFRelease(v);
+    return s;
+}
+
+static void SLSharedSet(NSString *key, NSString *value) {
+    CFStringRef domain = (__bridge CFStringRef)kSLSharedDomain;
+    CFPreferencesSetAppValue((__bridge CFStringRef)key, (__bridge CFStringRef)value, domain);
+    CFPreferencesAppSynchronize(domain);
+}
+
 static void SLStoreFloatPos(CGPoint c, CGSize size) {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    if (size.width > 0 && size.height > 0) {
-        [d setObject:[NSString stringWithFormat:@"%.4f,%.4f", c.x / size.width, c.y / size.height]
-              forKey:@"SLFloatPosRel"];
-    }
-    [d setObject:NSStringFromCGPoint(c) forKey:@"SLFloatPos"];   // 兼容旧版读法
+    if (size.width <= 0 || size.height <= 0) return;
+    NSString *rel = [NSString stringWithFormat:@"%.4f,%.4f", c.x / size.width, c.y / size.height];
+    SLSharedSet(kSLPosRelKey, rel);
+    SLSharedSet(kSLPosAbsKey, NSStringFromCGPoint(c));   // 兼容旧版读法
+    // 本 App 也留一份：万一全局域被拒（个别宿主沙盒更严），下次还能读回自己那份，
+    // 不至于每次都跳回默认位置。
+    [[NSUserDefaults standardUserDefaults] setObject:rel forKey:kSLPosRelKey];
 }
 
 static CGPoint SLLoadFloatPos(CGSize size) {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    NSString *rel = [d stringForKey:@"SLFloatPosRel"];
+    NSString *rel = SLSharedString(kSLPosRelKey);
+    if (!rel.length) {
+        // 全局域还是空的（第一次装 0.2.15）→ 从本 App 的旧值迁移过来，
+        // 老用户升级后球不会跳位。
+        NSString *old = [[NSUserDefaults standardUserDefaults] stringForKey:kSLPosRelKey];
+        if (old.length) {
+            SLSharedSet(kSLPosRelKey, old);
+            rel = old;
+        }
+    }
     if (rel.length) {
         NSArray *p = [rel componentsSeparatedByString:@","];
         if (p.count == 2) {
@@ -1364,8 +1450,9 @@ static CGPoint SLLoadFloatPos(CGSize size) {
             }
         }
     }
-    NSString *old = [d objectForKey:@"SLFloatPos"];
-    if (old.length) return CGPointFromString(old);
+    NSString *abs = SLSharedString(kSLPosAbsKey);
+    if (!abs.length) abs = [[NSUserDefaults standardUserDefaults] stringForKey:kSLPosAbsKey];
+    if (abs.length) return CGPointFromString(abs);
     return CGPointMake(size.width - 36.0, size.height * 0.55);
 }
 
@@ -1387,7 +1474,7 @@ void SLEnsureFloatButton(void) {
         // v0.4.37：窗口被换（启动页 / 广告窗关掉、场景重建）时把球迁到新的顶层窗口，
         // 否则球跟着旧窗一起消失，而且在新窗口里找不到 tag、只能等下次冷启动。
         [btn removeFromSuperview];
-        btn.center = SLClampFloatPos(btn.center, w.bounds.size);
+        btn.center = SLClampFloatPos(btn.center, SLHostSizeFor(w));
         [w addSubview:btn];
         // 抖音这类 App 的遮罩窗一秒能换好几次，逐次打日志会把整份日志顶满。
         // 同一类窗口只记第一次，之后每 50 次补一行心跳。
@@ -1404,7 +1491,7 @@ void SLEnsureFloatButton(void) {
         }
     }
     if (!btn) {
-        CGPoint c = SLClampFloatPos(SLLoadFloatPos(w.bounds.size), w.bounds.size);
+        CGPoint c = SLClampFloatPos(SLLoadFloatPos(SLScreenSize()), SLHostSizeFor(w));
         btn = [[SLFloatButton alloc] initWithFrame:CGRectMake(0, 0, 48, 48)];
         btn.center = c;
         btn.tag = SLBtnTag;

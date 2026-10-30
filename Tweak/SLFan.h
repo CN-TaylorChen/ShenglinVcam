@@ -3,8 +3,12 @@
 //  声临 · 虚拟摄像头 —— 长按展开的五个开关球
 //
 //  几何：球永远贴在屏幕某条边上，扇口朝屏幕内侧张开。
-//  五个球排在 144° 的弧上（±72°），半径 92pt，球径 44pt；球贴角落时先缩半径
-//  （92 → 74，再小五个球就会叠在一起），剩下的越界逐个夹回安全区。
+//  五个球排在 144° 的弧上（±72°），半径 92pt，球径 44pt。
+//
+//  0.2.15：球贴角落时不再「逐球夹取」——那样会把一侧两三个球压到同一条竖线上，
+//  看起来就是「展开后错位」。现在改成**扇心内推**：球心不动，把扇心沿垂直于
+//  张开方向的那一维推进安全区；真的放不下（屏幕比整扇还窄）才按比例缩半径。
+//  扇心可能不等于球心，调用方用 slFanCenter 把主球滑过去，保持「球带扇走」。
 //
 //  顺序（从上到下 / 从右到左）：启用 · 静音 · 旋转 · 镜像 · 循环
 //  旋转是四态（0/90/180/270），滑到它上面会再展开一列角度，弧跟着手指扫。
@@ -31,7 +35,8 @@ typedef NS_ENUM(NSInteger, SLFanSwitch) {
 
 @interface SLFanView : UIView
 
-/// host 是扇要铺满的那个容器（球的 superview）；center 是主球在 host 里的中心
+/// host 是扇要铺满的那个容器（球的 superview）；center 是主球在 host 里的中心。
+/// hostSize 传**屏幕尺寸**（SLScreenSize()），不要传 superview.bounds.size。
 - (instancetype)initWithHostSize:(CGSize)hostSize
                       ballCenter:(CGPoint)center
                             edge:(SLFanEdge)edge;
@@ -42,6 +47,10 @@ typedef NS_ENUM(NSInteger, SLFanSwitch) {
 
 /// 手指位置（host 坐标）。内部负责 hover、角度列的展开与弧的跟手扫动。
 - (void)sl_trackPoint:(CGPoint)p;
+
+/// 扇心（host 坐标）。球贴角时它会被推进安全区，和主球球心不同 ——
+/// 调用方拿它把主球滑过来，否则会出现「球在一处、扇在另一处」。
+@property (nonatomic, readonly) CGPoint slFanCenter;
 
 /// 松手时的结果：选中的开关球，-1 = 没选
 @property (nonatomic, readonly) NSInteger slPickedSwitch;

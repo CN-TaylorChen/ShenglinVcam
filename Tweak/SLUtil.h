@@ -28,6 +28,15 @@ void SLToastLong(NSString *message);
 /// 当前最顶层的控制器（考虑 presentedViewController 链）
 UIViewController *_Nullable SLTopViewController(void);
 
+/// 屏幕矩形，origin 恒为 (0,0)。
+/// 插件注入后所有「尺寸」都必须走这里，不要用 superview.bounds / self.view.bounds ——
+/// SLKeyWindow() 挑的是 windowLevel 最高的窗口，那个窗口常常只是屏幕的一块局部区域
+/// （QQRTCWindow、键盘窗、Alert 窗），拿它的 bounds 当屏幕会让扇缩水、面板变形。
+CGRect SLScreenRect(void);
+
+/// SLScreenRect().size
+CGSize SLScreenSize(void);
+
 /// 居中裁成正方形后再切圆角。用于自定义图标 / 素材封面。
 UIImage *_Nullable SLRoundedImage(UIImage *_Nullable src, CGFloat side);
 

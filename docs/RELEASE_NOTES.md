@@ -1,3 +1,107 @@
+## 0.2.15 —— 坐标系收口 / 扇几何重做 / 拍照接管 / 音频布点
+
+0.2.14 上机后的一批问题。这一版有两条是**功能新增**（拍照替换、录制链路探测），
+其余是几何与交互修正。
+
+### 一、所有尺寸改从屏幕取，不再信宿主视图
+
+根因一句话：`SLKeyWindow()` 挑的是 **windowLevel 最高**的窗口，而 iOS 里最高的
+往往不是主窗口 —— `QQRTCWindow`（通话浮层）、`UITextEffectsWindow`（键盘）、
+Alert 窗、状态栏窗都排在主窗口前面。这些窗口的 `bounds` 只是屏幕的一块。
+
+于是同一个 `self.bounds` 在不同 App 里量出不同结果：
+
+| 用到的地方 | 症状 |
+|---|---|
+| `SLFan` 的 `_hostSize` | 扇半径被夹到 74，五个球挤成一团 |
+| `SLClampFloatPos` 的 `size` | 球被夹在浮层里，拖不到屏幕边 |
+| `self.view.bounds`（面板） | 设置菜单在每个 App 里大小不同 |
+
+新增 `SLScreenRect()` / `SLScreenSize()`（`SLUtil.m`），取所有活跃 `UIWindowScene`
+里最大的 `coordinateSpace.bounds`，origin 归零。面板尺寸、扇几何、球夹取全部走它。
+
+扇仍然铺在父视图上（子视图画不到父视图外面），所以 `SLHostSizeFor(sv)` 取
+「屏幕」和「sv」里小的那个：正常 App 退化成屏幕，浮层窗口时至少不会画出界。
+
+### 二、扇贴角落时不再被压扁
+
+0.2.13/0.2.14 是「越界就缩半径，缩到下限 74 就停，剩下的逐球夹取」。
+球贴角落时，一侧两三个球会被推到**同一条竖线上** —— 弧被压成一条直线，
+看起来就是「展开后错位」。收扇角也不行：相邻夹角 `2*half/4`，收 `half`
+会让弦长一起变小，五个球直接叠在一起。
+
+改成**扇心内推**：球心不动，把扇心沿垂直于张开方向的那一维推进安全区，
+最多推到「整扇刚好贴住安全区边缘」。弧线形状完全不变，只是整体平移。
+只有屏幕比整扇还窄时才按比例缩半径，下限仍是 74，最后留一道逐球兜底。
+
+扇心被推走后主球跟着滑过去（0.18s），收起时滑回原处 —— 否则屏幕上就是
+「球在一处、扇在另一处」。
+
+### 三、配色与图标
+
+- `sl_accent`：`systemIndigoColor`（偏紫）→ `systemBlueColor`。选中 pill、弧、
+  光晕、角度图标都跟着这个走，改一处全变。
+- 镜像图标：`arrow.left.and.right` → `flip.horizontal`（iOS 15+，退回原图标）。
+  前者就是两根箭头，没有「翻转」语义，摆在旋转球旁边更像「左右移动」。
+
+### 四、素材可以取消勾选了
+
+`SLMediaStore setCurrentItem:` 本来就支持传 `nil` 清空（内部走 `removeObjectForKey`），
+只是 `didSelectRow` 从来没给过 `nil` —— 点已勾选的行只会再选一次，永远取消不掉。
+现在点已选中的行 = 取消替换，并弹一句「已取消替换 · 恢复真实摄像头」。
+
+### 五、球的位置跨 App 共享
+
+`[NSUserDefaults standardUserDefaults]` 在 tweak 注入后解析成**该进程自己的
+bundle id**，落到各自沙盒的 `Library/Preferences/<bundleid>.plist` ——
+抖音存一份、QQ 存一份，互不可见。这就是「每个 App 里球位置都不一样」。
+
+改用 `CFPreferencesSetAppValue` 写全局域 `com.taylorchen.shenglinvcam`。
+**不能自己用 `NSFileManager` 拼 `/var/mobile/Library/Preferences/xxx.plist`**：
+tweak 继承的是 App 沙盒，直接写那个路径会被拒。CFPreferences 走的是 `cfprefsd`
+的 XPC，落盘由 cfprefsd 以用户身份完成，不在 App 沙盒内 —— 顺带也不用判断
+rootless 越狱下 `/var/jb` 的前缀。
+
+首次读不到全局域时回落到本 App 的旧值并迁移过去，老用户升级不会跳位。
+
+### 六、开关提交后有 toast 了
+
+松开手指那一刻扇已经收了，屏幕上什么反馈都没有。现在每个开关都给一句：
+「替换已开启 · 摄像头画面换成素材」「素材声音：关 · 对方听到你的真麦克风」
+「画面方向：顺时针 90°」……
+
+### 七、拍照接管（新功能）
+
+`-[AVCaptureStillImageOutput captureStillImageAsynchronouslyFromConnection:completionHandler:]`
+是「对象 + block」两个参数，被注入层「单指针参数」的启发式规则直接跳过 ——
+所以拍照出来永远是真实画面。QQ 的日志里明确有
+`会话加输出: AVCaptureStillImageOutput`，就是它。
+
+接法：把 `completionHandler` 包一层，收到真 buffer 后不往下传，改传我们自己
+构造的假 JPEG —— 素材当前帧转 JPEG，再按 JPEG 宽高建
+`CMVideoFormatDescriptionCreate(kCMVideoCodecType_JPEG)` + `CMBlockBuffer` 拼成
+`CMSampleBufferCreateReady`。素材那一帧没解出来时退回真画面，不给黑图。
+
+### 八、录制音频布点（只为定位，不接管）
+
+0.2.14 的日志显示：QQ 拍摄页期间 `AudioUnitRender bus=1` 为 0 次、
+`AVCaptureAudioDataOutput` 没被加进会话、`AudioQueueNewInput` 没触发、
+连新加的「放行真麦克风」都没打 —— 说明 `audioForFormat:` 根本没被调用，
+声音是从 capture session 外面进来的。
+
+新增三个探测点，命中即打一行日志：
+
+| 探测点 | 命中说明 |
+|---|---|
+| `-[AVAudioInputNode installTapOnBus:bufferSize:format:block:]` | 走 AVAudioEngine，可以直接接管 |
+| `-[AVAudioRecorder record]` | 走写文件路径，需要另一套接管 |
+| `-[AVCaptureMovieFileOutput startRecordingToOutputFileURL:recordingDelegate:]` | 画面会绕过 VideoDataOutput |
+
+这一版**只打日志不接管**：tap 能直接改 PCM buffer，Recorder 是往文件里写，
+两套接管方式完全不同，没确认走哪条就写大概率白做。
+
+---
+
 ## 0.2.14 —— 扇的图标 / 动画 / 命中 / 视觉，加音频诊断（本地改动，尚未构建发布）
 
 0.2.13 上机之后暴露的一批问题，逐条修。**音频替换的内容一行没改**，只加了日志。

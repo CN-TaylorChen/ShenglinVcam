@@ -6,13 +6,17 @@
 #import "SLCamInject.h"
 #import "SLCamFeed.h"
 #import "SLCamAudioUnit.h"
+#import "SLCamBridge.h"
 #import "SLLog.h"
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <CoreImage/CoreImage.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <os/lock.h>
+#import <dlfcn.h>
 
 typedef void (*SLProcessSampleBufferFn)(id, SEL, CMSampleBufferRef);
 
@@ -556,6 +560,200 @@ static void SLCamHookSessionOutputs(void) {
     method_setImplementation(m, (IMP)SLCamAddOutput);
 }
 
+#pragma mark - 录制音频链路探测（0.2.15）
+
+// 我们目前接了三条音频链路：AudioUnitRender(bus=1)、AVCaptureAudioDataOutput、
+// AudioQueueNewInput。QQ 的「拍摄页录制」三条全都没走到 —— 0.2.14 的日志里
+// 连新加的「放行真麦克风」一行都没打，说明 audioForFormat: 根本没被调用；
+// 而同一个会话只加了 VideoDataOutput / StillImageOutput / MetadataOutput，
+// 没有 AudioDataOutput，所以声音是从 capture session 外面进来的。
+//
+// 下面三条是最可能的入口。这一版**只打日志、不接管**：
+// AVAudioEngine 的 tap 能直接改 PCM buffer，AVAudioRecorder 是往文件里写，
+// 两套接管方式完全不同 —— 没确认走哪条就写，大概率白做。
+static void (*gSLTapOrig)(id, SEL, NSUInteger, AVAudioFrameCount, AVAudioFormat *, id);
+static BOOL (*gSLRecorderOrig)(id, SEL);
+static void (*gSLMovieStartOrig)(id, SEL, NSURL *, id);
+
+static void SLCamAudioTapProbe(id self, SEL _cmd, NSUInteger bus, AVAudioFrameCount frames,
+                               AVAudioFormat *fmt, id block) {
+    static BOOL logged = NO;
+    if (!logged) {
+        logged = YES;
+        AudioStreamBasicDescription a;
+        memset(&a, 0, sizeof(a));
+        if (fmt && fmt.streamDescription) a = *fmt.streamDescription;
+        SLLog(@"音频: 命中 AVAudioEngine tap bus=%lu %.0fHz %uch %uB/帧 · 录制走这条",
+              (unsigned long)bus, a.mSampleRate,
+              (unsigned)a.mChannelsPerFrame, (unsigned)a.mBytesPerFrame);
+    }
+    if (gSLTapOrig) gSLTapOrig(self, _cmd, bus, frames, fmt, block);
+}
+
+static BOOL SLCamRecorderProbe(id self, SEL _cmd) {
+    static BOOL logged = NO;
+    if (!logged) {
+        logged = YES;
+        SLLog(@"音频: 命中 AVAudioRecorder -record · 录制走写文件路径");
+    }
+    return gSLRecorderOrig ? gSLRecorderOrig(self, _cmd) : NO;
+}
+
+static void SLCamMovieStartProbe(id self, SEL _cmd, NSURL *url, id delegate) {
+    static BOOL logged = NO;
+    if (!logged) {
+        logged = YES;
+        SLLog(@"音频: 命中 AVCaptureMovieFileOutput 录制（%@）· 画面会绕过 VideoDataOutput",
+              url.lastPathComponent ?: @"?");
+    }
+    if (gSLMovieStartOrig) gSLMovieStartOrig(self, _cmd, url, delegate);
+}
+
+// AVFAudio 是 iOS 14 起独立出来的框架，宿主不一定会主动加载。
+// objc_getClass 拿不到就 dlopen 一次再取。
+static Class SLCamLoadClass(const char *name, const char *framework) {
+    Class c = objc_getClass(name);
+    if (c || !framework) return c;
+    if (dlopen(framework, RTLD_LAZY)) return objc_getClass(name);
+    return nil;
+}
+
+static void SLCamHookSel(Class cls, SEL sel, IMP imp, IMP *origOut) {
+    if (!cls || !sel) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    if (origOut) *origOut = method_getImplementation(m);
+    method_setImplementation(m, imp);
+}
+
+static void SLCamInstallRecordingProbes(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    const char *avf = "/System/Library/Frameworks/AVFAudio.framework/AVFAudio";
+    Class inputNode = SLCamLoadClass("AVAudioInputNode", avf);
+    SLCamHookSel(inputNode, NSSelectorFromString(@"installTapOnBus:bufferSize:format:block:"),
+                 (IMP)SLCamAudioTapProbe, (IMP *)&gSLTapOrig);
+
+    Class rec = SLCamLoadClass("AVAudioRecorder", avf);
+    SLCamHookSel(rec, @selector(record), (IMP)SLCamRecorderProbe, (IMP *)&gSLRecorderOrig);
+
+    Class movie = objc_getClass("AVCaptureMovieFileOutput");
+    SLCamHookSel(movie, NSSelectorFromString(@"startRecordingToOutputFileURL:recordingDelegate:"),
+                 (IMP)SLCamMovieStartProbe, (IMP *)&gSLMovieStartOrig);
+
+    SLLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d",
+          inputNode != nil, rec != nil, movie != nil);
+}
+
+#pragma mark - 拍照接管（0.2.15）
+
+// 拍照是另一条完全独立的路径。
+//
+// 我们的注入是按「类名里凡是名字带 samplebuffer 且签名是单指针参数的方法」挂的，
+// 而 -[AVCaptureStillImageOutput captureStillImageAsynchronouslyFromConnection:completionHandler:]
+// 是「对象 + block」两个参数，被那条规则直接跳过 —— 所以拍照出来永远是真实画面。
+// QQ 的日志里明确有「会话加输出: AVCaptureStillImageOutput」，就是它。
+//
+// 接法：把 completionHandler 包一层，收到真 buffer 后不往下传，改传我们自己的
+// 假 JPEG。CMSampleBuffer 是只读的，替换只能新建一个 —— 拿素材当前帧转 JPEG，
+// 再按 JPEG 的宽高建 format description + block buffer 拼出来。
+static void (*gSLStillOrig)(id, SEL, id, void (^)(CMSampleBufferRef, NSError *));
+
+static NSData *SLCamJPEGFromPixelBuffer(CVPixelBufferRef pb, CGFloat quality) {
+    if (!pb) return nil;
+    CIImage *ci = [CIImage imageWithCVPixelBuffer:pb];
+    if (!ci) return nil;
+    static CIContext *ctx = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ ctx = [CIContext contextWithOptions:nil]; });
+    CGImageRef cg = [ctx createCGImage:ci fromRect:ci.extent];
+    if (!cg) return nil;
+    UIImage *img = [UIImage imageWithCGImage:cg];
+    CGImageRelease(cg);
+    return UIImageJPEGRepresentation(img, quality);
+}
+
+static CMSampleBufferRef SLCamJPEGSampleBuffer(CVPixelBufferRef pb) {
+    NSData *jpeg = SLCamJPEGFromPixelBuffer(pb, 0.92);
+    if (!jpeg.length) return NULL;
+
+    size_t len = jpeg.length;
+    CMBlockBufferRef block = NULL;
+    if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, len, kCFAllocatorDefault,
+                                           NULL, 0, len, kCMBlockBufferAssureMemoryNowFlag,
+                                           &block) != kCMBlockBufferNoErr || !block) {
+        return NULL;
+    }
+    if (CMBlockBufferReplaceDataBytes(jpeg.bytes, block, 0, len) != kCMBlockBufferNoErr) {
+        CFRelease(block);
+        return NULL;
+    }
+
+    // 宽高必须跟 JPEG 本身一致 —— QQ 是按 format description 摆图的，
+    // 尺寸对不上会拉伸变形。
+    CMVideoFormatDescriptionRef fmt = NULL;
+    OSStatus st = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_JPEG,
+                                                 (int32_t)CVPixelBufferGetWidth(pb),
+                                                 (int32_t)CVPixelBufferGetHeight(pb),
+                                                 NULL, &fmt);
+    if (st != noErr || !fmt) {
+        CFRelease(block);
+        return NULL;
+    }
+
+    CMSampleTimingInfo timing = { CMTimeMake(1, 30), kCMTimeZero, kCMTimeInvalid };
+    size_t sizes[1] = { len };
+    CMSampleBufferRef sbuf = NULL;
+    st = CMSampleBufferCreateReady(kCFAllocatorDefault, block, fmt, 1, 1, &timing, 1, sizes, &sbuf);
+    CFRelease(fmt);
+    CFRelease(block);
+    return (st == noErr) ? sbuf : NULL;
+}
+
+static void SLCamCaptureStill(id self, SEL _cmd, id connection,
+                              void (^handler)(CMSampleBufferRef, NSError *)) {
+    if (!gSLStillOrig) return;
+    if (!SLCamInjecting() || !SLCamArmed() || ![[SLCamFeed shared] isReady]) {
+        gSLStillOrig(self, _cmd, connection, (__bridge id)handler);
+        return;
+    }
+
+    void (^wrapped)(CMSampleBufferRef, NSError *) = ^(CMSampleBufferRef buf, NSError *err) {
+        if (!handler) return;
+        CVPixelBufferRef pb = [[SLCamFeed shared] copyNextFrame];
+        CMSampleBufferRef fake = pb ? SLCamJPEGSampleBuffer(pb) : NULL;
+        if (pb) CVPixelBufferRelease(pb);
+        if (fake) {
+            static BOOL logged = NO;
+            if (!logged) {
+                logged = YES;
+                SLLog(@"注入: 拍照已接管 · 返回素材画面");
+            }
+            handler(fake, err);
+            CFRelease(fake);
+        } else {
+            handler(buf, err);   // 素材这一帧没解出来，宁可给真画面也不给黑图
+        }
+    };
+    gSLStillOrig(self, _cmd, connection, (__bridge id)[wrapped copy]);
+}
+
+static void SLCamInstallStillImageHook(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    Class cls = objc_getClass("AVCaptureStillImageOutput");
+    if (!cls) {
+        SLLog(@"注入: AVCaptureStillImageOutput 不存在，拍照跳过");
+        return;
+    }
+    SLCamHookSel(cls, NSSelectorFromString(@"captureStillImageAsynchronouslyFromConnection:completionHandler:"),
+                 (IMP)SLCamCaptureStill, (IMP *)&gSLStillOrig);
+    SLLog(@"注入: 拍照链路已布点 still=%d", gSLStillOrig != nil);
+}
+
 void SLCamInstallHooks(void) {
     if (sSLCamHooksInstalled) return;
     sSLCamHooksInstalled = YES;
@@ -606,6 +804,12 @@ void SLCamInstallHooks(void) {
 
     // 第二条链路：不经过 AVCapture 的麦克风（QQ 这类自建音频栈的 App）
     SLCamInstallAudioUnitHook();
+
+    // 第三条：QQ 拍摄页录制走的第四条路 —— 先布点确认是哪条
+    SLCamInstallRecordingProbes();
+
+    // 拍照（AVCaptureStillImageOutput）走的是另一条路，上面那套启发式挂不到
+    SLCamInstallStillImageHook();
 
     if (sSLCamHookCount == 0) {
         SLLog(@"注入: 没找到 _processSampleBuffer: —— 该系统版本可能改了私有 API，"

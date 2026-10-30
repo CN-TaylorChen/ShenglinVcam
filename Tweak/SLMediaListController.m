@@ -191,7 +191,18 @@ static void SLPresentSettingsWhenFree(UIViewController *host, NSInteger attempt)
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (ip.row >= (NSInteger)self.items.count) return;
-    [SLMediaStore setCurrentItem:self.items[ip.row]];
+    SLMediaItem *it = self.items[ip.row];
+    // 再点一次已经打勾的那行 = 取消替换。
+    // SLMediaStore 本来就支持传 nil 清空（内部走 removeObjectForKey），
+    // 只是这里从来没给过 nil —— 所以「勾上了就取消不掉」。
+    BOOL cur = [[SLMediaStore currentItem].fileName isEqualToString:it.fileName];
+    if (cur) {
+        [SLMediaStore setCurrentItem:nil];
+        SLToast(@"已取消替换 · 恢复真实摄像头");
+    } else {
+        [SLMediaStore setCurrentItem:it];
+        SLToast(@"已切换素材");
+    }
     [tv reloadData];
     SLCamReloadAll();
 }

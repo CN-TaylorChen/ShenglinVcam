@@ -110,6 +110,44 @@ UIViewController *SLTopViewController(void) {
     return vc;
 }
 
+// 屏幕尺寸的唯一出口。
+//
+// 为什么不能直接读 superview.bounds / self.view.bounds：
+// 球挂在 SLKeyWindow() 挑出来的那个窗口上，而它挑的是 windowLevel 最高的窗口。
+// iOS 里 windowLevel 最高的往往不是主窗口 —— QQRTCWindow（通话浮层）、
+// UITextEffectsWindow（键盘）、Alert 窗、状态栏窗都排在主窗口前面。
+// 这些窗口的 bounds 只是屏幕的一块局部区域，拿它当屏幕量几何，扇就会：
+//   ① 半径被安全区夹到下限 74，五个球挤在一起；
+//   ② 球心相对位置偏移，看起来「每个 App 位置都不一样」。
+// 面板同理 —— self.view.bounds 是呈现容器的 bounds，容器一变尺寸就变。
+//
+// coordinateSpace.bounds 的 origin 在分屏 / 台前调度下可能不是 0，这里统一归零：
+// 我们要的只是「能画多大」，不是「画在屏幕的哪个偏移处」。
+CGRect SLScreenRect(void) {
+    if (@available(iOS 13.0, *)) {
+        CGRect best = CGRectZero;
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)sc;
+            if (ws.activationState == UISceneActivationStateBackground) continue;
+            CGRect r = ws.coordinateSpace.bounds;
+            if (r.size.width * r.size.height > best.size.width * best.size.height) best = r;
+        }
+        if (best.size.width > 0 && best.size.height > 0) {
+            return CGRectMake(0, 0, best.size.width, best.size.height);
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    CGRect r = [UIScreen mainScreen].bounds;
+#pragma clang diagnostic pop
+    return CGRectMake(0, 0, r.size.width, r.size.height);
+}
+
+CGSize SLScreenSize(void) {
+    return SLScreenRect().size;
+}
+
 UIImage *SLRoundedImage(UIImage *src, CGFloat side) {
     if (!src || side <= 0) return nil;
     CGSize sz = src.size;
