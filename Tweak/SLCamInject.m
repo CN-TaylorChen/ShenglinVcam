@@ -37,6 +37,9 @@ static int  sSLCamBadPTS = 0;
 static int  sSLCamTimingFixLogged = 0;
 static int  sSLCamOwnFmtLogged = 0;
 static int  sSLCamDTSFixLogged = 0;
+static int  sSLCamAttachLogged = 0;
+static int  sSLCamSetAttachFailLogged = 0;
+static int  sSLCamOwnFmtExtFailLogged = 0;
 
 /// 四字符码转可读串（'BGRA' / '420f'），日志里比裸数字好认
 static NSString *SLFourCC(OSType v) {
@@ -63,6 +66,78 @@ static IMP SLCamOriginalIMP(id self, SEL _cmd) {
         SLLog(@"注入: 找不到 %s 的原始 IMP，将原样放行", sel_getName(_cmd));
     }
     return NULL;
+}
+
+/// 自建一个「和假帧自洽、又保留宿主 extensions」的 fmt。
+///
+/// 这里绝对不能用 CMVideoFormatDescriptionCreateForImageBuffer：它是从像素缓冲区
+/// 反推 extensions 的，而我们手上的帧是 CVPixelBufferCreate 干净造出来的，
+/// 反推出来就是空字典。宿主（抖音尤其）会去 CMFormatDescriptionGetExtension
+/// 取相机内参、色彩矩阵这类 key，拿到 NULL 之后是不判空直接 CFRelease 的 ——
+/// CoreFoundation 对 CFRelease(NULL) 是硬断言，当场 SIGTRAP。
+/// 0.2.9「点开录制就闪退」的栈就是：我们的假帧 → _processSampleBuffer: →
+/// AwemeCore 代理 → CFRelease(NULL)。所以必须把宿主 fmt 的 extensions 整包搬过去。
+///
+/// 尺寸用假帧自己的，这样 CMVideoFormatDescriptionMatchesImageBuffer 才过。
+static CMVideoFormatDescriptionRef SLCamMakeFormatDescription(CMFormatDescriptionRef hostFmt,
+                                                              CVPixelBufferRef frame) {
+    if (!hostFmt || !frame) return NULL;
+
+    OSType subType = CMFormatDescriptionGetMediaSubType(hostFmt);
+    if (subType == 0) subType = CVPixelBufferGetPixelFormatType(frame);
+
+    CMVideoFormatDescriptionRef out = NULL;
+    OSStatus st = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, subType,
+                                                 (int32_t)CVPixelBufferGetWidth(frame),
+                                                 (int32_t)CVPixelBufferGetHeight(frame),
+                                                 CMFormatDescriptionGetExtensions(hostFmt),
+                                                 &out);
+    if (st == noErr && out) return out;
+
+    // 带着宿主 extensions 造不出来（个别 key 和尺寸不自洽），退回系统那套：
+    // extensions 是空的，但至少 fmt 和帧自洽，画面不会黑。
+    out = NULL;
+    if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &out) != noErr) {
+        return NULL;
+    }
+    if (sSLCamOwnFmtExtFailLogged++ == 0) {
+        SLLog(@"注入: 带宿主 extensions 建 fmt 失败 st=%d，已退回空 extensions（宿主可能取不到内参）", (int)st);
+    }
+    return out;
+}
+
+/// 把真帧上的附件整套搬到假帧上。
+///
+/// CMSampleBufferCreateReadyWithImageBuffer 只传播「像素缓冲区上」的附件，而真帧
+/// sample buffer 自己带的那些（相机内参、时间戳对齐信息等）一条都继承不过来。
+/// 宿主用 CMGetAttachment / CMCopyDictionaryOfAttachments 去取，就会拿到 NULL。
+static void SLCamCopySampleAttachments(CMSampleBufferRef from, CMSampleBufferRef to) {
+    if (!from || !to) return;
+    CFDictionaryRef atts = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, from,
+                                                         kCMAttachmentMode_ShouldPropagate);
+    if (!atts) return;
+    OSStatus st = CMSetAttachments(to, atts, kCMAttachmentMode_ShouldPropagate);
+    if (st != noErr && sSLCamSetAttachFailLogged++ == 0) {
+        SLLog(@"注入: 附件回填失败 st=%d（宿主可能取不到内参）", (int)st);
+    }
+    CFRelease(atts);
+}
+
+/// 首次注入时把两边的 key 列表打出来。
+/// 万一以后还崩在这个位置，这一行就能直接指出宿主缺哪个 key，不用再猜。
+static void SLCamLogAttachmentKeys(CMSampleBufferRef sbuf, CMFormatDescriptionRef fmt) {
+    if (sSLCamAttachLogged++ > 0) return;
+
+    CFDictionaryRef atts = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, sbuf,
+                                                         kCMAttachmentMode_ShouldPropagate);
+    NSArray *attKeys = atts ? [(__bridge NSDictionary *)atts allKeys] : @[];
+    CFDictionaryRef ext = fmt ? CMFormatDescriptionGetExtensions(fmt) : NULL;
+    NSArray *extKeys = ext ? [(__bridge NSDictionary *)ext allKeys] : @[];
+
+    SLLog(@"注入: 真帧附件 %lu 项 %@ · 宿主 fmt 扩展 %lu 项 %@",
+          (unsigned long)attKeys.count, attKeys,
+          (unsigned long)extKeys.count, extKeys);
+    if (atts) CFRelease(atts);
 }
 
 static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) {
@@ -107,6 +182,8 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
                       d.width, d.height,
                       SLFourCC(CMFormatDescriptionGetMediaSubType(fmt)),
                       fmtMatchesReal ? @"Y" : @"N");
+                // 宿主到底从帧上取了哪些 key，一次看清 —— 以后崩在这个位置能直接定位
+                SLCamLogAttachmentKeys(sbuf, fmt);
             }
 
             CMSampleTimingInfo timing = {0};
@@ -144,20 +221,23 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
             CVPixelBufferRef frame = [feed copyFrameForPixelFormat:pf size:size];
             if (frame) {
                 // 优先沿用宿主的 fmt（下游的编码器/写入器都按它配置，换了会出岔子）。
-                // 只有当假帧确实与它不匹配时，才退而求其次自建一个 —— 自建的保证内部自洽。
+                // 只有当假帧确实与它不匹配时，才退而求其次自建一个 —— 自建的那个
+                // 必须把宿主的 extensions 带过去，否则宿主读扩展拿到 NULL 会崩。
                 CMVideoFormatDescriptionRef useFmt = (CMVideoFormatDescriptionRef)fmt;
                 CMVideoFormatDescriptionRef ownFmt = NULL;
                 if (!CMVideoFormatDescriptionMatchesImageBuffer((CMVideoFormatDescriptionRef)fmt, frame)) {
-                    if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, frame, &ownFmt) == noErr
-                        && ownFmt) {
+                    ownFmt = SLCamMakeFormatDescription(fmt, frame);
+                    if (ownFmt) {
                         useFmt = ownFmt;
                         if (sSLCamOwnFmtLogged++ == 0) {
                             CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions((CMVideoFormatDescriptionRef)fmt);
-                            SLLog(@"注入: 假帧与宿主 fmt 不匹配，已自建 fmt（帧 %ux%u %@ / fmt %dx%d %@）",
+                            SLLog(@"注入: 假帧与宿主 fmt 不匹配，已自建 fmt（帧 %ux%u %@ / fmt %dx%d %@ · 宿主扩展 %ld 项）",
                                   (unsigned)CVPixelBufferGetWidth(frame),
                                   (unsigned)CVPixelBufferGetHeight(frame),
                                   SLFourCC(CVPixelBufferGetPixelFormatType(frame)),
-                                  d.width, d.height, SLFourCC(CMFormatDescriptionGetMediaSubType(fmt)));
+                                  d.width, d.height, SLFourCC(CMFormatDescriptionGetMediaSubType(fmt)),
+                                  (long)(CMFormatDescriptionGetExtensions(fmt)
+                                         ? CFDictionaryGetCount(CMFormatDescriptionGetExtensions(fmt)) : 0));
                         }
                     }
                 }
@@ -179,9 +259,14 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
                               fmtMatchesReal ? @"Y" : @"N",
                               ownFmt ? @"Y" : @"N");
                     }
-                } else if (sSLCamFailCount > 0) {
-                    SLLog(@"注入: 打包恢复正常（累计失败 %d 次）", sSLCamFailCount);
-                    sSLCamFailCount = 0;
+                } else {
+                    if (sSLCamFailCount > 0) {
+                        SLLog(@"注入: 打包恢复正常（累计失败 %d 次）", sSLCamFailCount);
+                        sSLCamFailCount = 0;
+                    }
+                    // 真帧的附件必须搬到假帧上：宿主那边 CMGetAttachment /
+                    // CMCopyDictionaryOfAttachments 拿不到东西，是不判空就 CFRelease 的
+                    SLCamCopySampleAttachments(sbuf, fake);
                 }
                 if (ownFmt) CFRelease(ownFmt);
                 CVPixelBufferRelease(frame);
@@ -228,6 +313,9 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
                                 SLLog(@"注入: 音频打包失败 #%d st=%d · %u 帧 · %zu 字节",
                                       sSLCamAudioFailCount, (int)ast, (unsigned)frames, len);
                             }
+                        } else {
+                            // 音频帧同样要把宿主的附件带过去，理由和视频一样
+                            SLCamCopySampleAttachments(sbuf, fake);
                         }
                         CFRelease(newBB);
                     }

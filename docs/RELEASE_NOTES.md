@@ -1,3 +1,94 @@
+## 0.2.10 —— 修抖音闪退，修声音加速
+
+两个独立的 bug，一个是崩溃，一个是听感。
+
+### 一、抖音点开录制就闪退
+
+崩溃日志（`Aweme-2026-10-30-111449.ips`）给得很清楚：
+
+```
+exception : EXC_BREAKPOINT / SIGTRAP
+asi       : {"CoreFoundation": ["*** CFRelease() called with NULL ***"]}
+
+CMCapture    __rqReceiverSetSource_block_invoke
+AVFCapture   -[AVCaptureVideoDataOutput _updateRemoteQueue:]_block_invoke
+ShenglinVcam SLCamProcessSampleBuffer          ← 我们
+AVFCapture   -[AVCaptureVideoDataOutput _processSampleBuffer:]
+AwemeCore    ? + 135303880                     ← 抖音的代理
+CoreFoundation CFRelease                        ← 崩在这
+```
+
+`CFRelease(NULL)` 在 CoreFoundation 里是**硬断言**，不是野指针 —— 说明抖音从我们给的
+假帧上取某个对象，拿到 NULL，然后没判空直接 Release 了。
+
+**假帧缺两样东西：**
+
+| 缺的 | 谁造成 | 抖音读它的方式 |
+|---|---|---|
+| sample buffer 附件 | `CMSampleBufferCreateReadyWithImageBuffer` 只传播**像素缓冲区上**的附件，真帧自己带的一条都不过去 | `CMGetAttachment` / `CMCopyDictionaryOfAttachments` |
+| format description 扩展 | 自建 fmt 走的是 `CMVideoFormatDescriptionCreateForImageBuffer`，它从像素缓冲区**反推**扩展，而我们的帧是干净造的 → 反推出来是空字典 | `CMFormatDescriptionGetExtension` |
+
+真机采集帧这两样**一定有值**，所以抖音那边根本没写判空。
+
+### 二、这一版怎么改
+
+1. **自建 fmt 时把宿主的 extensions 整包搬过去**
+   换成 `CMVideoFormatDescriptionCreate(subType, 帧宽, 帧高, 宿主扩展)`。
+   造不出来（个别 key 和尺寸不自洽）才退回原来那套，并记一行日志。
+
+2. **真帧的附件搬到假帧上**
+   `CMCopyDictionaryOfAttachments` → `CMSetAttachments`。相机内参、色彩矩阵、
+   时间戳对齐信息都回来了。音频帧同样处理。
+
+3. **渲染出来的帧带上源帧的色彩附件**
+   `CVPixelBufferCreate` 造的是干净缓冲，YCbCr 矩阵 / 色彩空间一个都没有，
+   现在从源帧拷过去 —— 顺带让色彩转换更准。
+
+4. **加一行诊断**
+   首次注入时把两边的 key 列表打出来：
+
+   ```
+   注入: 真帧附件 9 项 (…, CameraIntrinsicMatrix, …) · 宿主 fmt 扩展 12 项 (…)
+   ```
+
+   万一还崩在这个位置，这一行能直接指出缺哪个 key，不用再猜。
+
+### 三、声音加速
+
+0.2.9 修完「没声音」，又引入了「2 倍速」。
+
+原因还是水位逻辑。0.2.9 里除了 0.6 秒硬切，还有一条：
+
+```c
+} else if (avail > target + numBytes * 4) {   // ← 稳态下天天成立
+    drop = MIN(numBytes, avail - target);     // 每次回调丢一包
+}
+```
+
+想的是「一次最多丢一包，2× 速度慢慢追，人耳听不出来」。但**稳态水位本来就长期高于
+target**（生产端按 `HIGH` 补，`HIGH` 必然大于 `TARGET`），这条分支每次回调都成立：
+每 20ms 丢一包 20ms → 内容以 40ms/20ms 前进 → **2 倍速**。
+
+> 任何在稳态下会成立的丢包条件都是错的。「追赶」只有在能判断「确实落后」时才有意义，
+> 而水位高不等于延迟大。
+
+所以整条删掉，只剩 0.6 秒硬切。同时把高水位从 0.14s 压到 0.12s。
+
+| 项 | 0.2.9 | 0.2.10 |
+|---|---|---|
+| 生产端高水位 | 0.14s | **0.12s** |
+| 2× 追赶丢包 | 稳态下每次回调都触发 | **删除** |
+| 硬切 | > 0.6s | > 0.6s（不变，正常永远够不着） |
+
+### 装上之后验证
+
+1. 抖音点开录制 → **不闪退**，录出来的画面是素材
+2. QQ / 陌陌 / 抖音，声音**速度正常**、不加速
+3. 日志里不该再出现「缓冲…偏高」，应该只有 `水位 xxx ms · 丢 0 字节`
+4. 日志里应该有 `注入: 真帧附件 N 项 … · 宿主 fmt 扩展 N 项 …`
+
+---
+
 ## 0.2.9 —— 把 0.2.8 丢掉的音频捡回来
 
 0.2.8 有个硬伤：**装上之后 QQ 和陌陌都没声音了**。这一版就是修它，外加抖音录像卡死。

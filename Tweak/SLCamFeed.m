@@ -25,16 +25,22 @@
 //   · 生产快于消费 → 缓冲一路涨（以前上限是 2 秒）→ 声音越来越滞后 = 不同步
 //   · 生产慢于消费 → 缓冲抽干 → 补零 → 声音断续
 //
-// 所以生产端补到 HIGH 就停手，消费端超过 TARGET 才丢 —— 两者必须贴得很近。
+// 所以生产端补到 HIGH 就停手，消费端只在「明显出事」时才丢 —— 两者必须贴得很近。
 // 0.2.8 的教训：HIGH 设成 0.35s 而 TARGET 只有 0.10s，于是解码线程每次都把
 // 缓冲填到 350ms，消费端下一次回调就一口气砍掉 250ms，稳态下每 270ms 只播
 // 20ms，听感就是「没声音」。水位控制的前提是生产端不许越过目标太多。
 //
-//   生产端高水位 140ms  ≈ 目标 100ms + 2 个包
-//   消费端丢弃阈值 180ms（正常运行时永远够不着，只是兜底）
-//   超过 600ms 才硬切 —— 那是中途卡过（切素材、重建管线），慢慢追不回来
+// 0.2.9 的教训：光把阈值压低还不够，**任何在稳态下会成立的丢包条件都不行**。
+// 那次加了一条「超过 target + 4 包就以 2× 速度追」，结果稳态水位本来就长期
+// 停在 target 之上（生产端按 HIGH 补），这条分支每次回调都成立，每 20ms 丢一包
+// 20ms，内容以 2 倍速前进 —— 听感就是「声音加速」。
+// 所以现在只剩一条硬切：0.6 秒。它离稳态水位有 5 倍余量，正常永远够不着，
+// 只有切素材、重建管线这种真卡顿才会踩到。
+//
+//   生产端高水位 120ms  —— 稳态水位就在这附近，A/V 延迟也靠它压住
+//   消费端只在超过 600ms 时一刀砍回 100ms，其余情况一律不丢
 #define SL_AUDIO_TARGET_SEC 0.10
-#define SL_AUDIO_HIGH_SEC   0.14
+#define SL_AUDIO_HIGH_SEC   0.12
 #define SL_AUDIO_HARD_SEC   0.60
 
 @interface SLCamFeed () {
@@ -579,6 +585,18 @@
                 bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)
             colorSpace:cs];
     CGColorSpaceRelease(cs);
+
+    // 把源帧的色彩附件带到目标帧上。
+    //
+    // CVPixelBufferCreate 造出来的是「干净」的缓冲，色彩空间 / YCbCr 矩阵这些
+    // 附件一个都没有。下游（尤其抖音）会去读这些 key，拿不到 NULL 之后有些
+    // 地方是不判空直接 CFRelease 的 —— 那就是崩溃。
+    // 顺带也让色彩转换更准：解码器给的矩阵本来就是对的。
+    CFDictionaryRef srcAtts = CVBufferCopyAttachments(src, kCVAttachmentMode_ShouldPropagate);
+    if (srcAtts) {
+        CVBufferSetAttachments(dst, srcAtts, kCVAttachmentMode_ShouldPropagate);
+        CFRelease(srcAtts);
+    }
     return dst;
 }
 
@@ -658,31 +676,30 @@
 
     // 水位控制。
     //
-    // 正常运行时这一段一次都不该触发 —— 生产端高水位只有 140ms，填不到
-    // 180ms 以上。真触发了只有两种可能：切素材、重建管线这类中途卡顿，
-    // 缓冲被撑大了。
+    // 只有一条规则：缓冲撑到 0.6 秒以上就一刀砍回目标水位。正常运行时一次都
+    // 不该触发 —— 生产端高水位只有 120ms，离 600ms 差着 5 倍。
     //
-    // 处理原则是「慢慢追，绝不硬砍」：一次最多丢一包，用 2× 速度追平，
-    // 人耳听不出来。0.2.8 那种一次砍掉 250ms 的做法会把语音切成碎片。
+    // 0.2.9 在这里还有一条「avail > target + 4 包就以 2× 速度追」的分支，
+    // 想法是「一次最多丢一包，人耳听不出来」。但稳态水位本来就长期高于 target
+    // （生产端按 HIGH 补，HIGH 必然大于 TARGET），于是那条分支每次回调都成立：
+    // 每 20ms 丢一包 20ms，内容以 40ms/20ms 前进 = 2 倍速，听感就是「声音加速」。
+    //
+    // 「追赶」只有在能判断出「确实落后」时才有意义，而这里根本没有可靠的落后
+    // 判据 —— 水位高不等于延迟大，正常稳态水位同样高。所以整条删掉，
+    // 不再有任何在稳态下会触发的丢包路径。
     if (_audioBytesPerSecond > 0) {
         NSUInteger target = (NSUInteger)(_audioBytesPerSecond * SL_AUDIO_TARGET_SEC);
         if (target < numBytes) target = numBytes;
         NSUInteger hard = (NSUInteger)(_audioBytesPerSecond * SL_AUDIO_HARD_SEC);
 
-        NSUInteger drop = 0;
         if (avail > hard) {
-            // 撑到 0.6 秒以上，靠慢慢追要好几秒才能追回来，只能硬切
-            drop = avail - target;
-        } else if (avail > target + numBytes * 4) {
-            drop = MIN(numBytes, avail - target);
-        }
-        if (drop > 0) {
+            NSUInteger drop = avail - target;
             _audioReadCursor += drop;
             avail -= drop;
             _audioDropped += drop;
             if (!_audioDropLogged) {
                 _audioDropLogged = YES;
-                SLLog(@"音频: 缓冲 %lums 偏高，丢弃 %lu 字节拉回 %lums",
+                SLLog(@"音频: 缓冲 %lums 严重偏高（卡顿后遗留），硬切 %lu 字节回 %lums",
                       (unsigned long)((avail + drop) * 1000 / _audioBytesPerSecond),
                       (unsigned long)drop,
                       (unsigned long)(target * 1000 / _audioBytesPerSecond));
