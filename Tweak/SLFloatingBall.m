@@ -1752,7 +1752,19 @@ void SLEnsureFloatButton(void) {
         [btn removeFromSuperview];
         btn.center = SLClampFloatPos(btn.center, w.bounds.size);
         [w addSubview:btn];
-        SLLog(@"SL-VCAM: float button moved to top window (%@)", NSStringFromClass([w class]));
+        // 抖音这类 App 的遮罩窗一秒能换好几次，逐次打日志会把整份日志顶满。
+        // 同一类窗口只记第一次，之后每 50 次补一行心跳。
+        static NSMutableSet *sSeenWindows = nil;
+        static int sMoveCount = 0;
+        sMoveCount++;
+        if (!sSeenWindows) sSeenWindows = [NSMutableSet set];
+        NSString *wn = NSStringFromClass([w class]);
+        BOOL firstForWindow = ![sSeenWindows containsObject:wn];
+        if (firstForWindow) [sSeenWindows addObject:wn];
+        if (firstForWindow || sMoveCount % 50 == 0) {
+            SLLog(@"SL-VCAM: float button moved to top window (%@)%@", wn,
+                  firstForWindow ? @"" : [NSString stringWithFormat:@" · 累计 %d 次", sMoveCount]);
+        }
     }
     if (!btn) {
         CGPoint c = SLClampFloatPos(SLLoadFloatPos(w.bounds.size), w.bounds.size);
@@ -1760,7 +1772,18 @@ void SLEnsureFloatButton(void) {
         btn.center = c;
         btn.tag = SLBtnTag;
         [w addSubview:btn];
-        SLLog(@"SL-VCAM: float button mounted at %@", NSStringFromCGPoint(c));
+        // 球被宿主反复移除重建时位置是一样的，重复打没有信息量
+        static CGPoint sLastMountPos;
+        static BOOL sHaveMountPos = NO;
+        static int sMountCount = 0;
+        sMountCount++;
+        BOOL posChanged = !sHaveMountPos || !CGPointEqualToPoint(sLastMountPos, c);
+        if (posChanged || sMountCount % 50 == 1) {
+            SLLog(@"SL-VCAM: float button mounted at %@%@", NSStringFromCGPoint(c),
+                  posChanged ? @"" : [NSString stringWithFormat:@" · 累计 %d 次", sMountCount]);
+        }
+        sLastMountPos = c;
+        sHaveMountPos = YES;
     }
     sSLFloatBtn = btn;
 }

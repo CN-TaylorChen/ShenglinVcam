@@ -348,6 +348,10 @@ void SLCamInstallHooks(void) {
         @"AVCaptureOutput",
     ];
 
+    // 跳过的这些方法每次启动都是固定的那几条，逐条打会把日志顶满。
+    // 攒起来合成一行 —— 信息一条不少，占用从 6 行变 1 行。
+    NSMutableArray<NSString *> *skipped = [NSMutableArray array];
+
     for (NSString *cn in classNames) {
         Class cls = objc_getClass(cn.UTF8String);
         if (!cls) continue;
@@ -358,14 +362,19 @@ void SLCamInstallHooks(void) {
                 NSString *name = @(sel_getName(method_getName(list[i]))).lowercaseString;
                 if (![name containsString:@"samplebuffer"]) continue;
                 if (!SLCamIsSinglePointerArgMethod(list[i])) {
-                    SLLog(@"跳过 -[%s %s]：签名不是单指针参数，挂了会丢参",
-                          class_getName(c), sel_getName(method_getName(list[i])));
+                    [skipped addObject:[NSString stringWithFormat:@"-[%s %s]",
+                                        class_getName(c), sel_getName(method_getName(list[i]))]];
                     continue;
                 }
                 SLCamHookMethod(c, list[i]);
             }
             free(list);
         }
+    }
+
+    if (skipped.count) {
+        SLLog(@"注入: 跳过 %lu 个方法（签名不是单指针参数，挂了会丢参）: %@",
+              (unsigned long)skipped.count, [skipped componentsJoinedByString:@", "]);
     }
 
     // 音频在各系统版本上未必走 AVCaptureAudioDataOutput，先把候选方法名和

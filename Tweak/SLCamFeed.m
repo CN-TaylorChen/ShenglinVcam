@@ -15,6 +15,22 @@
 #import <CoreImage/CoreImage.h>
 #import <unistd.h>
 
+// 音频水位（单位：秒）。
+//
+// 音频消费是硬实时的：AudioUnitRender 每 20ms 就要 320 帧（16k 单声道 = 1280 字节），
+// 一秒 64000 字节，一字节都不能少、也不能晚。而生产端是解码线程，速度取决于
+// 解码耗时和视频帧率 —— 两者不可能天然相等。
+//
+// 不钉水位就会漂：
+//   · 生产快于消费 → 缓冲一路涨（以前上限是 2 秒）→ 声音越来越滞后 = 不同步
+//   · 生产慢于消费 → 缓冲抽干 → 补零 → 声音断续
+//
+// 所以消费端超过 TARGET 就把多余的丢掉，把延迟恒定在 100ms 左右
+// （低于人对唇音不同步的感知阈值 ~125ms）；生产端补到 HIGH 就停手，
+// 留一点抖动余量，避免解码线程偶尔卡一下就把音频饿死。
+#define SL_AUDIO_TARGET_SEC 0.10
+#define SL_AUDIO_HIGH_SEC   0.35
+
 @interface SLCamFeed () {
     NSLock *_lock;
 
@@ -28,6 +44,9 @@
     BOOL _hasAudioDstASBD;
     AVAudioConverter *_audioConverter;
     NSUInteger _audioBytesPerSecond;
+    BOOL _assetHasAudio;                 // 素材本身有没有音轨：决定「没数据」时是静音还是放行真麦克风
+    NSUInteger _audioDropped;            // 累计丢弃字节（诊断用）
+    BOOL _audioDropLogged;
     CGSize _naturalSize;
 
     // ---- 解码线程独占 ----
@@ -47,6 +66,7 @@
 - (void)sl_decodeLoopWithGeneration:(NSUInteger)gen;
 - (void)sl_buildReaderForKey:(NSString *)key;
 - (BOOL)sl_pumpAudio;
+- (BOOL)sl_audioBelowHighWater;
 - (NSData *)sl_convertAudio:(NSData *)input;
 - (NSInteger)sl_normalizedRotation;
 - (CVPixelBufferRef)sl_render:(CVPixelBufferRef)src
@@ -186,7 +206,16 @@
                 }
             }
 
-            if (_audioOut && [self sl_pumpAudio]) gotAny = YES;
+            // 一个视频帧周期里音频往往不止需要一包（一包 AAC 通常只有 23ms，
+            // 而 30fps 一帧是 33ms），以前「一帧只补一包」会让缓冲长期处于抽干状态。
+            // 现在按水位补，最多补 8 包，避免一次把解码线程卡太久。
+            if (_audioOut) {
+                for (int i = 0; i < 8; i++) {
+                    if (![self sl_pumpAudio]) break;
+                    gotAny = YES;
+                    if (![self sl_audioBelowHighWater]) break;
+                }
+            }
 
             if (gotAny) {
                 _idleRounds = 0;
@@ -210,13 +239,23 @@
     }
 }
 
-/// 解码线程内调用：音频池不够 2 秒才继续解
+/// 缓冲还没到高水位，可以继续补
+- (BOOL)sl_audioBelowHighWater {
+    [_lock lock];
+    NSUInteger buffered = _audioPCM.length - _audioReadCursor;
+    NSUInteger rate = _audioBytesPerSecond;
+    [_lock unlock];
+    if (rate == 0) return YES;      // 目标格式还没确定，先别停
+    return buffered < (NSUInteger)(rate * SL_AUDIO_HIGH_SEC);
+}
+
+/// 解码线程内调用：音频池没到高水位才继续解
 - (BOOL)sl_pumpAudio {
     [_lock lock];
     NSUInteger buffered = _audioPCM.length - _audioReadCursor;
-    NSUInteger limit = _audioBytesPerSecond * 2;
+    NSUInteger limit = (NSUInteger)(_audioBytesPerSecond * SL_AUDIO_HIGH_SEC);
     [_lock unlock];
-    if (limit && buffered > limit) return NO;
+    if (limit && buffered >= limit) return NO;
 
     CMSampleBufferRef sb = [_audioOut copyNextSampleBuffer];
     if (!sb) return NO;
@@ -323,14 +362,20 @@
     wantAudio = _hasAudioDstASBD;
     [_lock unlock];
 
+    // 素材到底有没有音轨，每次都记下来。这不只是日志：
+    // 音频池暂时没数据时，靠它决定是「输出静音」还是「放行真实麦克风」。
+    AVAssetTrack *audioTrack = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+    [_lock lock];
+    _assetHasAudio = (audioTrack != nil);
+    [_lock unlock];
+
     // 每次换素材探一次音轨，单独打一行。
     // 不这样的话，日志里 `(video=Y audio=N)` 会有歧义 —— 那个 N 只表示
     // 「宿主还没来要音频」，跟素材有没有音轨是两回事。
     static NSString *sLastAudioProbePath = nil;
     if (![sLastAudioProbePath isEqualToString:path]) {
         sLastAudioProbePath = path;
-        AVAssetTrack *probe = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
-        SLLog(@"feed 素材音轨: %@（%@）", probe ? @"有" : @"无", path.lastPathComponent);
+        SLLog(@"feed 素材音轨: %@（%@）", audioTrack ? @"有" : @"无", path.lastPathComponent);
     }
 
     AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
@@ -357,8 +402,8 @@
         [_lock unlock];
     }
 
-    if (wantAudio) {
-        AVAssetTrack *at = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+    if (wantAudio && audioTrack) {
+        AVAssetTrack *at = audioTrack;
         if (at) {
             // 统一解成 float32 / 单声道 / 非交错 / 44.1k，再由 AVAudioConverter 转成宿主格式
             AudioStreamBasicDescription src;
@@ -525,6 +570,56 @@
 
 #pragma mark - 出音频
 
+/// 登记宿主音频格式并建好转换器。调用方必须已持有 _lock。
+/// 返回 YES 表示格式是新的（或变了），解码管线需要重建。
+- (BOOL)sl_configureAudioLocked:(const AudioStreamBasicDescription *)asbd {
+    if (!asbd || asbd->mBytesPerFrame == 0 || asbd->mSampleRate == 0) return NO;
+    if (_hasAudioDstASBD && memcmp(asbd, &_audioDstASBD, sizeof(*asbd)) == 0) return NO;
+
+    _audioDstASBD = *asbd;
+    _hasAudioDstASBD = YES;
+    _audioBytesPerSecond = (NSUInteger)(asbd->mSampleRate * asbd->mBytesPerFrame);
+
+    // 解码侧固定 float32 / 单声道 / 非交错 / 44.1k，这里就地推导源格式，
+    // 不依赖解码线程，避免首次请求时 converter 拿到全零 ASBD
+    AudioStreamBasicDescription src = *asbd;
+    src.mSampleRate = 44100;
+    src.mFormatID = kAudioFormatLinearPCM;
+    src.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved;
+    src.mChannelsPerFrame = 1;
+    src.mBitsPerChannel = 32;
+    src.mBytesPerFrame = 4;
+    src.mBytesPerPacket = 4;
+    src.mFramesPerPacket = 1;
+    _audioSrcASBD = src;
+
+    _audioConverter = nil;
+    BOOL needConvert = !(asbd->mFormatFlags & kAudioFormatFlagIsFloat)
+                    || !(asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved)
+                    || asbd->mChannelsPerFrame != 1
+                    || asbd->mSampleRate != 44100;
+    if (needConvert) {
+        AVAudioFormat *sf = [[AVAudioFormat alloc] initWithStreamDescription:&src];
+        AVAudioFormat *df = [[AVAudioFormat alloc] initWithStreamDescription:&_audioDstASBD];
+        if (sf && df) {
+            _audioConverter = [[AVAudioConverter alloc] initFromFormat:sf toFormat:df];
+            if (!_audioConverter) SLLog(@"音频转换器创建失败，将只换画面");
+        }
+    }
+    _reconfigRequested = YES;   // 让解码线程把音频轨挂上
+    SLLog(@"audio 目标 %.0fHz %uch %uB/帧 转码=%@", asbd->mSampleRate,
+          (unsigned)asbd->mChannelsPerFrame, (unsigned)asbd->mBytesPerFrame,
+          needConvert ? @"Y" : @"N");
+    return YES;
+}
+
+- (void)primeAudioFormat:(const AudioStreamBasicDescription *)asbd {
+    if (!asbd) return;
+    [_lock lock];
+    [self sl_configureAudioLocked:asbd];
+    [_lock unlock];
+}
+
 - (NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes {
     if (!asbd || asbd->mBytesPerFrame == 0 || numBytes == 0) return nil;
 
@@ -536,59 +631,55 @@
     }
 
     [_lock lock];
-    BOOL firstTime = !_hasAudioDstASBD || memcmp(asbd, &_audioDstASBD, sizeof(*asbd)) != 0;
-    if (firstTime) {
-        _audioDstASBD = *asbd;
-        _hasAudioDstASBD = YES;
-        _audioBytesPerSecond = (NSUInteger)(asbd->mSampleRate * asbd->mBytesPerFrame);
-
-        // 解码侧固定 float32 / 单声道 / 非交错 / 44.1k，这里就地推导源格式，
-        // 不依赖解码线程，避免首次请求时 converter 拿到全零 ASBD
-        AudioStreamBasicDescription src = *asbd;
-        src.mSampleRate = 44100;
-        src.mFormatID = kAudioFormatLinearPCM;
-        src.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved;
-        src.mChannelsPerFrame = 1;
-        src.mBitsPerChannel = 32;
-        src.mBytesPerFrame = 4;
-        src.mBytesPerPacket = 4;
-        src.mFramesPerPacket = 1;
-        _audioSrcASBD = src;
-
-        _audioConverter = nil;
-        BOOL needConvert = !(asbd->mFormatFlags & kAudioFormatFlagIsFloat)
-                        || !(asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved)
-                        || asbd->mChannelsPerFrame != 1
-                        || asbd->mSampleRate != 44100;
-        if (needConvert) {
-            AVAudioFormat *sf = [[AVAudioFormat alloc] initWithStreamDescription:&src];
-            AVAudioFormat *df = [[AVAudioFormat alloc] initWithStreamDescription:&_audioDstASBD];
-            if (sf && df) {
-                _audioConverter = [[AVAudioConverter alloc] initFromFormat:sf toFormat:df];
-                if (!_audioConverter) SLLog(@"音频转换器创建失败，将只换画面");
-            }
-        }
-        _reconfigRequested = YES;   // 让解码线程把音频轨挂上
-        SLLog(@"audio 目标 %.0fHz %uch %uB/帧 转码=%@", asbd->mSampleRate,
-              (unsigned)asbd->mChannelsPerFrame, (unsigned)asbd->mBytesPerFrame,
-              needConvert ? @"Y" : @"N");
-    }
+    [self sl_configureAudioLocked:asbd];
 
     NSMutableData *chunk = [NSMutableData dataWithLength:numBytes];
     NSUInteger got = 0;
     NSUInteger avail = _audioPCM.length - _audioReadCursor;
+
+    // 水位控制（0.2.8 修不同步的核心）。
+    // 消费端是硬实时的，生产端是解码线程，速率不可能天然相等：
+    // 堆多了 → 声音越来越滞后；抽干了 → 声音断续。
+    // 超过目标水位就把多余的丢掉，延迟恒定在 ~100ms。
+    if (_audioBytesPerSecond > 0) {
+        NSUInteger target = (NSUInteger)(_audioBytesPerSecond * SL_AUDIO_TARGET_SEC);
+        if (target < numBytes) target = numBytes;
+        if (avail > target + numBytes) {
+            NSUInteger drop = avail - target;
+            _audioReadCursor += drop;
+            avail -= drop;
+            _audioDropped += drop;
+            if (!_audioDropLogged) {
+                _audioDropLogged = YES;
+                SLLog(@"音频: 缓冲超水位，丢弃 %lu 字节拉回 %lums（累计 %lu）",
+                      (unsigned long)drop,
+                      (unsigned long)(target * 1000 / _audioBytesPerSecond),
+                      (unsigned long)_audioDropped);
+            }
+        }
+    }
+
     if (avail > 0) {
         got = MIN(avail, numBytes);
         memcpy(chunk.mutableBytes, (uint8_t *)_audioPCM.bytes + _audioReadCursor, got);
         _audioReadCursor += got;
-        if (_audioReadCursor > 44100 * 32) {
+        NSUInteger trimAt = _audioBytesPerSecond ? _audioBytesPerSecond * 2 : (44100 * 32);
+        if (_audioReadCursor > trimAt) {
             [_audioPCM replaceBytesInRange:NSMakeRange(0, _audioReadCursor) withBytes:NULL length:0];
             _audioReadCursor = 0;
         }
     }
+    BOOL hasAudio = _assetHasAudio;
     [_lock unlock];
 
-    if (got == 0) return nil;
+    if (got == 0) {
+        // 素材本来就没音轨 —— 用户预期就是「只换画面、保留原声」，放行真实麦克风
+        if (!hasAudio) return nil;
+        // 有音轨但还没解出数据 —— 必须输出静音。
+        // 返回 nil 会让注入层放行真麦克风，把环境声原样录进去，
+        // 通话刚接通那 1 秒最明显。
+        return chunk;   // dataWithLength 出来就是全零
+    }
     if (got < numBytes) memset((uint8_t *)chunk.mutableBytes + got, 0, numBytes - got);  // 不够补静音
     return chunk;
 }

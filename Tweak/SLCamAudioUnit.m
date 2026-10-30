@@ -12,6 +12,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <AVFoundation/AVFoundation.h>
 #import <string.h>
+#import <stdlib.h>
 
 typedef OSStatus (*SLAudioUnitRenderFn)(AudioUnit, AudioUnitRenderActionFlags *,
                                         const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
@@ -251,23 +252,115 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
     return st;
 }
 
-#pragma mark - 只探测不接管
+#pragma mark - AudioQueue 链路（抖音拍摄走这条）
 
-// AudioQueue 走的是另一套回调，不是 AudioUnitRender 能覆盖的。
-// 先挂个只记日志的探针 —— 万一哪个 App 用它，日志里能直接看出来，
-// 不用再靠猜。
+// 抖音拍视频的麦克风不走 AudioUnitRender，也不走 AVCaptureAudioDataOutput，
+// 而是 AudioQueueNewInput + 回调 —— 0.2.7 只挂了个探针，日志里那行
+// 「宿主使用 AudioQueue 录音，暂未接管」就是它。结果是这条路径上「替换音频」
+// 完全空转，录进去的是真麦克风。
+//
+// 接管方式：AudioQueueNewInput 的 inCallback/inUserData 由宿主传入，我们换成
+// 自己的回调 + 上下文，回调触发时先用素材音频覆盖 buffer，再把原回调叫起来。
+// 宿主拿到的 buffer 内容和时序都没变，只是内容被换掉了。
+
+typedef struct {
+    AudioQueueInputCallback origCb;
+    void *origUd;
+    AudioStreamBasicDescription asbd;
+    BOOL usable;            // 格式能替换（线性 PCM 且字段自洽）
+    BOOL replacedLogged;
+    int  replaced;
+} SLAQContext;
+
+/// 这些上下文要和 AudioQueue 同生共死，不能回收 —— 队列什么时候停、停完还调不调
+/// 回调，都不在我们控制范围内。每次 NewInput 泄漏一百多字节，一个进程也就几次。
+static SLAQContext *gSLAQContexts[8] = {NULL};
+static int gSLAQContextCount = 0;
+
+static BOOL SLAQFormatUsable(const AudioStreamBasicDescription *fmt) {
+    return fmt
+        && fmt->mFormatID == kAudioFormatLinearPCM
+        && fmt->mSampleRate > 0
+        && fmt->mChannelsPerFrame > 0
+        && fmt->mBytesPerFrame > 0
+        && fmt->mBytesPerFrame < 64;      // 明显不对的值直接放弃，别拿它算字节数
+}
+
+static void SLCamAudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ,
+                                         AudioQueueBufferRef inBuffer,
+                                         const AudioTimeStamp *inStartTime,
+                                         UInt32 inNumberPacketDescriptions,
+                                         const AudioStreamPacketDescription *inPacketDescs) {
+    SLAQContext *ctx = (SLAQContext *)inUserData;
+    if (!ctx) return;
+
+    if (ctx->usable && inBuffer && inBuffer->mAudioData && inBuffer->mAudioDataByteSize > 0
+        && SLCamInjecting() && !SLCamAVCaptureAudioSeen()) {
+        NSData *pcm = [[SLCamFeed shared] audioForFormat:&ctx->asbd
+                                                numBytes:inBuffer->mAudioDataByteSize];
+        // 长度不等 = 素材没音轨 / 还没解出来，保持真实麦克风，绝不写半截
+        if (pcm.length == inBuffer->mAudioDataByteSize) {
+            memcpy(inBuffer->mAudioData, pcm.bytes, pcm.length);
+            ctx->replaced++;
+            if (!ctx->replacedLogged) {
+                ctx->replacedLogged = YES;
+                SLLog(@"音频: 已接管 AudioQueue 麦克风输入（%.0fHz %uch）",
+                      ctx->asbd.mSampleRate, (unsigned)ctx->asbd.mChannelsPerFrame);
+            } else if (ctx->replaced % 3000 == 0) {
+                SLLog(@"音频: AudioQueue 心跳 %d 次", ctx->replaced);
+            }
+        }
+    }
+
+    if (ctx->origCb) {
+        ctx->origCb(ctx->origUd, inAQ, inBuffer, inStartTime,
+                    inNumberPacketDescriptions, inPacketDescs);
+    }
+}
+
 static OSStatus SLCamAudioQueueNewInput(const AudioStreamBasicDescription *fmt,
                                         AudioQueueInputCallback cb, void *ud,
                                         CFRunLoopRef rl, CFStringRef mode,
                                         UInt32 flags, AudioQueueRef *outAQ) {
-    if (!gSLAQProbeLogged) {
-        gSLAQProbeLogged = YES;
-        SLLog(@"音频: 宿主使用 AudioQueue 录音（%.0fHz %uch），暂未接管",
-              fmt ? fmt->mSampleRate : 0,
-              fmt ? (unsigned)fmt->mChannelsPerFrame : 0);
-    }
     if (!gSLAQOrig) return -1;
-    return gSLAQOrig(fmt, cb, ud, rl, mode, flags, outAQ);
+
+    // 格式拿不到、或不是线性 PCM（压缩格式没法逐包替换）就原样放行
+    if (!cb || !SLAQFormatUsable(fmt) || gSLAQContextCount >= 8) {
+        if (!gSLAQProbeLogged) {
+            gSLAQProbeLogged = YES;
+            SLLog(@"音频: AudioQueue 录音格式不可替换（%.0fHz %uch fmt=%u），放行真实麦克风",
+                  fmt ? fmt->mSampleRate : 0, fmt ? (unsigned)fmt->mChannelsPerFrame : 0,
+                  fmt ? (unsigned)fmt->mFormatID : 0);
+        }
+        return gSLAQOrig(fmt, cb, ud, rl, mode, flags, outAQ);
+    }
+
+    SLAQContext *ctx = calloc(1, sizeof(SLAQContext));
+    if (!ctx) return gSLAQOrig(fmt, cb, ud, rl, mode, flags, outAQ);
+    ctx->origCb = cb;
+    ctx->origUd = ud;
+    ctx->asbd = *fmt;
+    ctx->usable = YES;
+
+    // 关键一步：交给系统的是我们的回调和上下文，不是宿主的。
+    // 宿主原来那对 (cb, ud) 存在 ctx 里，由包装函数在替换完数据后再叫起来。
+    OSStatus st = gSLAQOrig(fmt, SLCamAudioQueueInputCallback, ctx, rl, mode, flags, outAQ);
+
+    // 建队列失败说明宿主自己都用不了，把上下文还回去，别占坑
+    if (st != noErr) {
+        free(ctx);
+        return st;
+    }
+
+    gSLAQContexts[gSLAQContextCount++] = ctx;
+
+    // 提前登记格式：解码线程要据此把音轨挂上，否则开头一段只能出静音
+    [[SLCamFeed shared] primeAudioFormat:fmt];
+
+    SLLog(@"音频: 已接管 AudioQueue 录音（%.0fHz %uch %uB/帧）· 素材音 %@",
+          fmt->mSampleRate, (unsigned)fmt->mChannelsPerFrame, (unsigned)fmt->mBytesPerFrame,
+          [[SLCamFeed shared] isReady] ? @"已就绪" : @"待命");
+    return st;
 }
 
 #pragma mark - 安装

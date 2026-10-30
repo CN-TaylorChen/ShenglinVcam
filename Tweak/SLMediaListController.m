@@ -58,6 +58,9 @@
     PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
     cfg.filter = [PHPickerFilter videosFilter];
     cfg.selectionLimit = 1;
+    // 默认的 automatic 可能让系统挑「兼容表示」，4K / HEVC 素材会被现场转码 ——
+    // 慢、临时文件更大、还更容易失败。current 直接拿原文件。
+    cfg.preferredAssetRepresentationMode = PHPickerConfigurationAssetRepresentationModeCurrent;
     PHPickerViewController *vc = [[PHPickerViewController alloc] initWithConfiguration:cfg];
     vc.delegate = self;
     [self presentViewController:vc animated:YES completion:nil];
@@ -73,21 +76,32 @@
         SLToast(@"这个文件不是视频");
         return;
     }
+
+    SLToast(@"正在导入…");   // 大文件要几秒，给个反馈
     __weak typeof(self) ws = self;
     [p loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier
                              completionHandler:^(NSURL *url, NSError *err) {
+        if (!url) {
+            SLLog(@"导入: 相册导出失败 %@", err.localizedDescription ?: @"?");
+            SLToast(@"相册导出失败，换一段试试");
+            return;
+        }
+
+        // 这个 URL 指向**临时文件**，handler 一返回就可能被清理。
+        // 以前是先 dispatch 到主线程再拷，主线程忙或文件大时文件已经没了 ——
+        // 表现就是「有的视频导入失败」。必须在这里就拷走。
+        NSError *e = nil;
+        BOOL ok = [SLMediaStore importFileAtURL:url error:&e];
+        NSString *reason = e.localizedDescription;
+
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!url) {
-                SLToast(@"这段视频读不出来");
-                return;
-            }
-            NSError *e = nil;
-            if ([SLMediaStore importFileAtURL:url error:&e]) {
+            if (ok) {
                 [ws sl_reload];
                 SLCamReloadAll();
                 SLToast(@"已加入素材");
             } else {
-                SLToast(@"保存失败，换一段试试");
+                SLLog(@"导入: 保存失败 %@", reason ?: @"?");
+                SLToast(reason.length ? reason : @"保存失败，换一段试试");
             }
         });
     }];

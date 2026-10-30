@@ -56,6 +56,12 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd
                            numBytes:(size_t)numBytes;
 
+/// 只登记宿主音频格式，不取数据。
+///
+/// AudioQueue 那条链路（抖音拍摄）拿到格式的时刻远早于第一次回调，提前登记
+/// 才能让解码线程把音轨挂上 —— 否则开头一两百毫秒只能出静音。
+- (void)primeAudioFormat:(const AudioStreamBasicDescription *)asbd;
+
 /// 回到第一帧（切换素材、重新打开相机时调）
 - (void)rewind;
 
