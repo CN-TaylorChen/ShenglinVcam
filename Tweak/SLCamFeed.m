@@ -245,7 +245,7 @@
     if (key.length) {
         NSArray<NSString *> *parts = [key componentsSeparatedByString:@":"];
         if (parts.count == 2) {
-            OSType kpf = (OSType)[parts[0] unsignedIntValue];
+            OSType kpf = (OSType)(uint32_t)[parts[0] intValue];
             NSArray<NSString *> *wh = [parts[1] componentsSeparatedByString:@"x"];
             if (wh.count == 2 && kpf) {
                 pf = kpf;
