@@ -141,7 +141,7 @@ static dispatch_queue_t SLThumbQueue(void) {
     // asCopy:YES —— 系统先把文件拷到我们沙盒的临时目录，不用处理 security scoped 权限，
     // 也不会碰到用户的原文件。
     UIDocumentPickerViewController *dp =
-        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTType.movie, UTType.image]
+        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeMovie, UTTypeImage]
                                                                    asCopy:YES];
     dp.delegate = self;
     dp.allowsMultipleSelection = NO;
@@ -155,7 +155,7 @@ static dispatch_queue_t SLThumbQueue(void) {
     if (!results.count) return;
 
     NSItemProvider *p = results.firstObject.itemProvider;
-    NSString *typeId = self.wantsVideo ? UTType.movie.identifier : UTType.image.identifier;
+    NSString *typeId = self.wantsVideo ? UTTypeMovie.identifier : UTTypeImage.identifier;
     if (![p hasItemConformingToTypeIdentifier:typeId]) {
         SLToast(self.wantsVideo ? @"这个文件不是视频" : @"这个文件不是图片");
         return;
