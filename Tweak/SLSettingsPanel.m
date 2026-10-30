@@ -22,7 +22,7 @@
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.0"
+#define SLVVersion @"0.3.1"
 
 // kSLCamLoopKey / kSLCamMirrorKey 现在由 SLVCamCore.m 统一导出（SLVCamBridge.h 里 extern），
 // 帧源要读同样的键，不能再各定义一份 static。
@@ -49,6 +49,140 @@ static UIView *SLVMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 static UIView *SLVMakeFooter(NSString *text, CGFloat x, CGFloat width) {
     return SLVAlignFooter(text, x, width);
 }
+
+#pragma mark - 「当前素材」右侧长文本：跑马灯
+
+// Value1 布局里 detailTextLabel 是右对齐的，文字一长就从左边溢出压到标题上 ——
+// 系统只在「放得下」时才保证避让。0.3.0 曾把它改成 Subtitle 两行，但那一行的信息量
+// 配不上一整行高度，观感太散。0.3.1 回到单行，改成：左侧标题不动，右侧给一块会被
+// 裁切的容器，放不下就慢慢往左滚，两端做渐隐，永远碰不到标题。
+@interface SLVMarqueeView : UIView
+@property (nonatomic, copy) NSString *text;
+@end
+
+@implementation SLVMarqueeView {
+    UILabel *_label;
+    CAGradientLayer *_fade;
+    CGFloat _laidWidth;
+    NSString *_laidText;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.clipsToBounds = YES;
+        self.userInteractionEnabled = NO;
+        self.backgroundColor = [UIColor clearColor];
+
+        _label = [[UILabel alloc] initWithFrame:CGRectZero];
+        _label.font = [UIFont systemFontOfSize:15];
+        _label.textColor = [UIColor secondaryLabelColor];
+        _label.numberOfLines = 1;
+        _label.lineBreakMode = NSLineBreakByClipping;   // 裁切交给容器，不走省略号
+        [self addSubview:_label];
+
+        // 两端渐隐。硬切在标题边上会像「字从标题里长出来」。
+        _fade = [CAGradientLayer layer];
+        _fade.colors = @[(__bridge id)[UIColor clearColor].CGColor,
+                         (__bridge id)[UIColor blackColor].CGColor,
+                         (__bridge id)[UIColor blackColor].CGColor,
+                         (__bridge id)[UIColor clearColor].CGColor];
+        _fade.startPoint = CGPointMake(0.0, 0.5);
+        _fade.endPoint = CGPointMake(1.0, 0.5);
+        self.layer.mask = _fade;
+    }
+    return self;
+}
+
+- (void)setText:(NSString *)text {
+    _text = [text copy];
+    _label.text = _text;
+    [self sl_relayout];
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    _fade.frame = self.bounds;
+    [self sl_relayout];
+}
+
+- (void)sl_relayout {
+    CGFloat w = CGRectGetWidth(self.bounds), h = CGRectGetHeight(self.bounds);
+    if (w <= 0.0 || h <= 0.0) return;
+    // layoutSubviews 会被频繁调到，每次重挂动画会让滚动一顿一顿的
+    if (fabs(w - _laidWidth) < 0.5 && [_laidText isEqualToString:(_text ?: @"")]) return;
+    _laidWidth = w;
+    _laidText = [_text copy];
+
+    [_label.layer removeAnimationForKey:@"slMarquee"];
+    _label.transform = CGAffineTransformIdentity;
+
+    CGSize s = [_label sizeThatFits:CGSizeMake(CGFLOAT_MAX, h)];
+    CGFloat lw = s.width;
+    if (lw <= w) {
+        // 放得下就右对齐，跟原生 Value1 一模一样，也不需要渐隐
+        _label.frame = CGRectMake(w - lw, (h - s.height) / 2.0, lw, s.height);
+        _fade.locations = @[@0, @0, @1, @1];
+        return;
+    }
+
+    _label.frame = CGRectMake(0.0, (h - s.height) / 2.0, lw, s.height);
+    CGFloat fade = MIN(13.0, w * 0.25);
+    _fade.locations = @[@0, @(fade / w), @(1.0 - fade / w), @1];
+
+    // 停 → 滚 → 停 → 回开头。滚完瞬跳是跑马灯的常规做法，
+    // 中间再插淡入淡出会让人以为内容换了。
+    CGFloat overflow = lw - w;
+    CGFloat move = MAX(1.6, overflow / 26.0);   // 26pt/s，再快就看不清
+    CGFloat pause = 1.1;
+    CGFloat total = pause * 2.0 + move;
+
+    CAKeyframeAnimation *a = [CAKeyframeAnimation animationWithKeyPath:@"transform.translation.x"];
+    a.values = @[@0.0, @0.0, @(-overflow), @(-overflow)];
+    a.keyTimes = @[@0.0, @(pause / total), @((pause + move) / total), @1.0];
+    a.timingFunctions = @[[CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut],
+                          [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear],
+                          [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear]];
+    a.duration = total;
+    a.repeatCount = HUGE_VALF;
+    a.fillMode = kCAFillModeBoth;
+    a.removedOnCompletion = NO;
+    [_label.layer addAnimation:a forKey:@"slMarquee"];
+}
+@end
+
+// 右侧箭头仍然用系统那个（accessoryType），只有详情文字换成自己的滚动容器。
+// detailTextLabel 留空，这样 Value1 的布局不会再去摆一块文字。
+@interface SLVScrollValueCell : UITableViewCell
+@property (nonatomic, strong) SLVMarqueeView *valueView;
+@end
+
+@implementation SLVScrollValueCell
+
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)rid {
+    self = [super initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:rid];
+    if (self) {
+        _valueView = [[SLVMarqueeView alloc] initWithFrame:CGRectZero];
+        [self.contentView addSubview:_valueView];
+    }
+    return self;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat h = CGRectGetHeight(self.contentView.bounds);
+    if (h <= 0.0) return;
+    // 用标题的固有宽度算左边界，不用 textLabel.frame —— 后者在 Value1 下可能被拉得很宽
+    CGFloat titleX = CGRectGetMinX(self.textLabel.frame);
+    CGFloat titleW = [self.textLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, h)].width;
+    CGFloat left = titleX + titleW + 10.0;
+    CGFloat right = CGRectGetWidth(self.contentView.bounds) - 6.0;
+    CGFloat w = right - left;
+    self.valueView.hidden = (w < 40.0);
+    if (!self.valueView.hidden) self.valueView.frame = CGRectMake(left, 0.0, w, h);
+}
+
+@end
 
 @interface SLVSettingsPanel ()
 @property (nonatomic, assign) CGFloat slLeading;
@@ -82,11 +216,11 @@ static UIView *SLVMakeFooter(NSString *text, CGFloat x, CGFloat width) {
     CGFloat H = 32.0;
     UIView *box = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 100, H)];
 
-    // 0.3.0：这里原来用的是 SLVBrandIconImage（黑底圆盘那张）。那张图在小尺寸下
-    // 圆底和两个框叠在一起，缩到 22pt 就是一坨黑块 —— 标题栏的 logo「乱了」就是这个。
-    // 换成无底色的紧凑版，线条跟着 labelColor 走，深浅色模式都对。
-    CGFloat iconSide = 24.0;
-    UIImageView *icon = [[UIImageView alloc] initWithImage:SLVBrandGlyphImage(iconSide, [UIColor labelColor])];
+    // 0.3.0 一度改成无底色的紧凑版，结果球和标题栏长得不一样，而且 24pt 明显偏大。
+    // 0.3.1 退回带黑底圆的那张（0.2.28 的样子），尺寸也退回 22pt；
+    // 只保留「后框裁切」这一处修正 —— 否则小尺寸下两个框会糊成 |||。
+    CGFloat iconSide = 22.0;
+    UIImageView *icon = [[UIImageView alloc] initWithImage:SLVBrandIconImage(iconSide)];
     icon.frame = CGRectMake(0, (H - iconSide) / 2.0, iconSide, iconSide);
     icon.contentMode = UIViewContentModeCenter;
     [box addSubview:icon];
@@ -225,37 +359,28 @@ static NSString *SLVRotationSummary(void) {
     return ceil(r.size.height) + 14;
 }
 
-// 「当前素材」是 Subtitle 两行，要留出第二行的高度；其余行保持系统默认的 44。
-- (CGFloat)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip {
-    (void)tv;
-    if (ip.section == 1 && ip.row == 0) return 62.0;
-    return 44.0;
-}
-
 - (void)tableView:(UITableView *)tv willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)ip {
     (void)tv; (void)ip;
     cell.backgroundColor = SLVGlassCellColor();
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
-    // 「当前素材」右侧要显示「1 个 · 完整文件名」，Value1 布局下详情一长就跟左边的
-    // 「当前素材」撞在一起（系统只在文字放得下时才保证避让，右对齐的标签一旦被压窄，
-    // 文字会从左边溢出到标题上）。这一行改用 Subtitle：值单独占第二行，怎么长都不会重叠。
-    BOOL subtitle = (ip.section == 1 && ip.row == 0);
-    static NSString *ridValue = @"slcell";
-    static NSString *ridSub   = @"slcell_sub";
-    NSString *rid = subtitle ? ridSub : ridValue;
+    // 「当前素材」右侧要显示「1 个 · 完整文件名」，用专门会滚的那一格。
+    BOOL scrollRow = (ip.section == 1 && ip.row == 0);
+    static NSString *ridValue  = @"slcell";
+    static NSString *ridScroll = @"slcell_scroll";
+    NSString *rid = scrollRow ? ridScroll : ridValue;
     UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:rid];
     if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:(subtitle ? UITableViewCellStyleSubtitle
-                                                               : UITableViewCellStyleValue1)
-                                     reuseIdentifier:rid];
+        cell = scrollRow
+            ? (UITableViewCell *)[[SLVScrollValueCell alloc] initWithStyle:UITableViewCellStyleValue1
+                                                           reuseIdentifier:rid]
+            : [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:rid];
     }
 
-    cell.detailTextLabel.textAlignment = subtitle ? NSTextAlignmentLeft : NSTextAlignmentRight;
-    cell.detailTextLabel.font = [UIFont systemFontOfSize:subtitle ? 13 : 15];
+    cell.detailTextLabel.textAlignment = NSTextAlignmentRight;
+    cell.detailTextLabel.font = [UIFont systemFontOfSize:15];
     cell.detailTextLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     cell.accessoryView = nil;
     cell.accessoryType = UITableViewCellAccessoryNone;
     cell.detailTextLabel.text = nil;
@@ -277,7 +402,8 @@ static NSString *SLVRotationSummary(void) {
     } else if (ip.section == 1) {
         if (ip.row == 0) {
             cell.textLabel.text = @"当前素材";
-            cell.detailTextLabel.text = SLVCamStatusSummary();
+            // 不走 detailTextLabel：它的右对齐在长文本下会从左边溢出压到标题上。
+            ((SLVScrollValueCell *)cell).valueView.text = SLVCamStatusSummary();
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         } else {
             // 预览素材：右侧直接给结论，不用点进去才知道有没有声音。

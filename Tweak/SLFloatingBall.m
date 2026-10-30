@@ -134,6 +134,9 @@ NSString *SLVFloatIconSummary(void) {
 static UIImage *SLVBrandIcon(CGFloat side, UIColor *bg) {
     if (side <= 0) side = 96;
     UIColor *base = bg ?: [UIColor blackColor];
+    BOOL small = (side < 32.0);
+    CGFloat lwU = small ? 6.5 : 8.5;
+    CGFloat radU = small ? 15.0 : 17.0;
     UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
     fmt.opaque = NO;
     UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side) format:fmt];
@@ -142,18 +145,21 @@ static UIImage *SLVBrandIcon(CGFloat side, UIColor *bg) {
         CGContextSetFillColorWithColor(c, base.CGColor);
         CGContextFillEllipseInRect(c, CGRectMake(0, 0, side, side));
         CGFloat u = side / 100.0;
-        CGFloat lw = 8.5 * u;
-        CGFloat rad = 17.0 * u;
-        // 后框先画，前框压在上面：重叠处的后框线被前框的白边吃掉一半，
-        // 看起来才像「前面那张挡着后面那张」，而不是两条线互相穿过。
+        CGFloat lw = lwU * u;
+        CGFloat rad = radU * u;
+        CGRect frontRect = CGRectMake(2.0 * u, 4.0 * u, 56.0 * u, 92.0 * u);
+        CGRect backRect  = CGRectMake(42.0 * u, 4.0 * u, 56.0 * u, 92.0 * u);
+        // 后框只留「前框右边线以右」那半截。整条画出来的话，它的左边线会落在
+        // 前框内部（相隔 7.5 单位），小尺寸下两条竖线糊成「|||」，像三根柱子。
+        CGContextSaveGState(c);
+        CGContextClipToRect(c, CGRectMake(CGRectGetMaxX(frontRect), 0, side, side));
         [[UIColor colorWithWhite:1.0 alpha:0.5] setStroke];
-        UIBezierPath *back = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(42.0 * u, 4.0 * u, 56.0 * u, 92.0 * u)
-                                                          cornerRadius:rad];
+        UIBezierPath *back = [UIBezierPath bezierPathWithRoundedRect:backRect cornerRadius:rad];
         back.lineWidth = lw;
         [back stroke];
+        CGContextRestoreGState(c);
         [[UIColor whiteColor] setStroke];
-        UIBezierPath *front = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(2.0 * u, 4.0 * u, 56.0 * u, 92.0 * u)
-                                                           cornerRadius:rad];
+        UIBezierPath *front = [UIBezierPath bezierPathWithRoundedRect:frontRect cornerRadius:rad];
         front.lineWidth = lw;
         [front stroke];
     }];
