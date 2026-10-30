@@ -12,11 +12,17 @@ NS_ASSUME_NONNULL_BEGIN
 /// SLFloatPanelController +presentMediaFrom: 里的类即可。
 @interface SLMediaListController : UITableViewController
 
-/// 弹出「添加素材」菜单：相册视频 / 相册图片 / 文件导入。
+/// 在 anchorView 下方弹出「添加素材」小框：从相册选择 / 从文件导入。
 ///
-/// 设置页和素材页都用它，免得两处各写一份。
+/// 0.2.22 起不再用 action sheet —— 素材页的「＋」在导航栏右上角，
+/// sheet 从屏幕底下升起来，跟点的那颗按钮没有任何位置关系；
+/// 改成锚在按钮下方的小框，点哪儿弹哪儿。
+///
+/// @param host      弹框的宿主控制器（浮窗里的素材页 / 设置页）
+/// @param anchorView 锚点视图，小框贴着它的下沿展开；传 nil 则退回 host.view 顶部居中
 /// @param completion 导入结束后回调（YES = 加进去了，包括「已在库里所以直接选中」）
 + (void)presentAddMenuFrom:(UIViewController *)host
+                    anchor:(nullable UIView *)anchorView
                 completion:(nullable void (^)(BOOL added))completion;
 
 @end

@@ -14,6 +14,7 @@
 #import "SLFloatingBall.h"
 #import "SLSettingsPanel.h"
 #import "SLMediaListController.h"
+#import "SLMediaPreview.h"
 #import "SLCamBridge.h"
 #import "SLFan.h"
 #import "SLUtil.h"
@@ -750,6 +751,9 @@ static UIImage *SLTransparentImage(void) {
 
 #pragma mark 长按扇
 
+/// 0.2.22：长按停在「启用」球上不动 → 松手进预览。定义在文件末尾。
+static void SLShowMediaPreview(void);
+
 // 球贴哪条边：取四个方向里最近的那条。贴角落时上下 / 左右距离接近，
 // 取到哪条都不算错 —— SLFanView 内部会把扇角收窄、半径缩小，保证不出屏。
 - (SLFanEdge)sl_edgeForCenter:(CGPoint)c inSize:(CGSize)sz {
@@ -871,8 +875,14 @@ static UIImage *SLTransparentImage(void) {
         if (_fan) {
             NSInteger sw = _fan.slPickedSwitch;
             NSInteger ang = _fan.slPickedAngle;
+            // 必须在 sl_hide 之前读 —— 收起时会把这个标志清掉
+            BOOL preview = _fan.slWantsPreview;
             [self sl_hideFan];
-            if (g.state == UIGestureRecognizerStateEnded) SLFanCommit(sw, ang);
+            if (g.state == UIGestureRecognizerStateEnded) {
+                // 停住「启用」球再松手 = 预览素材，不切开关
+                if (preview) SLShowMediaPreview();
+                else SLFanCommit(sw, ang);
+            }
         }
     }
 }
@@ -1659,7 +1669,7 @@ void SLStartEntryWatcher(void) {
 - (void)sl_applied {
     SLRefreshFloatButton();
     [self.tableView reloadData];
-    SLToast(@"图标已更新");
+    SLToast(@"已更新");
 }
 
 - (void)sl_pickPhoto {
@@ -1676,7 +1686,7 @@ void SLStartEntryWatcher(void) {
     if (!results.count) return;
     NSItemProvider *p = results.firstObject.itemProvider;
     if (![p canLoadObjectOfClass:[UIImage class]]) {
-        SLToast(@"这张图片读不出来");
+        SLToast(@"图片读不出来");
         return;
     }
     __weak typeof(self) ws = self;
@@ -1686,10 +1696,27 @@ void SLStartEntryWatcher(void) {
             if (img && SLSaveFloatIconImage(img)) {
                 [ws sl_applied];
             } else {
-                SLToast(@"保存失败，换一张试试");
+                SLToast(@"保存失败");
             }
         });
     }];
 }
 
 @end
+
+#pragma mark - 预览入口
+
+// 0.2.22：长按停在「启用」球上再松手 → 预览当前素材。
+//
+// 两种情况分开走：浮窗已经开着（设置页 / 素材页）就直接推进它自己的导航栈；
+// 没开着才新起一层。不能只调 presentFrom: —— 它有「已经开着就不再叠第二层」
+// 的守卫，浮窗开着时这次点击会被静默吃掉。
+static void SLShowMediaPreview(void) {
+    if (sSLFloatPanel && sSLFloatPanel.presentingViewController && sSLFloatPanel.nav) {
+        [sSLFloatPanel.nav pushViewController:[[SLMediaPreviewController alloc] init] animated:YES];
+        return;
+    }
+    UIViewController *host = SLTopViewController();
+    if (!host) return;
+    [SLFloatPanelController presentFrom:host root:[[SLMediaPreviewController alloc] init]];
+}

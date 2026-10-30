@@ -57,6 +57,10 @@ typedef NS_ENUM(NSInteger, SLFanSwitch) {
 /// 选中的角度档位 0..3，-1 = 没选（只有停在旋转球上才有值）
 @property (nonatomic, readonly) NSInteger slPickedAngle;
 
+/// 0.2.22：手指停在「启用」球上不动 0.55s 再松手 = 想预览素材，不切开关。
+/// 松手时要先读这个值再调 sl_hide，hide 会把它清掉。
+@property (nonatomic, readonly) BOOL slWantsPreview;
+
 /// 用当前设置初始化各球的状态（进扇之前调一次）
 - (void)sl_reloadStates;
 

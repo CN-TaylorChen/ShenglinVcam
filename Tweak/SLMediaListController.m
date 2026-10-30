@@ -7,8 +7,12 @@
 //
 //  0.2.20：
 //    · 每行带缩略图（图片直接缩，视频抽第 0 帧），异步生成 + NSCache
-//    · 「＋」变成一个三选一菜单：相册视频 / 相册图片 / 文件导入
 //    · 导入完自动选中（在 SLMediaStore 里做），列表最新的排最上面
+//
+//  0.2.22：
+//    · 「＋」不再弹 action sheet，改成锚在按钮下方的小框（点哪儿弹哪儿）
+//    · 相册入口合并成一个：图片和视频同屏，一次能选一批
+//    · 提示语砍短，只留结论
 //
 
 #import "SLMediaListController.h"
@@ -78,15 +82,244 @@ static dispatch_queue_t SLThumbQueue(void) {
     return q;
 }
 
+// 导入队列：算 SHA-256 指纹 + 解码体检都是秒级操作，批量导入时不能占主线程。
+// 串行是因为 importItemAtURL: 会读写 media/.hashes.plist，并发就得再加一层锁。
+static dispatch_queue_t SLImportQueue(void) {
+    static dispatch_queue_t q = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.taylorchen.shenglinvcam.import", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
+#pragma mark - 弹出小框
+
+// 尺寸都在这儿，改一处全变
+static const CGFloat kSLMenuRowH  = 44.0;
+static const CGFloat kSLMenuPadY  = 6.0;
+static const CGFloat kSLMenuWidth = 176.0;
+static const CGFloat kSLMenuGap   = 6.0;    // 锚点与小框之间
+static const CGFloat kSLMenuArrow = 9.0;    // 三角尖的高度
+static const CGFloat kSLMenuEdge  = 8.0;    // 离容器边缘至少留这么多
+
+// 不用毛玻璃：三角尖要跟面板同色，毛玻璃没法画出一个「对得上」的尖。
+// 系统自己的弹出菜单也是实色，这里跟着它走。
+static UIColor *SLMenuFillColor(void) {
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+            ? [UIColor colorWithWhite:0.20 alpha:0.98]
+            : [UIColor colorWithWhite:1.0 alpha:0.99];
+    }];
+}
+
+@interface SLAddMenuRow : UIControl
+@property (nonatomic, strong) UIImageView *iconView;
+@property (nonatomic, strong) UILabel *titleLab;
+- (instancetype)initWithTitle:(NSString *)title icon:(NSString *)icon;
+@end
+
+@implementation SLAddMenuRow
+
+- (instancetype)initWithTitle:(NSString *)title icon:(NSString *)icon {
+    if ((self = [super initWithFrame:CGRectZero])) {
+        UIImageSymbolConfiguration *cfg =
+            [UIImageSymbolConfiguration configurationWithPointSize:15
+                                                            weight:UIImageSymbolWeightMedium];
+        _iconView = [[UIImageView alloc] initWithFrame:CGRectZero];
+        _iconView.image = [UIImage systemImageNamed:icon withConfiguration:cfg];
+        _iconView.contentMode = UIViewContentModeCenter;
+        _iconView.tintColor = [UIColor labelColor];
+        [self addSubview:_iconView];
+
+        _titleLab = [[UILabel alloc] initWithFrame:CGRectZero];
+        _titleLab.text = title;
+        _titleLab.font = [UIFont systemFontOfSize:14.5];
+        _titleLab.textColor = [UIColor labelColor];
+        [self addSubview:_titleLab];
+
+        self.layer.cornerRadius = 8.0;
+        self.layer.cornerCurve = kCACornerCurveContinuous;
+        self.backgroundColor = [UIColor clearColor];
+    }
+    return self;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGRect b = self.bounds;
+    _iconView.frame = CGRectMake(10.0, (b.size.height - 20.0) / 2.0, 20.0, 20.0);
+    _titleLab.frame = CGRectMake(36.0, 0, MAX(0.0, b.size.width - 44.0), b.size.height);
+}
+
+- (void)setHighlighted:(BOOL)highlighted {
+    [super setHighlighted:highlighted];
+    self.backgroundColor = highlighted
+        ? [[UIColor labelColor] colorWithAlphaComponent:0.08]
+        : [UIColor clearColor];
+}
+
+@end
+
+@interface SLAddMenu : UIView
+@property (nonatomic, strong) UIControl *backdrop;
+@property (nonatomic, strong) UIView *panel;
+@property (nonatomic, strong) CAShapeLayer *arrow;
+@property (nonatomic, copy) void (^albumBlock)(void);
+@property (nonatomic, copy) void (^filesBlock)(void);
++ (void)showInView:(UIView *)hostView
+            anchor:(CGRect)anchor
+             album:(void (^)(void))album
+             files:(void (^)(void))files;
+@end
+
+@implementation SLAddMenu
+
++ (void)showInView:(UIView *)hostView anchor:(CGRect)anchor
+             album:(void (^)(void))album files:(void (^)(void))files {
+    if (!hostView) return;
+    // 连点两下「＋」不要叠两层
+    for (UIView *v in hostView.subviews) {
+        if ([v isKindOfClass:[SLAddMenu class]]) return;
+    }
+
+    SLAddMenu *m = [[SLAddMenu alloc] initWithFrame:hostView.bounds];
+    m.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    m.albumBlock = album;
+    m.filesBlock = files;
+    [m sl_buildWithAnchor:anchor hostSize:hostView.bounds.size];
+    [hostView addSubview:m];
+    [m sl_animateIn];
+}
+
+- (void)sl_buildWithAnchor:(CGRect)anchor hostSize:(CGSize)hs {
+    self.backgroundColor = [UIColor clearColor];
+
+    // 背板：透明，只负责「点别处关掉」。
+    // 不做压暗 —— 小框就贴在手边，压暗整屏反而像切了场景。
+    self.backdrop = [[UIControl alloc] initWithFrame:self.bounds];
+    self.backdrop.backgroundColor = [UIColor clearColor];
+    self.backdrop.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.backdrop addTarget:self action:@selector(sl_dismiss)
+            forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:self.backdrop];
+
+    CGFloat w = kSLMenuWidth;
+    CGFloat h = kSLMenuPadY * 2.0 + kSLMenuRowH * 2.0;
+
+    CGFloat midX = CGRectGetMidX(anchor);
+    CGFloat x = midX - w / 2.0;
+    x = MIN(MAX(x, kSLMenuEdge), MAX(kSLMenuEdge, hs.width - w - kSLMenuEdge));
+
+    // 默认往下开；下面放不下就翻到锚点上方
+    BOOL below = YES;
+    CGFloat y = CGRectGetMaxY(anchor) + kSLMenuGap + kSLMenuArrow;
+    if (y + h > hs.height - kSLMenuEdge) {
+        below = NO;
+        y = CGRectGetMinY(anchor) - kSLMenuGap - kSLMenuArrow - h;
+    }
+    if (y < kSLMenuEdge) y = kSLMenuEdge;
+
+    self.panel = [[UIView alloc] initWithFrame:CGRectMake(round(x), round(y), w, h)];
+    self.panel.backgroundColor = SLMenuFillColor();
+    self.panel.layer.cornerRadius = 14.0;
+    self.panel.layer.cornerCurve = kCACornerCurveContinuous;
+    self.panel.layer.shadowColor = [UIColor blackColor].CGColor;
+    self.panel.layer.shadowOpacity = 0.18;
+    self.panel.layer.shadowRadius = 14.0;
+    self.panel.layer.shadowOffset = CGSizeMake(0, 6);
+    self.panel.layer.shadowPath =
+        [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, w, h) cornerRadius:14.0].CGPath;
+    [self addSubview:self.panel];
+
+    // 三角尖：夹在面板内，别贴着圆角
+    CGFloat ax = round(MIN(MAX(midX - x, 20.0), w - 20.0));
+    UIBezierPath *tri = [UIBezierPath bezierPath];
+    if (below) {
+        [tri moveToPoint:CGPointMake(ax - kSLMenuArrow, y - 0.5)];
+        [tri addLineToPoint:CGPointMake(ax, y - kSLMenuArrow)];
+        [tri addLineToPoint:CGPointMake(ax + kSLMenuArrow, y - 0.5)];
+    } else {
+        [tri moveToPoint:CGPointMake(ax - kSLMenuArrow, y + h + 0.5)];
+        [tri addLineToPoint:CGPointMake(ax, y + h + kSLMenuArrow)];
+        [tri addLineToPoint:CGPointMake(ax + kSLMenuArrow, y + h + 0.5)];
+    }
+    [tri closePath];
+
+    self.arrow = [CAShapeLayer layer];
+    self.arrow.path = tri.CGPath;
+    self.arrow.fillColor = SLMenuFillColor().CGColor;
+    [self.layer insertSublayer:self.arrow below:self.panel.layer];
+
+    SLAddMenuRow *r1 = [[SLAddMenuRow alloc] initWithTitle:@"从相册选择" icon:@"photo.on.rectangle"];
+    r1.frame = CGRectMake(4.0, kSLMenuPadY, w - 8.0, kSLMenuRowH);
+    [r1 addTarget:self action:@selector(sl_tapAlbum) forControlEvents:UIControlEventTouchUpInside];
+    [self.panel addSubview:r1];
+
+    SLAddMenuRow *r2 = [[SLAddMenuRow alloc] initWithTitle:@"从文件导入" icon:@"folder"];
+    r2.frame = CGRectMake(4.0, kSLMenuPadY + kSLMenuRowH, w - 8.0, kSLMenuRowH);
+    [r2 addTarget:self action:@selector(sl_tapFiles) forControlEvents:UIControlEventTouchUpInside];
+    [self.panel addSubview:r2];
+}
+
+- (void)sl_animateIn {
+    self.panel.alpha = 0.0;
+    self.panel.transform = CGAffineTransformMakeScale(0.94, 0.94);
+    self.arrow.opacity = 0.0f;
+    [UIView animateWithDuration:0.18 delay:0
+                        options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        self.panel.alpha = 1.0;
+        self.panel.transform = CGAffineTransformIdentity;
+    } completion:nil];
+    self.arrow.opacity = 1.0f;
+}
+
+- (void)sl_dismiss {
+    [UIView animateWithDuration:0.13 animations:^{
+        self.panel.alpha = 0.0;
+        self.panel.transform = CGAffineTransformMakeScale(0.96, 0.96);
+    } completion:^(BOOL done) {
+        (void)done;
+        [self removeFromSuperview];
+    }];
+}
+
+// 点完立刻摘掉再起 picker：picker 是全屏的，留着这一层只会挡在转场动画里
+- (void)sl_tapAlbum {
+    void (^b)(void) = self.albumBlock;
+    [self removeFromSuperview];
+    if (b) b();
+}
+
+- (void)sl_tapFiles {
+    void (^b)(void) = self.filesBlock;
+    [self removeFromSuperview];
+    if (b) b();
+}
+
+@end
+
 #pragma mark - 添加素材（相册 / 文件）
 
 /// 相册和文件两个 picker 的 delegate 都放在这个单例上。
 /// 放控制器里不行：picker 是 present 出来的，控制器在浮窗里随时可能被关掉。
 @interface SLMediaAdder : NSObject <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, copy, nullable) void (^completion)(BOOL added);
-@property (nonatomic, assign) BOOL wantsVideo;
+
+// 批量导入：一次选一堆时逐个处理。串行是有意的 ——
+// loadFileRepresentation 给的临时文件只在回调里有效，必须当场拷走；
+// 并发拷会同时改 .hashes.plist，还得额外加锁。
+@property (nonatomic, strong) NSArray<NSItemProvider *> *queue;
+@property (nonatomic, assign) NSUInteger cursor;
+@property (nonatomic, assign) NSInteger addedCount;
+@property (nonatomic, assign) NSInteger dupCount;
+@property (nonatomic, assign) NSInteger failCount;
+
 + (instancetype)shared;
-- (void)presentMenuFrom:(UIViewController *)host completion:(nullable void (^)(BOOL))completion;
+- (void)presentMenuFrom:(UIViewController *)host
+                 anchor:(UIView *)anchorView
+             completion:(nullable void (^)(BOOL))completion;
 @end
 
 @implementation SLMediaAdder
@@ -98,37 +331,39 @@ static dispatch_queue_t SLThumbQueue(void) {
     return s;
 }
 
-- (void)presentMenuFrom:(UIViewController *)host completion:(void (^)(BOOL))completion {
+- (void)presentMenuFrom:(UIViewController *)host
+                 anchor:(UIView *)anchorView
+             completion:(void (^)(BOOL))completion {
     if (!host) return;
     self.completion = completion;
 
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:nil
-                                                                  message:nil
-                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+    // 菜单挂在导航控制器的视图上，不挂在 host.view 上 ——
+    // 两个调用方（设置页 / 素材页）都是 UITableViewController，self.view 就是那张表，
+    // 菜单加进去会跟着一起滚走。呈现仍然从 host 发起，跟以前一样稳。
+    UIView *menuHost = host.navigationController.view ?: host.view;
+
+    // 锚点换到 menuHost 坐标
+    CGRect anchor;
+    if (anchorView && anchorView.window == menuHost.window) {
+        anchor = [menuHost convertRect:anchorView.bounds fromView:anchorView];
+    } else {
+        CGFloat w = menuHost.bounds.size.width;
+        anchor = CGRectMake(w - 60.0, 0, 40.0, 0);
+    }
+
     __weak typeof(self) ws = self;
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"从相册选视频"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { [ws pickPhotosFrom:host video:YES]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"从相册选图片"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { [ws pickPhotosFrom:host video:NO]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"从文件导入"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { [ws pickFilesFrom:host]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-
-    // 弹窗形态下没有 anchor 会直接崩，必须给一个
-    sheet.popoverPresentationController.sourceView = host.view;
-    sheet.popoverPresentationController.sourceRect = host.view.bounds;
-    [host presentViewController:sheet animated:YES completion:nil];
+    [SLAddMenu showInView:menuHost anchor:anchor
+                    album:^{ [ws pickPhotosFrom:host]; }
+                    files:^{ [ws pickFilesFrom:host]; }];
 }
 
-- (void)pickPhotosFrom:(UIViewController *)host video:(BOOL)video {
-    self.wantsVideo = video;
+- (void)pickPhotosFrom:(UIViewController *)host {
     PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
-    cfg.filter = video ? [PHPickerFilter videosFilter] : [PHPickerFilter imagesFilter];
-    cfg.selectionLimit = 1;
+    // 图片和视频一起显示 —— 相册本来就是一屏混排，没必要让用户先做一次分类。
+    cfg.filter = [PHPickerFilter anyFilterMatchingSubfilters:
+                  @[[PHPickerFilter imagesFilter], [PHPickerFilter videosFilter]]];
+    // 0 = 不限数量。批量导入按顺序跑，最后导入的那个成为当前素材。
+    cfg.selectionLimit = 0;
     // 默认的 automatic 可能让系统挑「兼容表示」，4K / HEVC 素材会被现场转码 ——
     // 慢、临时文件更大、还更容易失败。current 直接拿原文件。
     cfg.preferredAssetRepresentationMode = PHPickerConfigurationAssetRepresentationModeCurrent;
@@ -144,7 +379,7 @@ static dispatch_queue_t SLThumbQueue(void) {
         [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeMovie, UTTypeImage]
                                                                    asCopy:YES];
     dp.delegate = self;
-    dp.allowsMultipleSelection = NO;
+    dp.allowsMultipleSelection = YES;
     [host presentViewController:dp animated:YES completion:nil];
 }
 
@@ -154,70 +389,131 @@ static dispatch_queue_t SLThumbQueue(void) {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (!results.count) return;
 
-    NSItemProvider *p = results.firstObject.itemProvider;
-    NSString *typeId = self.wantsVideo ? UTTypeMovie.identifier : UTTypeImage.identifier;
-    if (![p hasItemConformingToTypeIdentifier:typeId]) {
-        SLToast(self.wantsVideo ? @"这个文件不是视频" : @"这个文件不是图片");
+    NSMutableArray<NSItemProvider *> *q = [NSMutableArray arrayWithCapacity:results.count];
+    for (PHPickerResult *r in results) {
+        if (r.itemProvider) [q addObject:r.itemProvider];
+    }
+    if (!q.count) return;
+
+    self.queue = q;
+    self.cursor = 0;
+    self.addedCount = 0;
+    self.dupCount = 0;
+    self.failCount = 0;
+    [self sl_step];
+}
+
+/// 逐个走：取一个 → 拷进库 → 再取下一个。
+- (void)sl_step {
+    if (self.cursor >= self.queue.count) {
+        [self sl_finish];
         return;
     }
 
-    SLToast(@"正在导入…");   // 大文件要几秒，给个反馈
+    NSUInteger total = self.queue.count;
+    NSUInteger idx = self.cursor + 1;
+    self.cursor++;
+    SLToast(total > 1 ? [NSString stringWithFormat:@"导入中 %lu/%lu",
+                         (unsigned long)idx, (unsigned long)total]
+                      : @"导入中");
+
+    NSItemProvider *p = self.queue[idx - 1];
+    // 先问图片再问视频：实况照片两种表示都注册了，
+    // 先问图片能拿到那张静态帧，比拿一段 3 秒的 MOV 更符合「图片定格」的预期。
+    NSString *typeId = nil;
+    if ([p hasItemConformingToTypeIdentifier:UTTypeImage.identifier]) {
+        typeId = UTTypeImage.identifier;
+    } else if ([p hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) {
+        typeId = UTTypeMovie.identifier;
+    }
+    if (!typeId) {
+        self.failCount++;
+        [self sl_next];
+        return;
+    }
+
     __weak typeof(self) ws = self;
     [p loadFileRepresentationForTypeIdentifier:typeId
                              completionHandler:^(NSURL *url, NSError *err) {
+        SLMediaAdder *ss = ws;
+        if (!ss) return;
         if (!url) {
             SLLog(@"导入: 相册导出失败 %@", err.localizedDescription ?: @"?");
-            SLToast(@"相册导出失败，换一个试试");
-            return;
+            ss.failCount++;
+        } else {
+            [ss sl_importOne:url];   // 临时文件只在这个回调里有效，必须当场拷
         }
-        [ws importURL:url];
+        [ss sl_next];
     }];
+}
+
+- (void)sl_next {
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_main_queue(), ^{ [ws sl_step]; });
+}
+
+- (void)sl_importOne:(NSURL *)url {
+    NSError *e = nil;
+    BOOL dup = NO;
+    SLMediaItem *it = [SLMediaStore importItemAtURL:url error:&e duplicate:&dup];
+    if (!it) {
+        self.failCount++;
+        SLLog(@"导入: 失败 %@", e.localizedDescription ?: @"?");
+        return;
+    }
+    if (dup) self.dupCount++;
+    else self.addedCount++;
+}
+
+- (void)sl_finish {
+    self.queue = nil;
+    [SLThumbCache() removeAllObjects];
+    SLCamReloadAll();
+
+    NSInteger ok = self.addedCount + self.dupCount;
+    NSString *msg;
+    if (ok == 0) {
+        msg = self.failCount > 0 ? @"导入失败" : @"没有可用素材";
+    } else if (ok == 1) {
+        msg = (self.dupCount == 1) ? @"已在库中" : @"已添加";
+    } else {
+        msg = [NSString stringWithFormat:@"已添加 %ld 个", (long)ok];
+    }
+    SLToast(msg);
+
+    void (^done)(BOOL) = self.completion;
+    self.completion = nil;
+    if (done) done(ok > 0);
 }
 
 #pragma mark 文件
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller
 didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
-    NSURL *url = urls.firstObject;
-    if (!url) return;
-    SLToast(@"正在导入…");
-    [self importURL:url];
+    (void)controller;
+    if (!urls.count) return;
+
+    self.queue = nil;
+    self.addedCount = 0;
+    self.dupCount = 0;
+    self.failCount = 0;
+
+    SLToast(urls.count > 1 ? [NSString stringWithFormat:@"导入中 %lu 个", (unsigned long)urls.count]
+                           : @"导入中");
+
+    // asCopy:YES 拿到的已经是沙盒副本，可以慢慢来。
+    // 但算指纹 + 体检对 4K 素材是秒级的，一次选五个就会把主线程堵死 —— 挪到后台串行队列。
+    __weak typeof(self) ws = self;
+    dispatch_async(SLImportQueue(), ^{
+        SLMediaAdder *ss = ws;
+        if (!ss) return;
+        for (NSURL *u in urls) [ss sl_importOne:u];
+        dispatch_async(dispatch_get_main_queue(), ^{ [ss sl_finish]; });
+    });
 }
 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
     (void)controller;
-}
-
-#pragma mark 落地
-
-- (void)importURL:(NSURL *)url {
-    // 这个 URL 指向**临时文件**，handler 一返回就可能被清理。
-    // 以前是先 dispatch 到主线程再拷，主线程忙或文件大时文件已经没了 ——
-    // 表现就是「有的视频导入失败」。必须在这里就拷走。
-    NSError *e = nil;
-    BOOL dup = NO;
-    SLMediaItem *it = [SLMediaStore importItemAtURL:url error:&e duplicate:&dup];
-    NSString *reason = e.localizedDescription;
-    BOOL isImage = it.isImage;
-    void (^done)(BOOL) = self.completion;
-    self.completion = nil;
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (it) {
-            [SLThumbCache() removeAllObjects];
-            SLCamReloadAll();
-            if (dup) {
-                SLToast(@"这份素材已经在库里，已切到它");
-            } else {
-                SLToast(isImage ? @"已加入图片，画面已定格" : @"已加入视频");
-            }
-            if (done) done(YES);
-        } else {
-            SLLog(@"导入: 保存失败 %@", reason ?: @"?");
-            SLToast(reason.length ? reason : @"导入失败，换一个试试");
-            if (done) done(NO);
-        }
-    });
 }
 
 @end
@@ -336,8 +632,10 @@ static void SLPresentSettingsWhenFree(UIViewController *host, NSInteger attempt)
 
 @implementation SLMediaListController
 
-+ (void)presentAddMenuFrom:(UIViewController *)host completion:(void (^)(BOOL))completion {
-    [[SLMediaAdder shared] presentMenuFrom:host completion:completion];
++ (void)presentAddMenuFrom:(UIViewController *)host
+                    anchor:(UIView *)anchorView
+                completion:(void (^)(BOOL))completion {
+    [[SLMediaAdder shared] presentMenuFrom:host anchor:anchorView completion:completion];
 }
 
 - (instancetype)init {
@@ -386,8 +684,12 @@ static void SLPresentSettingsWhenFree(UIViewController *host, NSInteger attempt)
 }
 
 - (void)sl_pick {
+    // 小框要贴着「＋」展开。锚点是导航栏里那颗胶囊的自定义视图，
+    // 菜单本身由 SLMediaAdder 挂到导航控制器的视图上（表格会滚，挂表格上会跟着跑）。
+    UIView *anchor = self.navigationItem.rightBarButtonItems.lastObject.customView;
+
     __weak typeof(self) ws = self;
-    [SLMediaListController presentAddMenuFrom:self completion:^(BOOL added) {
+    [SLMediaListController presentAddMenuFrom:self anchor:anchor completion:^(BOOL added) {
         (void)added;
         [ws sl_reload];
     }];
@@ -414,9 +716,9 @@ static void SLPresentSettingsWhenFree(UIViewController *host, NSInteger attempt)
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)section {
     (void)tv; (void)section;
     if (self.items.count) {
-        return @"新添加的素材自动选中并排在最上面。视频循环播放，图片定格不动。左滑可以删除。";
+        return @"最新的排在最上面，导入后自动选中。左滑删除。";
     }
-    return @"还没有素材。点右上角「＋」从相册或文件里选一段视频 / 一张图片，它会替换摄像头画面。";
+    return @"还没有素材。点右上角「＋」选一段视频或一张图片，它会替换摄像头画面。";
 }
 
 - (void)tableView:(UITableView *)tv willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)ip {
@@ -445,10 +747,10 @@ static void SLPresentSettingsWhenFree(UIViewController *host, NSInteger attempt)
     BOOL cur = [[SLMediaStore currentItem].fileName isEqualToString:it.fileName];
     if (cur) {
         [SLMediaStore setCurrentItem:nil];
-        SLToast(@"已取消替换 · 恢复真实摄像头");
+        SLToast(@"已取消");
     } else {
         [SLMediaStore setCurrentItem:it];
-        SLToast(it.isImage ? @"已切换 · 画面定格在这张图" : @"已切换素材");
+        SLToast(@"已切换");
     }
     [tv reloadData];
     SLCamReloadAll();

@@ -1,0 +1,385 @@
+//
+//  SLMediaPreview.m
+//  声临 · 虚拟摄像头 —— 素材预览
+//
+
+#import "SLMediaPreview.h"
+#import "SLMediaStore.h"
+#import "SLFloatingBall.h"
+#import "SLGlass.h"
+#import "SLUtil.h"
+#import "SLLog.h"
+#import <AVFoundation/AVFoundation.h>
+
+#pragma mark - 音轨体检
+
+@implementation SLMediaAudioInfo
+@end
+
+/// 4CC → 可读名。别写 'aac ' 这种多字符字面量 —— 实现定义，换编译器就可能变。
+static NSString *SLFourCCName(FourCharCode fc) {
+    char s[5] = {
+        (char)((fc >> 24) & 0xFF),
+        (char)((fc >> 16) & 0xFF),
+        (char)((fc >> 8) & 0xFF),
+        (char)(fc & 0xFF),
+        0,
+    };
+    NSString *raw = [[NSString stringWithUTF8String:s] stringByTrimmingCharactersInSet:
+                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *k = raw.lowercaseString;
+
+    if ([k isEqualToString:@"aac"] || [k isEqualToString:@"mp4a"]) return @"AAC";
+    if ([k isEqualToString:@"alac"]) return @"ALAC";
+    if ([k isEqualToString:@"ac-3"]) return @"AC-3";
+    if ([k isEqualToString:@"ec-3"]) return @"E-AC-3";
+    if ([k isEqualToString:@"opus"]) return @"Opus";
+    if ([k isEqualToString:@"lpcm"] || [k isEqualToString:@"sowt"]
+        || [k isEqualToString:@"twos"] || [k isEqualToString:@"fl32"]) return @"PCM";
+    if ([k isEqualToString:@"samr"]) return @"AMR";
+    if ([k isEqualToString:@"ulaw"] || [k isEqualToString:@"alaw"]) return @"G.711";
+    return raw.length ? raw : @"未知";
+}
+
+/// 音轨能不能解成 PCM —— 判据跟 SLCamFeed 建 reader 时保持一致，
+/// 否则会出现「预览说能出声、录制时却静音」这种前后矛盾。
+static BOOL SLTrackDecodesToPCM(AVAsset *asset, AVAssetTrack *track) {
+    if (!asset || !track) return NO;
+    NSError *err = nil;
+    AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&err];
+    if (!reader) return NO;
+    NSDictionary *settings = @{
+        AVFormatIDKey : @(kAudioFormatLinearPCM),
+        AVLinearPCMBitDepthKey : @16,
+        AVLinearPCMIsFloatKey : @NO,
+        AVLinearPCMIsBigEndianKey : @NO,
+        AVLinearPCMIsNonInterleaved : @NO,
+    };
+    AVAssetReaderTrackOutput *out =
+        [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
+    return [reader canAddOutput:out];
+}
+
+SLMediaAudioInfo *SLProbeMediaAudio(NSString *path) {
+    if (!path.length) return nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path]) return nil;
+
+    // 缓存键带上修改时间：同名文件被替换过就要重新探
+    NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+    NSTimeInterval mtime = [(NSDate *)attrs[NSFileModificationDate] timeIntervalSince1970];
+    NSString *key = [NSString stringWithFormat:@"%@|%.0f", path.lastPathComponent, mtime];
+
+    static NSMutableDictionary<NSString *, SLMediaAudioInfo *> *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
+    @synchronized (cache) {
+        SLMediaAudioInfo *hit = cache[key];
+        if (hit) return hit;
+    }
+
+    SLMediaAudioInfo *info = [[SLMediaAudioInfo alloc] init];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+    AVAssetTrack *at = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+
+    if (!at) {
+        info.hasAudio = NO;
+        info.decodable = NO;
+        info.codec = @"";
+        info.detail = @"";
+    } else {
+        info.hasAudio = YES;
+        info.decodable = SLTrackDecodesToPCM(asset, at);
+
+        CMFormatDescriptionRef fd =
+            (__bridge CMFormatDescriptionRef)at.formatDescriptions.firstObject;
+        if (fd) {
+            info.codec = SLFourCCName(CMFormatDescriptionGetMediaSubType(fd));
+            const AudioStreamBasicDescription *asbd =
+                CMAudioFormatDescriptionGetStreamBasicDescription(fd);
+            if (asbd && asbd->mSampleRate > 0) {
+                info.detail = [NSString stringWithFormat:@"%.1f kHz · %u 声道",
+                               asbd->mSampleRate / 1000.0, (unsigned)asbd->mChannelsPerFrame];
+            }
+        }
+        if (!info.codec.length) info.codec = @"未知";
+        if (!info.detail.length) info.detail = @"";
+    }
+
+    @synchronized (cache) {
+        cache[key] = info;
+        // 素材删了缓存不会自己掉，超过 200 条整表清一次，别让字典无限长
+        if (cache.count > 200) [cache removeAllObjects];
+    }
+    return info;
+}
+
+NSString *SLMediaAudioSummary(void) {
+    SLMediaItem *it = [SLMediaStore currentItem];
+    if (!it) return @"未选素材";
+    if (it.isImage) return @"图片";
+    SLMediaAudioInfo *info = SLProbeMediaAudio(it.path);
+    if (!info) return @"读不到";
+    if (!info.hasAudio) return @"无声音";
+    if (!info.decodable) return @"音轨不可解";
+    return @"有声音";
+}
+
+#pragma mark - 预览页
+
+@interface SLMediaPreviewController ()
+@property (nonatomic, strong) SLMediaItem *item;
+@property (nonatomic, strong) UIView *stage;
+@property (nonatomic, strong) UIImageView *stillView;
+@property (nonatomic, strong) AVPlayer *player;
+@property (nonatomic, strong) AVPlayerLayer *playerLayer;
+@property (nonatomic, strong) UIView *infoCard;
+@property (nonatomic, strong) UILabel *stateLab;
+@property (nonatomic, strong) UILabel *codecLab;
+@property (nonatomic, strong) UILabel *noteLab;
+@property (nonatomic, strong) UIButton *playBtn;
+@property (nonatomic, assign) BOOL playing;
+@property (nonatomic, assign) BOOL audioActive;
+@end
+
+@implementation SLMediaPreviewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor clearColor];
+    self.title = @"预览";
+    self.navigationItem.titleView = SLPillTitleView(@"预览");
+    self.navigationItem.rightBarButtonItem = SLPillBarItem(@"完成", self, @selector(sl_close));
+
+    self.item = [SLMediaStore currentItem];
+
+    self.stage = [[UIView alloc] initWithFrame:CGRectZero];
+    self.stage.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.86];
+    self.stage.layer.cornerRadius = 14.0;
+    self.stage.layer.cornerCurve = kCACornerCurveContinuous;
+    self.stage.clipsToBounds = YES;
+    [self.view addSubview:self.stage];
+
+    self.stillView = [[UIImageView alloc] initWithFrame:CGRectZero];
+    self.stillView.contentMode = UIViewContentModeScaleAspectFit;
+    self.stillView.hidden = YES;
+    [self.stage addSubview:self.stillView];
+
+    self.infoCard = [[UIView alloc] initWithFrame:CGRectZero];
+    self.infoCard.backgroundColor = SLGlassCellColor();
+    self.infoCard.layer.cornerRadius = 14.0;
+    self.infoCard.layer.cornerCurve = kCACornerCurveContinuous;
+    [self.view addSubview:self.infoCard];
+
+    self.stateLab = [[UILabel alloc] initWithFrame:CGRectZero];
+    self.stateLab.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    self.stateLab.textColor = [UIColor labelColor];
+    [self.infoCard addSubview:self.stateLab];
+
+    self.codecLab = [[UILabel alloc] initWithFrame:CGRectZero];
+    self.codecLab.font = [UIFont systemFontOfSize:13];
+    self.codecLab.textColor = [UIColor secondaryLabelColor];
+    self.codecLab.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.infoCard addSubview:self.codecLab];
+
+    self.noteLab = [[UILabel alloc] initWithFrame:CGRectZero];
+    self.noteLab.font = [UIFont systemFontOfSize:12];
+    self.noteLab.textColor = [UIColor tertiaryLabelColor];
+    self.noteLab.numberOfLines = 2;
+    [self.infoCard addSubview:self.noteLab];
+
+    self.playBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.playBtn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
+    self.playBtn.tintColor = [UIColor whiteColor];
+    self.playBtn.layer.cornerRadius = 20.0;
+    self.playBtn.hidden = YES;
+    [self.playBtn addTarget:self action:@selector(sl_togglePlay) forControlEvents:UIControlEventTouchUpInside];
+    [self.stage addSubview:self.playBtn];
+
+    [self sl_loadContent];
+}
+
+- (void)sl_close {
+    SLCloseHostingPanel(self);
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    if (!self.player) return;
+    [self sl_activateAudio];
+    // 从预览里推走别的页再回来，接着放
+    if (self.playing) [self.player play];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [self.player pause];
+    [self sl_deactivateAudio];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+#pragma mark 内容
+
+- (void)sl_loadContent {
+    SLMediaItem *it = self.item;
+    if (!it.path.length) {
+        self.stateLab.text = @"没有素材";
+        self.stateLab.textColor = [UIColor secondaryLabelColor];
+        self.codecLab.text = @"先去素材页选一段视频或一张图片";
+        self.noteLab.text = nil;
+        return;
+    }
+
+    if (it.isImage) {
+        self.stillView.hidden = NO;
+        UIImage *img = [UIImage imageWithContentsOfFile:it.path];
+        self.stillView.image = img;
+        self.stateLab.text = @"图片 · 画面定格";
+        self.stateLab.textColor = [UIColor labelColor];
+        self.codecLab.text = img ? [NSString stringWithFormat:@"%.0f × %.0f",
+                                    img.size.width * img.scale, img.size.height * img.scale]
+                                 : @"图片读不出来";
+        self.noteLab.text = @"图片素材没有音轨，录制时会全程静音。";
+        return;
+    }
+
+    // ---- 视频 ----
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:it.path] options:nil];
+    AVPlayerItem *pitem = [AVPlayerItem playerItemWithAsset:asset];
+    self.player = [AVPlayer playerWithPlayerItem:pitem];
+    self.player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+
+    self.playerLayer = [AVPlayerLayer playerLayerWithPlayer:self.player];
+    self.playerLayer.videoGravity = AVLayerVideoGravityResizeAspect;
+    self.playerLayer.frame = self.stage.bounds;
+    [self.stage.layer insertSublayer:self.playerLayer atIndex:0];
+
+    self.playBtn.hidden = NO;
+    [self sl_updatePlayIcon];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(sl_onItemEnd:)
+                                                 name:AVPlayerItemDidPlayToEndTimeNotification
+                                               object:pitem];
+
+    // ---- 音轨结论 ----
+    SLMediaAudioInfo *info = SLProbeMediaAudio(it.path);
+    if (!info || !info.hasAudio) {
+        self.stateLab.text = @"无声音";
+        self.stateLab.textColor = [UIColor systemOrangeColor];
+        self.codecLab.text = @"这段素材没有音轨";
+        self.noteLab.text = @"录制时会输出静音，不会放行真麦克风。";
+    } else if (!info.decodable) {
+        self.stateLab.text = @"有音轨 · 解不了";
+        self.stateLab.textColor = [UIColor systemOrangeColor];
+        self.codecLab.text = info.codec;
+        self.noteLab.text = @"这个编码解不成 PCM，录制时会静音。换 AAC 试试。";
+    } else {
+        self.stateLab.text = @"有声音";
+        self.stateLab.textColor = [UIColor systemGreenColor];
+        self.codecLab.text = info.detail.length
+            ? [NSString stringWithFormat:@"%@ · %@", info.codec, info.detail]
+            : info.codec;
+        self.noteLab.text = @"现在放的就是素材原声，录制时会用它替换麦克风。";
+    }
+
+    [self.player play];
+    self.playing = YES;
+    [self sl_updatePlayIcon];
+}
+
+- (void)sl_onItemEnd:(NSNotification *)n {
+    (void)n;
+    // 循环：回到 0 再放，跟录制时的循环行为一致
+    [self.player seekToTime:kCMTimeZero toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+    if (self.playing) [self.player play];
+}
+
+- (void)sl_togglePlay {
+    if (!self.player) return;
+    if (self.playing) {
+        [self.player pause];
+        self.playing = NO;
+    } else {
+        [self.player play];
+        self.playing = YES;
+    }
+    [self sl_updatePlayIcon];
+}
+
+- (void)sl_updatePlayIcon {
+    NSString *name = self.playing ? @"pause.fill" : @"play.fill";
+    UIImageSymbolConfiguration *cfg =
+        [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIImageSymbolWeightSemibold];
+    [self.playBtn setImage:[UIImage systemImageNamed:name withConfiguration:cfg]
+                  forState:UIControlStateNormal];
+}
+
+#pragma mark 音频会话
+
+// 不改会话的话，宿主 app（抖音 / QQ）可能把类别设成 Ambient，
+// 手机一开静音键预览就没声 —— 用户会当成「素材坏了」。这里临时用 Playback + 混音。
+- (void)sl_activateAudio {
+    if (self.audioActive) return;
+    self.audioActive = YES;
+    NSError *err = nil;
+    AVAudioSession *s = [AVAudioSession sharedInstance];
+    [s setCategory:AVAudioSessionCategoryPlayback
+       withOptions:AVAudioSessionCategoryOptionMixWithOthers
+             error:&err];
+    if (err) SLLog(@"预览: 音频类别设置失败 %@", err.localizedDescription ?: @"?");
+    err = nil;
+    [s setActive:YES error:&err];
+    if (err) SLLog(@"预览: 音频会话激活失败 %@", err.localizedDescription ?: @"?");
+}
+
+- (void)sl_deactivateAudio {
+    if (!self.audioActive) return;
+    self.audioActive = NO;
+    [[AVAudioSession sharedInstance] setActive:NO
+                                   withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                                         error:nil];
+}
+
+#pragma mark 布局
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGRect b = self.view.bounds;
+    if (b.size.width < 1.0) return;
+
+    // 导航栏是透明的，self.view 从卡片顶就开始 —— 内容得自己让开它
+    CGFloat top = 44.0;
+    UINavigationBar *nb = self.navigationController.navigationBar;
+    if (nb && nb.superview) {
+        CGFloat y = CGRectGetMaxY([self.view convertRect:nb.frame fromView:nb.superview]);
+        if (y > top) top = y;
+    }
+
+    CGFloat pad = 16.0;
+    CGFloat w = b.size.width - pad * 2.0;
+    CGFloat h = round(w * 9.0 / 16.0);
+    CGFloat maxH = b.size.height - top - 150.0;
+    if (h > maxH) h = maxH;
+    if (h < 110.0) h = 110.0;
+
+    self.stage.frame = CGRectMake(pad, top + 4.0, w, h);
+    self.playerLayer.frame = self.stage.bounds;
+    self.stillView.frame = self.stage.bounds;
+    self.playBtn.frame = CGRectMake(w - 50.0, h - 50.0, 40.0, 40.0);
+
+    CGFloat cardH = 112.0;
+    CGFloat cy = CGRectGetMaxY(self.stage.frame) + 12.0;
+    if (cy + cardH > b.size.height - 12.0) cy = MAX(top + 4.0, b.size.height - 12.0 - cardH);
+    self.infoCard.frame = CGRectMake(pad, cy, w, cardH);
+
+    CGFloat iw = w - 28.0;
+    self.stateLab.frame = CGRectMake(14.0, 12.0, iw, 21.0);
+    self.codecLab.frame = CGRectMake(14.0, 36.0, iw, 18.0);
+    self.noteLab.frame = CGRectMake(14.0, 58.0, iw, 44.0);
+}
+
+@end

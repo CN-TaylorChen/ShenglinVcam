@@ -25,6 +25,7 @@ ShenglinVcam_FILES = Tweak/SLCam.x \
 	Tweak/SLSettingsPanel.m \
 	Tweak/SLMediaStore.m \
 	Tweak/SLMediaListController.m \
+	Tweak/SLMediaPreview.m \
 	Tweak/SLCamCore.m \
 	Tweak/SLCamFeed.m \
 	Tweak/SLCamInject.m \

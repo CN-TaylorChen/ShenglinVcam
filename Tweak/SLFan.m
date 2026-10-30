@@ -84,6 +84,17 @@ static UIImage *SLFanIcon(NSInteger idx) {
     return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
 }
 
+/// 「启用」球被停住之后换成这个 —— 图标从电源变成播放，一眼看出松手会去预览
+static UIImage *SLFanPreviewIcon(void) {
+    UIImageSymbolConfiguration *cfg =
+        [UIImageSymbolConfiguration configurationWithPointSize:SL_FAN_ICON_PT
+                                                        weight:UIImageSymbolWeightSemibold];
+    UIImage *img = [UIImage systemImageNamed:@"play.rectangle.fill" withConfiguration:cfg];
+    if (!img) img = [UIImage systemImageNamed:@"play.fill" withConfiguration:cfg];
+    if (!img) img = [UIImage systemImageNamed:@"play.circle.fill" withConfiguration:cfg];
+    return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+}
+
 static NSString *SLFanAngleName(NSInteger i) {
     switch (i) {
         case 1: return @"90°";
@@ -129,6 +140,12 @@ static NSString *SLFanAngleName(NSInteger i) {
     NSInteger _angleIndex;
     CGFloat _arcProgress;
     NSInteger _shownAngle;
+
+    // 0.2.22：停在「启用」球上不动 = 预览素材。
+    // 扇的交互本来就是「按下 → 滑到某个球 → 松手提交」，没有单击，
+    // 所以只能靠「停留时长」区分：滑过去就松手 = 切开关，停住不走 = 预览。
+    BOOL _previewArmed;
+    BOOL _previewPending;
 }
 
 #pragma mark 构建
@@ -585,6 +602,9 @@ static NSString *SLFanAngleName(NSInteger i) {
 
 - (void)sl_hide {
     _hover = -1;
+    _previewPending = NO;
+    // 调用方在 sl_hide 之前已经读过 slWantsPreview，这里清掉不会丢结果
+    [self sl_setPreviewArmed:NO];
     [self sl_setAngleOpen:NO];
     for (int i = 0; i < 5; i++) {
         UIView *b = _ball[i];
@@ -645,6 +665,37 @@ static NSString *SLFanAngleName(NSInteger i) {
                 }
             });
         }
+    }
+
+    // 停在「启用」球上不动 0.55s → 转成预览入口（松手不切开关）
+    if (hit != SLFanSwitchEnabled) {
+        if (_previewArmed) [self sl_setPreviewArmed:NO];
+        return;
+    }
+    if (_previewArmed || _previewPending) return;
+
+    _previewPending = YES;
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        SLFanView *ss = ws;
+        if (!ss) return;
+        ss->_previewPending = NO;
+        // 松手后 _hover 会被 sl_hide 清成 -1，所以这里能顺带挡掉「刚滑过去就松手」
+        if (ss->_hover == SLFanSwitchEnabled && !ss->_previewArmed) [ss sl_setPreviewArmed:YES];
+    });
+}
+
+- (void)sl_setPreviewArmed:(BOOL)armed {
+    if (_previewArmed == armed) return;
+    _previewArmed = armed;
+    _iconV[SLFanSwitchEnabled].image = armed ? SLFanPreviewIcon() : SLFanIcon(SLFanSwitchEnabled);
+    if (armed) {
+        // 轻震一下：不看屏幕也知道已经切到「松手预览」
+        UIImpactFeedbackGenerator *h =
+            [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        [h prepare];
+        [h impactOccurred];
     }
 }
 
@@ -770,6 +821,10 @@ static NSString *SLFanAngleName(NSInteger i) {
 - (NSInteger)slPickedAngle {
     if (_hover != SLFanSwitchRotate || !_angleOpen) return -1;
     return _angleIndex;
+}
+
+- (BOOL)slWantsPreview {
+    return _previewArmed;
 }
 
 - (CGPoint)slFanCenter {

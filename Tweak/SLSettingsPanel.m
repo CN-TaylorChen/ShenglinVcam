@@ -16,12 +16,13 @@
 #import "SLAlignBox.h"
 #import "SLMediaListController.h"
 #import "SLMediaStore.h"
+#import "SLMediaPreview.h"
 #import "SLCamBridge.h"
 #import "SLUtil.h"
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVersion @"0.2.21"
+#define SLVersion @"0.2.22"
 
 // kSLCamLoopKey / kSLCamMirrorKey 现在由 SLCamCore.m 统一导出（SLCamBridge.h 里 extern），
 // 帧源要读同样的键，不能再各定义一份 static。
@@ -174,7 +175,7 @@ static NSString *SLRotationSummary(void) {
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
     (void)tv;
     if (section == 0) return 2;   // 启用 + 悬浮球图标
-    if (section == 1) return 2;   // 当前素材 + 添加素材
+    if (section == 1) return 3;   // 当前素材 + 添加素材 + 预览素材
     if (section == 2) return 3;   // 循环 + 镜像 + 旋转
     if (section == 3) return 1;   // 音频
     return 1;                     // 运行日志
@@ -196,7 +197,7 @@ static NSString *SLRotationSummary(void) {
 
 - (NSString *)sl_footerForSection:(NSInteger)section {
     if (section == 0) return @"关掉后胶囊不再展开，长按球仍可进设置。";
-    if (section == 1) return @"新添加的素材会自动选中，不用再进素材页点一次。视频循环播放，图片定格不动。";
+    if (section == 1) return @"导入后自动选中。视频循环播放，图片定格不动。";
     if (section == 2) return @"旋转按顺时针计算，画面会铺满取景框、多出来的部分居中裁掉。";
     if (section == 3) return @"关掉后麦克风会被静音，不会录入环境声。素材没有音轨时同样生效。";
     return nil;
@@ -256,12 +257,18 @@ static NSString *SLRotationSummary(void) {
             cell.textLabel.text = @"当前素材";
             cell.detailTextLabel.text = SLCamStatusSummary();
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else {
-            // 添加素材：相册视频 / 相册图片 / 文件导入，收在一个菜单里，
-            // 不并排放三个按钮把整组撑满
+        } else if (ip.row == 1) {
+            // 添加素材：相册（图片 + 视频同屏）/ 文件导入，收在「＋」下方的小框里，
+            // 不并排放两个按钮把整组撑满
             cell.textLabel.text = @"添加素材";
             cell.textLabel.textColor = [UIColor systemBlueColor];
-            cell.detailTextLabel.text = @"视频 · 图片 · 文件";
+            cell.detailTextLabel.text = @"相册 · 文件";
+        } else {
+            // 预览素材：右侧直接给结论，不用点进去才知道有没有声音
+            cell.textLabel.text = @"预览素材";
+            cell.textLabel.textColor = [UIColor systemBlueColor];
+            cell.detailTextLabel.text = SLMediaAudioSummary();
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         }
     } else if (ip.section == 2) {
         if (ip.row == 2) {
@@ -298,12 +305,16 @@ static NSString *SLRotationSummary(void) {
     } else if (ip.section == 1) {
         if (ip.row == 0) {
             [self.navigationController pushViewController:[[SLMediaListController alloc] init] animated:YES];
-        } else {
+        } else if (ip.row == 1) {
+            // 锚在这一行上，小框从这行下面展开
+            UITableViewCell *cell = [tv cellForRowAtIndexPath:ip];
             __weak typeof(self) ws = self;
-            [SLMediaListController presentAddMenuFrom:self completion:^(BOOL added) {
+            [SLMediaListController presentAddMenuFrom:self anchor:cell completion:^(BOOL added) {
                 (void)added;
                 [ws.tableView reloadData];
             }];
+        } else {
+            [self.navigationController pushViewController:[[SLMediaPreviewController alloc] init] animated:YES];
         }
     } else if (ip.section == 2 && ip.row == 2) {
         [self sl_pickRotation];
@@ -331,7 +342,7 @@ static NSString *SLRotationSummary(void) {
             SLSetRotation(v);
             SLCamReloadAll();
             [self.tableView reloadData];
-            SLToast(v == 0 ? @"已取消旋转" : [NSString stringWithFormat:@"已顺时针旋转 %ld°", (long)v]);
+            SLToast(v == 0 ? @"不旋转" : [NSString stringWithFormat:@"%ld°", (long)v]);
         }]];
     }
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
@@ -347,7 +358,7 @@ static NSString *SLRotationSummary(void) {
 - (void)sl_enabledChanged:(UISwitch *)sw {
     SLSetBool(kSLCamEnabledKey, sw.on);
     SLCamReloadAll();
-    SLToast(sw.on ? @"已启用虚拟摄像头" : @"已关闭，点球不再展开");
+    SLToast(sw.on ? @"已启用" : @"已关闭");
 }
 
 - (void)sl_optionChanged:(UISwitch *)sw {
@@ -355,7 +366,7 @@ static NSString *SLRotationSummary(void) {
     if (sw.tag == 2) {
         SLSetBool(kSLCamAudioKey, sw.on);
         SLCamReloadAll();
-        SLToast(sw.on ? @"已改用素材音频" : @"已静音，不再录入环境声");
+        SLToast(sw.on ? @"声音：开" : @"声音：关");
         return;
     }
     SLSetBool(sw.tag == 0 ? kSLCamLoopKey : kSLCamMirrorKey, sw.on);
