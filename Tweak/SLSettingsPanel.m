@@ -22,7 +22,7 @@
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVersion @"0.2.22"
+#define SLVersion @"0.2.23"
 
 // kSLCamLoopKey / kSLCamMirrorKey 现在由 SLCamCore.m 统一导出（SLCamBridge.h 里 extern），
 // 帧源要读同样的键，不能再各定义一份 static。
@@ -175,7 +175,7 @@ static NSString *SLRotationSummary(void) {
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
     (void)tv;
     if (section == 0) return 2;   // 启用 + 悬浮球图标
-    if (section == 1) return 3;   // 当前素材 + 添加素材 + 预览素材
+    if (section == 1) return 2;   // 当前素材 + 预览素材
     if (section == 2) return 3;   // 循环 + 镜像 + 旋转
     if (section == 3) return 1;   // 音频
     return 1;                     // 运行日志
@@ -257,14 +257,9 @@ static NSString *SLRotationSummary(void) {
             cell.textLabel.text = @"当前素材";
             cell.detailTextLabel.text = SLCamStatusSummary();
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else if (ip.row == 1) {
-            // 添加素材：相册（图片 + 视频同屏）/ 文件导入，收在「＋」下方的小框里，
-            // 不并排放两个按钮把整组撑满
-            cell.textLabel.text = @"添加素材";
-            cell.textLabel.textColor = [UIColor systemBlueColor];
-            cell.detailTextLabel.text = @"相册 · 文件";
         } else {
-            // 预览素材：右侧直接给结论，不用点进去才知道有没有声音
+            // 预览素材：右侧直接给结论，不用点进去才知道有没有声音。
+            // 添加素材不在这里再放一份 —— 素材页的「＋」已经是入口了，两处重复。
             cell.textLabel.text = @"预览素材";
             cell.textLabel.textColor = [UIColor systemBlueColor];
             cell.detailTextLabel.text = SLMediaAudioSummary();
@@ -305,14 +300,6 @@ static NSString *SLRotationSummary(void) {
     } else if (ip.section == 1) {
         if (ip.row == 0) {
             [self.navigationController pushViewController:[[SLMediaListController alloc] init] animated:YES];
-        } else if (ip.row == 1) {
-            // 锚在这一行上，小框从这行下面展开
-            UITableViewCell *cell = [tv cellForRowAtIndexPath:ip];
-            __weak typeof(self) ws = self;
-            [SLMediaListController presentAddMenuFrom:self anchor:cell completion:^(BOOL added) {
-                (void)added;
-                [ws.tableView reloadData];
-            }];
         } else {
             [self.navigationController pushViewController:[[SLMediaPreviewController alloc] init] animated:YES];
         }

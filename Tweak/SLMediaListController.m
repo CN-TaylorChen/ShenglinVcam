@@ -100,11 +100,15 @@ static const CGFloat kSLMenuRowH  = 44.0;
 static const CGFloat kSLMenuPadY  = 6.0;
 static const CGFloat kSLMenuWidth = 176.0;
 static const CGFloat kSLMenuGap   = 6.0;    // 锚点与小框之间
-static const CGFloat kSLMenuArrow = 9.0;    // 三角尖的高度
 static const CGFloat kSLMenuEdge  = 8.0;    // 离容器边缘至少留这么多
 
-// 不用毛玻璃：三角尖要跟面板同色，毛玻璃没法画出一个「对得上」的尖。
-// 系统自己的弹出菜单也是实色，这里跟着它走。
+// 0.2.23：三角尖去掉了。
+//
+// 原来画了一枚指向锚点的小尖，两个问题：① 面板是近白实色，尖也是近白，
+// 在浅色玻璃上看着就是一块白疙瘩，跟面板之间还有一道 0.5pt 的缝；
+// ② 尖的位置靠 midX - x 算，菜单被边缘夹过之后就跟按钮对不上了。
+// 系统自己的 UIMenu / 上下文菜单本来就没有箭头 —— 靠位置和弹出动画表达
+// 「从哪儿来的」就够了，不需要画一个几何体去指。
 static UIColor *SLMenuFillColor(void) {
     return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
         return tc.userInterfaceStyle == UIUserInterfaceStyleDark
@@ -164,7 +168,6 @@ static UIColor *SLMenuFillColor(void) {
 @interface SLAddMenu : UIView
 @property (nonatomic, strong) UIControl *backdrop;
 @property (nonatomic, strong) UIView *panel;
-@property (nonatomic, strong) CAShapeLayer *arrow;
 @property (nonatomic, copy) void (^albumBlock)(void);
 @property (nonatomic, copy) void (^filesBlock)(void);
 + (void)showInView:(UIView *)hostView
@@ -210,17 +213,23 @@ static UIColor *SLMenuFillColor(void) {
     CGFloat midX = CGRectGetMidX(anchor);
     CGFloat x = midX - w / 2.0;
     x = MIN(MAX(x, kSLMenuEdge), MAX(kSLMenuEdge, hs.width - w - kSLMenuEdge));
+    x = round(x);
 
     // 默认往下开；下面放不下就翻到锚点上方
     BOOL below = YES;
-    CGFloat y = CGRectGetMaxY(anchor) + kSLMenuGap + kSLMenuArrow;
+    CGFloat y = CGRectGetMaxY(anchor) + kSLMenuGap;
     if (y + h > hs.height - kSLMenuEdge) {
         below = NO;
-        y = CGRectGetMinY(anchor) - kSLMenuGap - kSLMenuArrow - h;
+        y = CGRectGetMinY(anchor) - kSLMenuGap - h;
     }
     if (y < kSLMenuEdge) y = kSLMenuEdge;
+    y = round(y);
 
-    self.panel = [[UIView alloc] initWithFrame:CGRectMake(round(x), round(y), w, h)];
+    // 用 bounds + anchorPoint + position 摆，不用 frame：
+    // 下面要改 anchorPoint 做「从按钮那一侧长出来」的缩放动画，
+    // 而 frame 在 anchorPoint 变了之后会自己变形，写 frame 等于白写。
+    self.panel = [[UIView alloc] initWithFrame:CGRectZero];
+    self.panel.bounds = CGRectMake(0, 0, w, h);
     self.panel.backgroundColor = SLMenuFillColor();
     self.panel.layer.cornerRadius = 14.0;
     self.panel.layer.cornerCurve = kCACornerCurveContinuous;
@@ -230,26 +239,13 @@ static UIColor *SLMenuFillColor(void) {
     self.panel.layer.shadowOffset = CGSizeMake(0, 6);
     self.panel.layer.shadowPath =
         [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, w, h) cornerRadius:14.0].CGPath;
+
+    // 缩放锚点落在「对着按钮的那条边」上：往下开取顶边，往上开取底边。
+    // 没有箭头之后，「从哪弹出来的」全靠这个动画交代。
+    CGFloat ax = round(MIN(MAX(midX - x, 24.0), w - 24.0));
+    self.panel.layer.anchorPoint = CGPointMake(ax / w, below ? 0.0 : 1.0);
+    self.panel.layer.position = CGPointMake(x + ax, below ? y : y + h);
     [self addSubview:self.panel];
-
-    // 三角尖：夹在面板内，别贴着圆角
-    CGFloat ax = round(MIN(MAX(midX - x, 20.0), w - 20.0));
-    UIBezierPath *tri = [UIBezierPath bezierPath];
-    if (below) {
-        [tri moveToPoint:CGPointMake(ax - kSLMenuArrow, y - 0.5)];
-        [tri addLineToPoint:CGPointMake(ax, y - kSLMenuArrow)];
-        [tri addLineToPoint:CGPointMake(ax + kSLMenuArrow, y - 0.5)];
-    } else {
-        [tri moveToPoint:CGPointMake(ax - kSLMenuArrow, y + h + 0.5)];
-        [tri addLineToPoint:CGPointMake(ax, y + h + kSLMenuArrow)];
-        [tri addLineToPoint:CGPointMake(ax + kSLMenuArrow, y + h + 0.5)];
-    }
-    [tri closePath];
-
-    self.arrow = [CAShapeLayer layer];
-    self.arrow.path = tri.CGPath;
-    self.arrow.fillColor = SLMenuFillColor().CGColor;
-    [self.layer insertSublayer:self.arrow below:self.panel.layer];
 
     SLAddMenuRow *r1 = [[SLAddMenuRow alloc] initWithTitle:@"从相册选择" icon:@"photo.on.rectangle"];
     r1.frame = CGRectMake(4.0, kSLMenuPadY, w - 8.0, kSLMenuRowH);
@@ -264,15 +260,13 @@ static UIColor *SLMenuFillColor(void) {
 
 - (void)sl_animateIn {
     self.panel.alpha = 0.0;
-    self.panel.transform = CGAffineTransformMakeScale(0.94, 0.94);
-    self.arrow.opacity = 0.0f;
-    [UIView animateWithDuration:0.18 delay:0
+    self.panel.transform = CGAffineTransformMakeScale(0.92, 0.92);
+    [UIView animateWithDuration:0.20 delay:0
                         options:UIViewAnimationOptionCurveEaseOut
                      animations:^{
         self.panel.alpha = 1.0;
         self.panel.transform = CGAffineTransformIdentity;
     } completion:nil];
-    self.arrow.opacity = 1.0f;
 }
 
 - (void)sl_dismiss {
