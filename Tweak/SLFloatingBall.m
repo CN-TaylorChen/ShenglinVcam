@@ -1402,9 +1402,18 @@ void SLRefreshFloatButton(void) {
         btn = (SLFloatButton *)[w viewWithTag:SLBtnTag];
     }
     SLApplyFloatIcon(btn);
-    // v0.4.40：装填了就亮成蓝的、撤销了回空闲 —— 名字（sl_loadIcon）和颜色一起走，
-    // 否则会出现「名字写原声、球还是蓝的」这种自相矛盾。
-    if (btn) [btn sl_applyState:(SLCamArmed() ? SLFloatStateReady : SLFloatStateIdle)];
+    // 0.2.28：绿球 = 「现在正在替换」，两个条件缺一不可。
+    //
+    // 原来只判 SLCamArmed()（素材就绪 + 帧源 ready），漏了总开关 —— 关掉「启用」但
+    // 素材还留着的时候，球依然是绿的，等于告诉用户「在替换」，其实早就放行了原画面。
+    //
+    // 关掉就退回 Idle：单框、中性色、42% 透明度，跟「没素材」完全一样。
+    // 这两件事对用户的意义本来就是同一个 —— 没在替换，没必要再造第三种颜色。
+    BOOL working = SLCamEnabled() && SLCamArmed();
+    SLFloatState want = working ? SLFloatStateReady : SLFloatStateIdle;
+    // 状态没变就别再调 —— sl_applyState 会重挂一遍动画，窗口轮询每 2 秒走一次这里，
+    // 每次都重挂的话球上的呼吸会一顿一顿的。
+    if (btn && btn.slState != want) [btn sl_applyState:want];
 }
 
 // 球/扇能用的那块区域。

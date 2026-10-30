@@ -1,3 +1,49 @@
+## 0.2.28 —— 关掉「启用」后球退回默认态
+
+### 症状
+
+关掉设置页的「启用」开关，球还是绿的 —— 绿是「正在替换」的信号，关掉了还亮着
+等于在骗人。
+
+### 根因：漏判了总开关
+
+`SLRefreshFloatButton` 只判 `SLCamArmed()`：
+
+```objc
+if (btn) [btn sl_applyState:(SLCamArmed() ? SLFloatStateReady : SLFloatStateIdle)];
+```
+
+而 `SLCamArmed()` 只看素材：
+
+```objc
+return [SLMediaStore currentItem] != nil && [[SLCamFeed shared] isReady];
+```
+
+**它不含总开关。** 关掉「启用」但素材还留着时，这个条件依然成立，球照旧发绿。
+注入层其实早就放行原画面了（`SLCamSetInjecting(SLCamEnabled() && 有素材路径)`），
+只有球的显示没跟上。
+
+### 改法
+
+```objc
+BOOL working = SLCamEnabled() && SLCamArmed();
+SLFloatState want = working ? SLFloatStateReady : SLFloatStateIdle;
+if (btn && btn.slState != want) [btn sl_applyState:want];
+```
+
+关掉之后球直接退回 Idle：**单框、中性色、42% 透明度**，跟「没素材」完全一样。
+这两件事对用户的意义本来就是同一个 —— 没在替换，不需要再为它造第三种颜色。
+
+没有把 `SLCamEnabled()` 塞进 `SLCamArmed()` 本身：那个函数的语义是「素材就绪」，
+注入层拿它当保险（`SLCamInject.m` 三处），混进总开关会让那几处判断变味。
+
+### 顺带加的守卫
+
+`btn.slState != want` 才调 `sl_applyState`。`SLEnsureFloatButton` 的窗口轮询每 2 秒
+走一次刷新，而 `sl_applyState` 会重挂一遍动画 —— 不判的话球上的呼吸会一顿一顿的。
+
+---
+
 ## 0.2.27 —— 贴边时外圈光晕被切掉一条
 
 球拖到屏幕边缘松手吸附之后，靠边那一侧的光晕少了一截，看起来像球被啃掉一块。
