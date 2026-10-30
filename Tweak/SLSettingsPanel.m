@@ -21,7 +21,7 @@
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVersion @"0.2.19"
+#define SLVersion @"0.2.20"
 
 // kSLCamLoopKey / kSLCamMirrorKey 现在由 SLCamCore.m 统一导出（SLCamBridge.h 里 extern），
 // 帧源要读同样的键，不能再各定义一份 static。
@@ -174,7 +174,7 @@ static NSString *SLRotationSummary(void) {
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
     (void)tv;
     if (section == 0) return 2;   // 启用 + 悬浮球图标
-    if (section == 1) return 1;   // 当前素材
+    if (section == 1) return 2;   // 当前素材 + 添加素材
     if (section == 2) return 3;   // 循环 + 镜像 + 旋转
     if (section == 3) return 1;   // 音频
     return 1;                     // 运行日志
@@ -196,6 +196,7 @@ static NSString *SLRotationSummary(void) {
 
 - (NSString *)sl_footerForSection:(NSInteger)section {
     if (section == 0) return @"关掉后胶囊不再展开，长按球仍可进设置。";
+    if (section == 1) return @"新添加的素材会自动选中，不用再进素材页点一次。视频循环播放，图片定格不动。";
     if (section == 2) return @"旋转按顺时针计算，画面会铺满取景框、多出来的部分居中裁掉。";
     if (section == 3) return @"关掉后麦克风会被静音，不会录入环境声。素材没有音轨时同样生效。";
     return nil;
@@ -251,9 +252,17 @@ static NSString *SLRotationSummary(void) {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         }
     } else if (ip.section == 1) {
-        cell.textLabel.text = @"当前素材";
-        cell.detailTextLabel.text = SLCamStatusSummary();
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        if (ip.row == 0) {
+            cell.textLabel.text = @"当前素材";
+            cell.detailTextLabel.text = SLCamStatusSummary();
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        } else {
+            // 添加素材：相册视频 / 相册图片 / 文件导入，收在一个菜单里，
+            // 不并排放三个按钮把整组撑满
+            cell.textLabel.text = @"添加素材";
+            cell.textLabel.textColor = [UIColor systemBlueColor];
+            cell.detailTextLabel.text = @"视频 · 图片 · 文件";
+        }
     } else if (ip.section == 2) {
         if (ip.row == 2) {
             cell.textLabel.text = @"画面旋转";
@@ -287,7 +296,15 @@ static NSString *SLRotationSummary(void) {
     if (ip.section == 0 && ip.row == 1) {
         [self.navigationController pushViewController:[[SLFloatIconController alloc] init] animated:YES];
     } else if (ip.section == 1) {
-        [self.navigationController pushViewController:[[SLMediaListController alloc] init] animated:YES];
+        if (ip.row == 0) {
+            [self.navigationController pushViewController:[[SLMediaListController alloc] init] animated:YES];
+        } else {
+            __weak typeof(self) ws = self;
+            [SLMediaListController presentAddMenuFrom:self completion:^(BOOL added) {
+                (void)added;
+                [ws.tableView reloadData];
+            }];
+        }
     } else if (ip.section == 2 && ip.row == 2) {
         [self sl_pickRotation];
     } else if (ip.section == 4) {

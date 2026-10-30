@@ -134,7 +134,7 @@ static int SLTargetIndexForName(const char *sname, size_t remain) {
 }
 
 static int SLScanImage(const struct mach_header_64 *hdr, const char *imgName,
-                       int *authSkipped, BOOL dryRun) {
+                       int *authSkipped) {
     // ---- 第一遍：找 __TEXT 的 vmaddr、__LINKEDIT、符号表命令 ----
     const struct segment_command_64 *linkedit = NULL;
     const struct symtab_command *symtab = NULL;
@@ -252,8 +252,6 @@ static int SLScanImage(const struct mach_header_64 *hdr, const char *imgName,
                 // 一个 section 里可能有多个我们要的符号，break 会漏掉后面的槽
                 if (!curAddr || curAddr == sTargets[t].replacement) continue;
 
-                // 审计模式：只数、不写。用来回答「这个镜像引用了目标符号，但我们没打补丁」
-                if (dryRun) { hits++; continue; }
 
                 // 先把原函数地址交出去，再改槽 —— 顺序反了会出现
                 // 「已经走我们的实现，但 gOrig 还是 NULL」的窗口
@@ -288,7 +286,6 @@ static int SLScanImage(const struct mach_header_64 *hdr, const char *imgName,
 int SLSymbolHookRescan(void) {
     if (sTargetCount == 0) return 0;
 
-    static int sLogCount = 0;
     int hits = 0;
     int scanned = 0;
     int authSkipped = 0;
@@ -306,60 +303,18 @@ int SLSymbolHookRescan(void) {
         const char *base = slash ? slash + 1 : path;
 
         scanned++;
-        hits += SLScanImage((const struct mach_header_64 *)h, base, &authSkipped, NO);
+        hits += SLScanImage((const struct mach_header_64 *)h, base, &authSkipped);
     }
-    // 每次会话加输出都会补扫一次，别把日志刷满：有命中/有认证槽跳过就必记，
-    // 什么都没有的只记前三次
-    if (hits > 0 || authSkipped > 0 || sLogCount++ < 3) {
+    // 只在「扫过的镜像数变了」或者「有命中」时出声。
+    // 以前是「无命中只记前 3 次」，结果启动那几次把配额吃光，之后补扫全静音 ——
+    // 真正想知道「录制开始时有没有新镜像加载」的时候反而看不到。
+    static int sLastScanned = -1;
+    if (hits > 0 || authSkipped > 0 || scanned != sLastScanned) {
+        sLastScanned = scanned;
         SLLog(@"符号: 扫过 %d 个 App 镜像，命中 %d 处，认证 GOT 跳过 %d 处",
               scanned, hits, authSkipped);
     }
     return hits;
-}
-
-int SLSymbolHookAudit(void) {
-    if (sTargetCount == 0) return 0;
-
-    int others = 0;
-    int systemCount = 0;
-    int found = 0;
-    NSMutableArray<NSString *> *names = [NSMutableArray array];
-    uint32_t n = _dyld_image_count();
-    for (uint32_t i = 0; i < n; i++) {
-        const struct mach_header *h = _dyld_get_image_header(i);
-        if (!h || h->magic != MH_MAGIC_64) continue;
-
-        const char *path = _dyld_get_image_name(i);
-        if (!path) continue;
-        if (strstr(path, ".app/")) continue;   // App 包内的正常扫描已经覆盖
-
-        // 系统库一律不碰。它们在 dyld 共享缓存里，fileoff 与运行时布局对不上，
-        // 算出来的指针槽位置是垃圾 —— 0.2.4 一装就崩就是栽在这儿。
-        // 审计是只读的，但读到垃圾地址去比字符串一样会炸，所以整个排除。
-        if (strstr(path, "/System/") || strstr(path, "/usr/lib/")) { systemCount++; continue; }
-
-        others++;
-        int authSkipped = 0;
-        // dryRun = YES：只数槽、一个字节都不写
-        int hits = SLScanImage((const struct mach_header_64 *)h, path, &authSkipped, YES);
-        if (hits > 0) {
-            found += hits;
-            const char *slash = strrchr(path, '/');
-            NSString *base = @(slash ? slash + 1 : path);
-            if (![names containsObject:base]) [names addObject:base];
-        }
-    }
-
-    NSString *list = @"(无)";
-    if (names.count > 12) {
-        list = [[names subarrayWithRange:NSMakeRange(0, 12)] componentsJoinedByString:@", "];
-        list = [list stringByAppendingFormat:@" … 另 %lu 个", (unsigned long)(names.count - 12)];
-    } else if (names.count) {
-        list = [names componentsJoinedByString:@", "];
-    }
-    SLLog(@"审计: 非 App 包内镜像 %d 个（系统 %d 个已跳过）· 其中 %d 处引用目标符号但没打补丁 → %@",
-          others, systemCount, found, list);
-    return found;
 }
 
 #pragma mark - 后加载镜像补扫
@@ -381,9 +336,21 @@ static void SLCamImageAdded(const struct mach_header *mh, intptr_t slide) {
     });
     if (!q) return;
 
+    // 去抖：`_dyld_register_func_for_add_image` 注册的那一刻，dyld 会把**当前已加载
+    // 的每一个镜像**都回调一遍。一个 QQ 进程实测 1000 多个，每个都排一次全量重扫
+    // 等于启动瞬间白烧上千次扫描，还把日志刷满。
+    //
+    // 这里用「已排队」标志把它们合成一次：第一个进来的排一个 0.25s 后的任务，
+    // 后面几百个进来看到标志就直接返回。标志只在 q 上读写，串行队列天然安全。
+    static BOOL scheduled = NO;
     dispatch_async(q, ^{
-        int hits = SLSymbolHookRescan();
-        if (hits > 0) SLLog(@"符号: 新镜像补扫命中 %d 处", hits);
+        if (scheduled) return;
+        scheduled = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), q, ^{
+            scheduled = NO;
+            int hits = SLSymbolHookRescan();
+            if (hits > 0) SLLog(@"符号: 新镜像补扫命中 %d 处", hits);
+        });
     });
 }
 

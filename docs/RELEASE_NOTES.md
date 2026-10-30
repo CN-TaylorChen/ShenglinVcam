@@ -1,3 +1,88 @@
+## 0.2.20 —— 图片素材 / 内容去重 / 文件导入 / 缩略图 · 日志回归干净
+
+### 一、素材库支持图片
+
+以前素材库只认 `mp4 / mov / m4v`，现在 PNG / JPG / HEIC / WebP / BMP / TIFF 也能进。
+
+图片的处理方式和视频**不是两套**：解码线程读到图片时，把图解一次、按宿主当前要的
+像素格式和尺寸渲成一张 `CVPixelBuffer`，塞进 `_latestVideo` —— 之后和视频帧走同一条路。
+所以下面这些一行代码都没改，图片自动就有：
+
+- 预览出帧（`copyFrameForPixelFormat:size:`）
+- 拍照（`copyOrientedFrameForPixelFormat:` / `renderIntoPixelBuffer:`）
+- 旋转 / 镜像（下游每帧按设置实时做）
+- 抖音的 `AVCapturePhoto.pixelBuffer` 原地改写
+
+两个实现细节：
+
+**竖拍照片会躺着**。`CIImage` 读文件时保留 EXIF 方向但不套用，得自己补：
+读 `kCGImagePropertyOrientation`，2~8 就 `imageByApplyingOrientation:`。不补的话
+手机拍的竖图进画面会横过来。
+
+**不会每帧重算**。静态图按宿主当前的 `格式:宽x高` 渲一次就缓存住（`_stillKey` 记着
+是按哪个目标渲的），宿主换分辨率才重渲。不这么做的话每帧都要做一次 CI 缩放，
+30fps 下等于白烧一个核。
+
+### 二、导入按内容去重
+
+同一份文件加两次，以前会变成两条（文件名是时间戳，天然不重名）。现在导入前先算
+**SHA-256**，跟库里已有的比：
+
+- 命中 → 不复制，直接切到已有的那条，提示「这份素材已经在库里」
+- 没命中 → 正常导入
+
+指纹存在 `media/.hashes.plist`（隐藏名 + plist 后缀，`allItems` 的扩展名过滤看不到它）。
+0.2.20 之前导入的素材没有指纹记录，第一次导入时补算一次，之后走缓存。
+
+分块读（1MB 一块）算哈希，4K 素材动辄上百 MB，一次读进内存会直接吃掉几百 MB。
+
+### 三、列表最新在上 + 导入后自动选中
+
+`allItems` 原来按文件名升序 —— 文件名就是时间戳，等于**最早的排最上面**。
+改成按修改时间降序。同时删掉 `importFileAtURL:` 里那句 `if (![self currentItem])`：
+以前只有库里空着才自动选中，加第二个素材还得再点一次；现在每次导入都自动选中。
+
+### 四、文件管理导入
+
+`UIDocumentPickerViewController`，类型放开到 `UTType.movie` + `UTType.image`，
+`asCopy:YES` —— 系统先拷到我们沙盒的临时目录，不用处理 security scoped 权限，
+也不碰用户的原文件。
+
+添加入口收成一个菜单（相册视频 / 相册图片 / 文件导入），设置页和素材页共用
+`+[SLMediaListController presentAddMenuFrom:completion:]`。三个按钮并排会把整组撑满，
+所以收进菜单里。
+
+### 五、缩略图
+
+每行左边 40pt 圆角缩略图：图片用 `CGImageSourceCreateThumbnailAtIndex`（顺带把 EXIF
+方向摆正），视频用 `AVAssetImageGenerator` 抽第 0 帧（`appliesPreferredTrackTransform`）。
+
+异步生成跑在一条**串行**队列上 —— 并发抽帧会跟宿主自己的解码抢 IO。结果进 `NSCache`
+（上限 64 张，一张约 70KB）。异步回来时靠 `cell.boundFile` 判断这一格是不是已经滚走、
+绑到别的素材上了，避免图错位。
+
+### 六、日志回到干净状态
+
+0.2.19 那批探针已经结案（QQ 录制的麦克风不经过任何客户端可见的音频 API），全删：
+
+- 6 个录制探针（`AVAudioRecorder` 三个变体、`AVAudioEngine`、`AVAudioSinkNode`、音频会话）
+- `SLSymbolHookAudit()` 只读审计
+- `SLScanImage` 的 `dryRun` 参数
+
+**补扫的启动洪水也修了**。`_dyld_register_func_for_add_image` 注册那一刻，dyld 会把
+当前已加载的**每一个**镜像都回调一遍 —— 一个 QQ 进程实测 1047 个，每个都排一次全量
+重扫，启动瞬间白烧上千次扫描，还把日志配额吃光（0.2.19 的日志里，17:20:33 之后
+所有补扫都是静音的，就是这个原因）。
+
+现在加了个「已排队」标志：第一个进来的排一个 0.25s 后的任务，后面几百个直接返回。
+标志只在后台串行队列上读写，不需要额外加锁。
+
+日志配额也换了判据：从「无命中只记前 3 次」改成「**扫过的镜像数变了**才记」。
+这样启动只出一行，之后每次有新 framework 加载再出一行 —— 既安静，又不会漏掉
+「录制开始时到底有没有新镜像」这个关键信息。
+
+---
+
 ## 0.2.19 —— 查 QQ 录制原声：自动补扫 + 只读审计 + 第二批探针
 
 ### 一、先把 0.2.18 的结论钉住

@@ -56,7 +56,8 @@ NSString *SLCamStatusSummary(void) {
     SLMediaItem *cur = [SLMediaStore currentItem];
     if (all.count == 0) return @"未导入";
     if (!cur) return [NSString stringWithFormat:@"%lu 个 · 未选", (unsigned long)all.count];
-    return [NSString stringWithFormat:@"%lu 个 · %@", (unsigned long)all.count, cur.displayName];
+    return [NSString stringWithFormat:@"%lu 个 · %@%@", (unsigned long)all.count,
+            cur.displayName, cur.isImage ? @"（图片）" : @""];
 }
 
 void SLCamHandleArrowTap(UIView *anchor) {

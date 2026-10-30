@@ -13,6 +13,7 @@
 #import "SLLog.h"
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
+#import <ImageIO/ImageIO.h>
 #import <unistd.h>
 
 // 音频水位（单位：秒）。
@@ -74,9 +75,18 @@
     CIContext *_ciContext;
     NSUInteger _generation;
     BOOL _running;
+
+    // ---- 图片素材（0.2.20）----
+    // 图片没有「下一帧」，解一次就够。解完塞进 _latestVideo，
+    // 下游三条出图路径（预览 / 拍照 / 抖音 pixelBuffer）读的都是它，一行都不用改。
+    BOOL _isImage;
+    BOOL _stillLoaded;
+    NSString *_stillKey;                 // 这张静态图是按哪个 "格式:宽x高" 渲染的
 }
 
 - (void)sl_restart;
++ (BOOL)sl_isImagePath:(NSString *)p;
+- (void)sl_loadStillImage;
 - (void)sl_decodeLoopWithGeneration:(NSUInteger)gen;
 - (void)sl_buildReaderForKey:(NSString *)key;
 - (BOOL)sl_pumpAudio;
@@ -127,9 +137,20 @@
     [_lock lock];
     _sourcePath = p;
     _naturalSize = CGSizeZero;
+    _isImage = [SLCamFeed sl_isImagePath:p];
+    _stillLoaded = NO;
     [_lock unlock];
     [self sl_restart];
-    SLLog(@"feed source -> %@", p.lastPathComponent ?: @"(nil)");
+    SLLog(@"feed source -> %@%@", p.lastPathComponent ?: @"(nil)",
+          [SLCamFeed sl_isImagePath:p] ? @"（图片）" : @"");
+}
+
+/// 按扩展名判断是不是图片素材
++ (BOOL)sl_isImagePath:(NSString *)p {
+    if (!p.length) return NO;
+    NSString *e = p.pathExtension.lowercaseString;
+    return [@[@"png", @"jpg", @"jpeg", @"heic", @"heif", @"webp", @"bmp", @"tif", @"tiff"]
+            containsObject:e];
 }
 
 - (CGSize)frameSize {
@@ -161,6 +182,8 @@
     gen = ++_generation;
     _reconfigRequested = YES;
     _pipelineKey = nil;
+    _stillLoaded = NO;
+    _stillKey = nil;
     if (_latestVideo) { CVPixelBufferRelease(_latestVideo); _latestVideo = NULL; }
     [_audioPCM setLength:0];
     _audioReadCursor = 0;
@@ -179,6 +202,102 @@
     [self sl_restart];
 }
 
+#pragma mark - 图片素材
+
+// 把一张图片变成一帧 CVPixelBuffer，塞进 _latestVideo。
+//
+// 只做一次。之后所有出图路径（预览的 copyFrameForPixelFormat:、拍照的
+// copyOrientedFrameForPixelFormat:、抖音的 renderIntoPixelBuffer:）读的都是
+// 这同一个 buffer，缩放 / 旋转 / 镜像全由它们原有的逻辑处理，这里不用重复实现。
+- (void)sl_loadStillImage {
+    NSString *path = nil;
+    NSString *key = nil;
+    NSUInteger gen = 0;
+    [_lock lock];
+    path = _sourcePath;
+    key = _pipelineKey;
+    gen = _generation;
+    [_lock unlock];
+    if (!path.length) return;
+
+    CIImage *img = [CIImage imageWithContentsOfURL:[NSURL fileURLWithPath:path] options:nil];
+    if (!img) {
+        SLLog(@"feed 图片解码失败 %@", path.lastPathComponent);
+        return;
+    }
+
+    // 竖着拍的照片像素本身是躺的，靠 EXIF 方向摆正。
+    // 不套这一下，选一张手机拍的竖图进去，画面会横过来。
+    NSNumber *ori = nil;
+    @try {
+        ori = img.properties[(NSString *)kCGImagePropertyOrientation];
+    } @catch (NSException *e) { }
+    NSInteger o = ori.integerValue;
+    if (o >= 2 && o <= 8) img = [img imageByApplyingOrientation:(int)o];
+
+    CGRect ext = img.extent;
+    if (ext.size.width < 1 || ext.size.height < 1) return;
+
+    // 目标尺寸：宿主已经告诉我们格式就按它来（这样 copyFrameForPixelFormat:
+    // 能走零转换直出），还没告诉就按原图（长边封顶 2048）。
+    OSType pf = kCVPixelFormatType_32BGRA;
+    size_t w = 0, h = 0;
+    if (key.length) {
+        NSArray<NSString *> *parts = [key componentsSeparatedByString:@":"];
+        if (parts.count == 2) {
+            OSType kpf = (OSType)[parts[0] unsignedIntValue];
+            NSArray<NSString *> *wh = [parts[1] componentsSeparatedByString:@"x"];
+            if (wh.count == 2 && kpf) {
+                pf = kpf;
+                w = (size_t)[wh[0] integerValue];
+                h = (size_t)[wh[1] integerValue];
+            }
+        }
+    }
+    if (w < 1 || h < 1) {
+        CGFloat cap = 2048.0;
+        CGFloat scale = MIN(1.0, cap / MAX(ext.size.width, ext.size.height));
+        w = (size_t)lround(ext.size.width * scale);
+        h = (size_t)lround(ext.size.height * scale);
+    }
+    if (w < 1 || h < 1) return;
+
+    // 缩放交给公共那套「铺满 + 居中裁切」，跟视频走完全一样的数学；
+    // 旋转 / 镜像**不在这里做** —— 那是每帧按设置实时变的，由下游负责。
+    CIImage *scaled = [self sl_image:img toWidth:w height:h mirror:NO rotation:0];
+    if (!scaled) return;
+
+    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+    CVPixelBufferRef pb = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, pf,
+                            (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess) {
+        return;
+    }
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    [_ciContext render:scaled toCVPixelBuffer:pb
+                bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h) colorSpace:cs];
+    CGColorSpaceRelease(cs);
+
+    BOOL stale = NO;
+    [_lock lock];
+    if (gen != _generation) {
+        stale = YES;
+    } else {
+        CVPixelBufferRef old = _latestVideo;
+        _latestVideo = pb;
+        _stillLoaded = YES;
+        _stillKey = [key copy];
+        _naturalSize = CGSizeMake((CGFloat)w, (CGFloat)h);
+        if (old) CVPixelBufferRelease(old);
+    }
+    [_lock unlock];
+
+    if (stale) { CVPixelBufferRelease(pb); return; }
+    SLLog(@"feed 管线就绪 图片 %zux%zu（原始 %.0fx%.0f）",
+          w, h, ext.size.width, ext.size.height);
+}
+
 #pragma mark - 解码线程
 
 - (void)sl_decodeLoopWithGeneration:(NSUInteger)gen {
@@ -195,8 +314,28 @@
             _reconfigRequested = NO;
             NSString *key = _pipelineKey;
             BOOL loop = _loopEnabled;
+            BOOL isImage = _isImage;
             [_lock unlock];
             if (!alive) break;
+
+            // ---- 图片素材：解一次就够，之后一直挂着同一帧 ----
+            // 不建 reader（图片没有视频轨，建了也是空的），也不节流到帧率 ——
+            // 直接睡到下一轮，等 generation 变了自然退出。
+            if (isImage) {
+                NSString *skey;
+                BOOL loaded;
+                [_lock lock];
+                loaded = _stillLoaded;
+                skey = _stillKey;
+                [_lock unlock];
+                // 宿主换了分辨率 / 像素格式 → 这张图得按新目标重渲一次，
+                // 否则 copyFrameForPixelFormat: 每帧都要现场做一次 CI 缩放，
+                // 30fps 下等于白烧一整个核。
+                BOOL same = (skey == nil && key == nil) || [skey isEqualToString:key];
+                if (!loaded || !same) [self sl_loadStillImage];
+                usleep(200 * 1000);
+                continue;
+            }
 
             if (reconfig || !_reader) {
                 [self sl_buildReaderForKey:key];

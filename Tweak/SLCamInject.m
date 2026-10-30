@@ -610,80 +610,6 @@ static void SLCamMovieStartProbe(id self, SEL _cmd, NSURL *url, id delegate) {
     if (gSLMovieStartOrig) gSLMovieStartOrig(self, _cmd, url, delegate);
 }
 
-// ---- 0.2.19：录制链路第二批探针 ----
-//
-// 第一批（installTapOnBus / record / movie）在 QQ 上全部落空，说明它走的是别的口子。
-// 这批同样只打日志、不改数据，目的是把范围一次锁死：
-//   · AVAudioRecorder 还有三个 record 变体，之前只挂了无参的 -record；
-//   · AVAudioEngine 用 AVAudioSinkNode 取 PCM 时**不会**调 installTapOnBus；
-//   · 音频会话的 category 变化本身就是「录制开始 / 结束」的时间戳。
-static BOOL (*gSLRecorderDurOrig)(id, SEL, double);
-static BOOL (*gSLRecorderAtOrig)(id, SEL, double);
-static BOOL (*gSLRecorderAtDurOrig)(id, SEL, double, double);
-static BOOL (*gSLEngineStartOrig)(id, SEL, id *);
-static id   (*gSLSinkInitOrig)(id, SEL, id);
-static BOOL (*gSLSessionCatOrig)(id, SEL, id, id, NSUInteger, id *);
-
-static BOOL SLCamRecorderDurProbe(id self, SEL _cmd, double dur) {
-    static BOOL logged = NO;
-    if (!logged) {
-        logged = YES;
-        SLLog(@"探测: 命中 AVAudioRecorder recordForDuration:（%.1fs）· 录制走写文件路径", dur);
-    }
-    return gSLRecorderDurOrig ? gSLRecorderDurOrig(self, _cmd, dur) : NO;
-}
-
-static BOOL SLCamRecorderAtProbe(id self, SEL _cmd, double at) {
-    static BOOL logged = NO;
-    if (!logged) {
-        logged = YES;
-        SLLog(@"探测: 命中 AVAudioRecorder recordAtTime:（%.2f）", at);
-    }
-    return gSLRecorderAtOrig ? gSLRecorderAtOrig(self, _cmd, at) : NO;
-}
-
-static BOOL SLCamRecorderAtDurProbe(id self, SEL _cmd, double at, double dur) {
-    static BOOL logged = NO;
-    if (!logged) {
-        logged = YES;
-        SLLog(@"探测: 命中 AVAudioRecorder recordAtTime:forDuration:（%.1fs）", dur);
-    }
-    return gSLRecorderAtDurOrig ? gSLRecorderAtDurOrig(self, _cmd, at, dur) : NO;
-}
-
-static BOOL SLCamEngineStartProbe(id self, SEL _cmd, id *err) {
-    static BOOL logged = NO;
-    if (!logged) {
-        logged = YES;
-        SLLog(@"探测: 宿主启动了 AVAudioEngine —— 麦克风在 AVFAudio 内部渲染，"
-              @"我们挂在 App 指针槽上的 AudioUnitRender 够不着");
-    }
-    return gSLEngineStartOrig ? gSLEngineStartOrig(self, _cmd, err) : NO;
-}
-
-static id SLCamSinkNodeInitProbe(id self, SEL _cmd, id block) {
-    static BOOL logged = NO;
-    if (!logged) {
-        logged = YES;
-        SLLog(@"探测: 宿主用 AVAudioSinkNode 取 PCM —— 这是可以接管的口子");
-    }
-    return gSLSinkInitOrig ? gSLSinkInitOrig(self, _cmd, block) : nil;
-}
-
-static BOOL SLCamSessionCategoryProbe(id self, SEL _cmd, id category, id mode,
-                                      NSUInteger options, id *err) {
-    // 这条每次变化都打：category 切换就是「开始录音 / 结束录音」的时间戳，
-    // 跟心跳那行对起来看，能直接看出录制从哪一秒开始。
-    static NSString *last = nil;
-    NSString *now = [NSString stringWithFormat:@"%@/%@/%lu",
-                     category ?: @"(nil)", mode ?: @"(nil)", (unsigned long)options];
-    if (![now isEqualToString:last]) {
-        last = [now copy];
-        SLLog(@"探测: 音频会话 → %@", now);
-    }
-    return gSLSessionCatOrig ? gSLSessionCatOrig(self, _cmd, category, mode, options, err) : NO;
-}
-
 // AVFAudio 是 iOS 14 起独立出来的框架，宿主不一定会主动加载。
 // objc_getClass 拿不到就 dlopen 一次再取。
 static Class SLCamLoadClass(const char *name, const char *framework) {
@@ -713,33 +639,13 @@ static void SLCamInstallRecordingProbes(void) {
 
     Class rec = SLCamLoadClass("AVAudioRecorder", avf);
     SLCamHookSel(rec, @selector(record), (IMP)SLCamRecorderProbe, (IMP *)&gSLRecorderOrig);
-    // 另外三个 record 变体：只挂无参的 -record 会漏掉「带时长」的写法
-    SLCamHookSel(rec, NSSelectorFromString(@"recordForDuration:"),
-                 (IMP)SLCamRecorderDurProbe, (IMP *)&gSLRecorderDurOrig);
-    SLCamHookSel(rec, NSSelectorFromString(@"recordAtTime:"),
-                 (IMP)SLCamRecorderAtProbe, (IMP *)&gSLRecorderAtOrig);
-    SLCamHookSel(rec, NSSelectorFromString(@"recordAtTime:forDuration:"),
-                 (IMP)SLCamRecorderAtDurProbe, (IMP *)&gSLRecorderAtDurOrig);
 
     Class movie = objc_getClass("AVCaptureMovieFileOutput");
     SLCamHookSel(movie, NSSelectorFromString(@"startRecordingToOutputFileURL:recordingDelegate:"),
                  (IMP)SLCamMovieStartProbe, (IMP *)&gSLMovieStartOrig);
 
-    Class engine = SLCamLoadClass("AVAudioEngine", avf);
-    SLCamHookSel(engine, NSSelectorFromString(@"startAndReturnError:"),
-                 (IMP)SLCamEngineStartProbe, (IMP *)&gSLEngineStartOrig);
-
-    Class sink = SLCamLoadClass("AVAudioSinkNode", avf);
-    SLCamHookSel(sink, NSSelectorFromString(@"initWithReceiverBlock:"),
-                 (IMP)SLCamSinkNodeInitProbe, (IMP *)&gSLSinkInitOrig);
-
-    Class session = SLCamLoadClass("AVAudioSession", avf);
-    SLCamHookSel(session, NSSelectorFromString(@"setCategory:mode:options:error:"),
-                 (IMP)SLCamSessionCategoryProbe, (IMP *)&gSLSessionCatOrig);
-
-    SLLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d engine=%d sink=%d session=%d",
-          inputNode != nil, rec != nil, movie != nil,
-          engine != nil, sink != nil, session != nil);
+    SLLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d",
+          inputNode != nil, rec != nil, movie != nil);
 }
 
 #pragma mark - 拍照接管（0.2.15）
