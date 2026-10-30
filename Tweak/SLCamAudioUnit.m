@@ -25,7 +25,6 @@ static SLAudioQueueNewInputFn gSLAQOrig = NULL;
 
 static BOOL gSLHooked = NO;
 static BOOL gSLRegistered = NO;
-static BOOL gSLReplacedLogged = NO;
 static BOOL gSLAQProbeLogged = NO;
 static int  gSLReplaceCount = 0;
 
@@ -42,6 +41,7 @@ static BOOL sLoggedYieldAVCap = NO;
 static BOOL sLoggedCacheFull = NO;
 static BOOL sLoggedNoASBD = NO;
 static BOOL sLoggedNotPCM = NO;
+static BOOL sLoggedPassThrough = NO;
 static int  sAddOutputLogs = 0;
 
 #pragma mark - 每个 AudioUnit 的属性缓存
@@ -64,11 +64,15 @@ typedef struct {
     int  attempts;             // ASBD 失败次数
     int  calls;                // 这条缓存被命中的次数（用于周期性补试）
     BOOL logged;               // 「unit 就绪」这行只打一次
+    BOOL replacedLogged;       // 「已接管」按 unit 各打一次，不是全局只打一次
     AudioStreamBasicDescription asbd;
 } SLUnitCache;
 
 #define SL_UNIT_CACHE 8
 #define SL_ASBD_MAX_TRIES 200
+// 格式重读间隔。10ms 一包，500 次约 5 秒 —— 切到拍摄页之后几秒内就能看到变化，
+// 又不至于每包都去查属性（AudioUnitGetProperty 内部是加锁的）。
+#define SL_ASBD_RECHECK_EVERY 500
 
 static SLUnitCache sUnitCache[SL_UNIT_CACHE];
 static int sUnitCacheCount = 0;
@@ -91,6 +95,45 @@ static void SLTryASBD(SLUnitCache *c) {
     } else {
         c->attempts++;
     }
+}
+
+/// 逐字段比较。不用 memcmp 是因为 ASBD 里有 `mReserved` 这种保留字段，
+/// 万一系统没清零，memcmp 会一直判「变了」，导致转换器被反复重建、声音一顿一顿。
+static BOOL SLASBDEqual(const AudioStreamBasicDescription *a, const AudioStreamBasicDescription *b) {
+    return a->mSampleRate == b->mSampleRate
+        && a->mFormatID == b->mFormatID
+        && a->mFormatFlags == b->mFormatFlags
+        && a->mBytesPerPacket == b->mBytesPerPacket
+        && a->mFramesPerPacket == b->mFramesPerPacket
+        && a->mBytesPerFrame == b->mBytesPerFrame
+        && a->mChannelsPerFrame == b->mChannelsPerFrame
+        && a->mBitsPerChannel == b->mBitsPerChannel;
+}
+
+/// 周期性重读一次 StreamFormat，格式变了就更新。
+///
+/// 为什么需要：0.2.13 之前 `hasASBD` 是一票否决 —— 读到就再也不看了。可宿主
+/// 会复用同一个 AudioUnit 换场景：QQ 视频通话是 16000Hz / 1ch / 4B，切到拍摄页
+/// 录制往往变成 44100Hz / 2ch。格式变了我们还在按旧格式要 PCM，而
+/// `pcm.length == mDataByteSize` 依然成立（按字节数申请的），memcpy 照做、
+/// 不报错、不打日志，听感就是「声音又慢又低」。这条日志就是为了把它暴露出来。
+static void SLRefreshASBD(SLUnitCache *c) {
+    if (!c->hasASBD) { SLTryASBD(c); return; }
+    if (c->calls % SL_ASBD_RECHECK_EVERY != 0) return;
+
+    AudioStreamBasicDescription a;
+    memset(&a, 0, sizeof(a));
+    UInt32 sz = sizeof(a);
+    OSStatus st = AudioUnitGetProperty(c->unit, kAudioUnitProperty_StreamFormat,
+                                       kAudioUnitScope_Output, c->bus, &a, &sz);
+    if (st != noErr || a.mSampleRate <= 0 || a.mChannelsPerFrame <= 0 || a.mBytesPerFrame <= 0) return;
+    if (SLASBDEqual(&a, &c->asbd)) return;
+
+    SLLog(@"音频: unit 格式变化 bus=%u %.0fHz %uch %uB/帧 → %.0fHz %uch %uB/帧",
+          (unsigned)c->bus,
+          c->asbd.mSampleRate, (unsigned)c->asbd.mChannelsPerFrame, (unsigned)c->asbd.mBytesPerFrame,
+          a.mSampleRate, (unsigned)a.mChannelsPerFrame, (unsigned)a.mBytesPerFrame);
+    c->asbd = a;
 }
 
 static SLUnitCache *SLCacheFor(AudioUnit unit, UInt32 bus, BOOL *isNew) {
@@ -200,8 +243,11 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
     // 前 200 次密集重试（约 2 秒），之后每 3000 次补一次 —— 属性查询要加锁，
     // 不能每 10ms 都去问。
     c->calls++;
-    if (!c->hasASBD && (c->attempts < SL_ASBD_MAX_TRIES || (c->calls % 3000) == 0)) {
-        SLTryASBD(c);
+    if (!c->hasASBD) {
+        if (c->attempts < SL_ASBD_MAX_TRIES || (c->calls % 3000) == 0) SLTryASBD(c);
+    } else {
+        // 已经拿到过格式也不能就此锁死：宿主换场景时同一个 unit 的格式会变
+        SLRefreshASBD(c);
     }
 
     // 拿到格式就说明这条 bus 确实在往外送音频数据，可以干活了。
@@ -239,15 +285,29 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
         if (!b->mData || b->mDataByteSize == 0) continue;
 
         NSData *pcm = [feed audioForFormat:&c->asbd numBytes:b->mDataByteSize];
-        if (pcm.length != b->mDataByteSize) continue;   // 素材还没解出音频，放行真麦克风
+        if (pcm.length != b->mDataByteSize) {
+            // 拿不到素材 PCM → 这一包放行真麦克风。
+            // 以前这里是完全静默的 continue，「录制时音频没被替换」在日志上
+            // 一个字都看不到，只能靠猜。现在第一次撞上就留一行痕。
+            if (!sLoggedPassThrough) {
+                sLoggedPassThrough = YES;
+                SLLog(@"音频: 放行真麦克风 —— 素材没给出 PCM（%uB/帧 · %.0fHz %uch %uB/帧）",
+                      (unsigned)b->mDataByteSize, c->asbd.mSampleRate,
+                      (unsigned)c->asbd.mChannelsPerFrame, (unsigned)c->asbd.mBytesPerFrame);
+            }
+            continue;
+        }
 
         memcpy(b->mData, pcm.bytes, pcm.length);
         gSLReplaceCount++;
     }
 
-    if (!gSLReplacedLogged && gSLReplaceCount > 0) {
-        gSLReplacedLogged = YES;
-        SLLog(@"音频: 已接管 AudioUnit 麦克风输入");
+    // 「已接管」改成按 unit 打：全局只打一次的话，第二个 unit（比如通话结束、
+    // 拍摄页新建的那个）接管时日志上是空的，看起来像没接管。
+    if (!c->replacedLogged && gSLReplaceCount > 0) {
+        c->replacedLogged = YES;
+        SLLog(@"音频: 已接管 AudioUnit 麦克风输入（bus=%u %.0fHz %uch）",
+              (unsigned)c->bus, c->asbd.mSampleRate, (unsigned)c->asbd.mChannelsPerFrame);
     }
     return st;
 }

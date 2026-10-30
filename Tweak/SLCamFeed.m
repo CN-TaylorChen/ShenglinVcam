@@ -59,6 +59,7 @@
     BOOL _assetHasAudio;                 // 素材本身有没有音轨：决定「没数据」时是静音还是放行真麦克风
     NSUInteger _audioDropped;            // 累计丢弃字节（诊断用）
     BOOL _audioDropLogged;
+    BOOL _audioPassLogged;               // 「放行真麦克风」只打一次，诊断用
     NSUInteger _audioCalls;              // 消费端被调用次数（水位心跳用）
     CGSize _naturalSize;
 
@@ -666,7 +667,15 @@
     if (configure) {
         [self sl_configureAudioLocked:asbd];
     } else if (!_hasAudioDstASBD) {
-        // 实时线程不建转换器 —— 那是几十毫秒的活，让 primeAudioFormat: 去做
+        // 实时线程不建转换器 —— 那是几十毫秒的活，让 primeAudioFormat: 去做。
+        // 但这条路以前是静默返回 nil 的，而 nil 在三条注入链路里都等于
+        // 「放行真麦克风」。所以「录制时音频没被替换」在日志上完全看不见，
+        // 现在第一次撞上就留一行痕。
+        if (!_audioPassLogged) {
+            _audioPassLogged = YES;
+            SLLog(@"音频: 放行真麦克风 —— 目标格式还没配置（素材 %.0fHz %uch，宿主未登记）",
+                  asbd->mSampleRate, (unsigned)asbd->mChannelsPerFrame);
+        }
         return nil;
     }
 
@@ -731,7 +740,13 @@
 
     if (got == 0) {
         // 素材本来就没音轨 —— 用户预期就是「只换画面、保留原声」，放行真实麦克风
-        if (!hasAudio) return nil;
+        if (!hasAudio) {
+            if (!_audioPassLogged) {
+                _audioPassLogged = YES;
+                SLLog(@"音频: 放行真麦克风 —— 素材没有音轨");
+            }
+            return nil;
+        }
         // 有音轨但还没解出数据 —— 必须输出静音。
         // 返回 nil 会让注入层放行真麦克风，把环境声原样录进去，
         // 通话刚接通那 1 秒最明显。
