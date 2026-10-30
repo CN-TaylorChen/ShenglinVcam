@@ -116,11 +116,18 @@ static void SLCamCopySampleAttachments(CMSampleBufferRef from, CMSampleBufferRef
     CFDictionaryRef atts = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, from,
                                                          kCMAttachmentMode_ShouldPropagate);
     if (!atts) return;
-    OSStatus st = CMSetAttachments(to, atts, kCMAttachmentMode_ShouldPropagate);
-    if (st != noErr && sSLCamSetAttachFailLogged++ == 0) {
-        SLLog(@"注入: 附件回填失败 st=%d（宿主可能取不到内参）", (int)st);
-    }
+
+    // CMSetAttachments 返回 void，失败是静默的 —— 只能写完再读回来确认。
+    // 这一步每个进程只做一次，开销可以忽略。
+    CMSetAttachments(to, atts, kCMAttachmentMode_ShouldPropagate);
     CFRelease(atts);
+
+    if (sSLCamSetAttachFailLogged++ > 0) return;
+    CFDictionaryRef check = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, to,
+                                                          kCMAttachmentMode_ShouldPropagate);
+    CFIndex got = check ? CFDictionaryGetCount(check) : 0;
+    if (got == 0) SLLog(@"注入: 附件回填后仍为空 —— 宿主可能取不到内参");
+    if (check) CFRelease(check);
 }
 
 /// 首次注入时把两边的 key 列表打出来。
