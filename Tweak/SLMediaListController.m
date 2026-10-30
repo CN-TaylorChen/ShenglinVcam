@@ -1,13 +1,13 @@
 //
-//  SLMediaListController.m
+//  SLVMediaListController.m
 //  声临 · 虚拟摄像头 —— 素材列表页
 //
 //  外观沿用项目里那套：玻璃表格 + 胶囊标题 + 胶囊「＋」+ 段尾说明。
-//  只做素材的增删选，不碰解码 / 注入 —— 那部分在 SLCamFeed / SLCamInject。
+//  只做素材的增删选，不碰解码 / 注入 —— 那部分在 SLVCamFeed / SLVCamInject。
 //
 //  0.2.20：
 //    · 每行带缩略图（图片直接缩，视频抽第 0 帧），异步生成 + NSCache
-//    · 导入完自动选中（在 SLMediaStore 里做），列表最新的排最上面
+//    · 导入完自动选中（在 SLVMediaStore 里做），列表最新的排最上面
 //
 //  0.2.22：
 //    · 「＋」不再弹 action sheet，改成锚在按钮下方的小框（点哪儿弹哪儿）
@@ -32,7 +32,7 @@
 // 缩略图按 3x 屏算：40pt 的坑给 132px，够清晰又不占内存
 static const CGFloat kSLThumbPixels = 132.0;
 
-static UIImage *SLMakeThumb(SLMediaItem *it) {
+static UIImage *SLVMakeThumb(SLVMediaItem *it) {
     if (it.isImage) {
         CGImageSourceRef src = CGImageSourceCreateWithURL(
             (__bridge CFURLRef)[NSURL fileURLWithPath:it.path], NULL);
@@ -62,7 +62,7 @@ static UIImage *SLMakeThumb(SLMediaItem *it) {
     return img;
 }
 
-static NSCache<NSString *, UIImage *> *SLThumbCache(void) {
+static NSCache<NSString *, UIImage *> *SLVThumbCache(void) {
     static NSCache *c = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -72,7 +72,7 @@ static NSCache<NSString *, UIImage *> *SLThumbCache(void) {
     return c;
 }
 
-static dispatch_queue_t SLThumbQueue(void) {
+static dispatch_queue_t SLVThumbQueue(void) {
     static dispatch_queue_t q = NULL;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -84,7 +84,7 @@ static dispatch_queue_t SLThumbQueue(void) {
 
 // 导入队列：算 SHA-256 指纹 + 解码体检都是秒级操作，批量导入时不能占主线程。
 // 串行是因为 importItemAtURL: 会读写 media/.hashes.plist，并发就得再加一层锁。
-static dispatch_queue_t SLImportQueue(void) {
+static dispatch_queue_t SLVImportQueue(void) {
     static dispatch_queue_t q = NULL;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -109,7 +109,7 @@ static const CGFloat kSLMenuEdge  = 8.0;    // 离容器边缘至少留这么多
 // ② 尖的位置靠 midX - x 算，菜单被边缘夹过之后就跟按钮对不上了。
 // 系统自己的 UIMenu / 上下文菜单本来就没有箭头 —— 靠位置和弹出动画表达
 // 「从哪儿来的」就够了，不需要画一个几何体去指。
-static UIColor *SLMenuFillColor(void) {
+static UIColor *SLVMenuFillColor(void) {
     return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
         return tc.userInterfaceStyle == UIUserInterfaceStyleDark
             ? [UIColor colorWithWhite:0.20 alpha:0.98]
@@ -117,13 +117,13 @@ static UIColor *SLMenuFillColor(void) {
     }];
 }
 
-@interface SLAddMenuRow : UIControl
+@interface SLVAddMenuRow : UIControl
 @property (nonatomic, strong) UIImageView *iconView;
 @property (nonatomic, strong) UILabel *titleLab;
 - (instancetype)initWithTitle:(NSString *)title icon:(NSString *)icon;
 @end
 
-@implementation SLAddMenuRow
+@implementation SLVAddMenuRow
 
 - (instancetype)initWithTitle:(NSString *)title icon:(NSString *)icon {
     if ((self = [super initWithFrame:CGRectZero])) {
@@ -165,7 +165,7 @@ static UIColor *SLMenuFillColor(void) {
 
 @end
 
-@interface SLAddMenu : UIView
+@interface SLVAddMenu : UIView
 @property (nonatomic, strong) UIControl *backdrop;
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, copy) void (^albumBlock)(void);
@@ -176,17 +176,17 @@ static UIColor *SLMenuFillColor(void) {
              files:(void (^)(void))files;
 @end
 
-@implementation SLAddMenu
+@implementation SLVAddMenu
 
 + (void)showInView:(UIView *)hostView anchor:(CGRect)anchor
              album:(void (^)(void))album files:(void (^)(void))files {
     if (!hostView) return;
     // 连点两下「＋」不要叠两层
     for (UIView *v in hostView.subviews) {
-        if ([v isKindOfClass:[SLAddMenu class]]) return;
+        if ([v isKindOfClass:[SLVAddMenu class]]) return;
     }
 
-    SLAddMenu *m = [[SLAddMenu alloc] initWithFrame:hostView.bounds];
+    SLVAddMenu *m = [[SLVAddMenu alloc] initWithFrame:hostView.bounds];
     m.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     m.albumBlock = album;
     m.filesBlock = files;
@@ -230,7 +230,7 @@ static UIColor *SLMenuFillColor(void) {
     // 而 frame 在 anchorPoint 变了之后会自己变形，写 frame 等于白写。
     self.panel = [[UIView alloc] initWithFrame:CGRectZero];
     self.panel.bounds = CGRectMake(0, 0, w, h);
-    self.panel.backgroundColor = SLMenuFillColor();
+    self.panel.backgroundColor = SLVMenuFillColor();
     self.panel.layer.cornerRadius = 14.0;
     self.panel.layer.cornerCurve = kCACornerCurveContinuous;
     self.panel.layer.shadowColor = [UIColor blackColor].CGColor;
@@ -247,12 +247,12 @@ static UIColor *SLMenuFillColor(void) {
     self.panel.layer.position = CGPointMake(x + ax, below ? y : y + h);
     [self addSubview:self.panel];
 
-    SLAddMenuRow *r1 = [[SLAddMenuRow alloc] initWithTitle:@"从相册选择" icon:@"photo.on.rectangle"];
+    SLVAddMenuRow *r1 = [[SLVAddMenuRow alloc] initWithTitle:@"从相册选择" icon:@"photo.on.rectangle"];
     r1.frame = CGRectMake(4.0, kSLMenuPadY, w - 8.0, kSLMenuRowH);
     [r1 addTarget:self action:@selector(sl_tapAlbum) forControlEvents:UIControlEventTouchUpInside];
     [self.panel addSubview:r1];
 
-    SLAddMenuRow *r2 = [[SLAddMenuRow alloc] initWithTitle:@"从文件导入" icon:@"folder"];
+    SLVAddMenuRow *r2 = [[SLVAddMenuRow alloc] initWithTitle:@"从文件导入" icon:@"folder"];
     r2.frame = CGRectMake(4.0, kSLMenuPadY + kSLMenuRowH, w - 8.0, kSLMenuRowH);
     [r2 addTarget:self action:@selector(sl_tapFiles) forControlEvents:UIControlEventTouchUpInside];
     [self.panel addSubview:r2];
@@ -298,7 +298,7 @@ static UIColor *SLMenuFillColor(void) {
 
 /// 相册和文件两个 picker 的 delegate 都放在这个单例上。
 /// 放控制器里不行：picker 是 present 出来的，控制器在浮窗里随时可能被关掉。
-@interface SLMediaAdder : NSObject <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
+@interface SLVMediaAdder : NSObject <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, copy, nullable) void (^completion)(BOOL added);
 
 // 批量导入：一次选一堆时逐个处理。串行是有意的 ——
@@ -316,12 +316,12 @@ static UIColor *SLMenuFillColor(void) {
              completion:(nullable void (^)(BOOL))completion;
 @end
 
-@implementation SLMediaAdder
+@implementation SLVMediaAdder
 
 + (instancetype)shared {
-    static SLMediaAdder *s = nil;
+    static SLVMediaAdder *s = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [[SLMediaAdder alloc] init]; });
+    dispatch_once(&once, ^{ s = [[SLVMediaAdder alloc] init]; });
     return s;
 }
 
@@ -346,7 +346,7 @@ static UIColor *SLMenuFillColor(void) {
     }
 
     __weak typeof(self) ws = self;
-    [SLAddMenu showInView:menuHost anchor:anchor
+    [SLVAddMenu showInView:menuHost anchor:anchor
                     album:^{ [ws pickPhotosFrom:host]; }
                     files:^{ [ws pickFilesFrom:host]; }];
 }
@@ -407,7 +407,7 @@ static UIColor *SLMenuFillColor(void) {
     NSUInteger total = self.queue.count;
     NSUInteger idx = self.cursor + 1;
     self.cursor++;
-    SLToast(total > 1 ? [NSString stringWithFormat:@"导入中 %lu/%lu",
+    SLVToast(total > 1 ? [NSString stringWithFormat:@"导入中 %lu/%lu",
                          (unsigned long)idx, (unsigned long)total]
                       : @"导入中");
 
@@ -429,10 +429,10 @@ static UIColor *SLMenuFillColor(void) {
     __weak typeof(self) ws = self;
     [p loadFileRepresentationForTypeIdentifier:typeId
                              completionHandler:^(NSURL *url, NSError *err) {
-        SLMediaAdder *ss = ws;
+        SLVMediaAdder *ss = ws;
         if (!ss) return;
         if (!url) {
-            SLLog(@"导入: 相册导出失败 %@", err.localizedDescription ?: @"?");
+            SLVLog(@"导入: 相册导出失败 %@", err.localizedDescription ?: @"?");
             ss.failCount++;
         } else {
             [ss sl_importOne:url];   // 临时文件只在这个回调里有效，必须当场拷
@@ -449,10 +449,10 @@ static UIColor *SLMenuFillColor(void) {
 - (void)sl_importOne:(NSURL *)url {
     NSError *e = nil;
     BOOL dup = NO;
-    SLMediaItem *it = [SLMediaStore importItemAtURL:url error:&e duplicate:&dup];
+    SLVMediaItem *it = [SLVMediaStore importItemAtURL:url error:&e duplicate:&dup];
     if (!it) {
         self.failCount++;
-        SLLog(@"导入: 失败 %@", e.localizedDescription ?: @"?");
+        SLVLog(@"导入: 失败 %@", e.localizedDescription ?: @"?");
         return;
     }
     if (dup) self.dupCount++;
@@ -461,8 +461,8 @@ static UIColor *SLMenuFillColor(void) {
 
 - (void)sl_finish {
     self.queue = nil;
-    [SLThumbCache() removeAllObjects];
-    SLCamReloadAll();
+    [SLVThumbCache() removeAllObjects];
+    SLVCamReloadAll();
 
     NSInteger ok = self.addedCount + self.dupCount;
     NSString *msg;
@@ -473,7 +473,7 @@ static UIColor *SLMenuFillColor(void) {
     } else {
         msg = [NSString stringWithFormat:@"已添加 %ld 个", (long)ok];
     }
-    SLToast(msg);
+    SLVToast(msg);
 
     void (^done)(BOOL) = self.completion;
     self.completion = nil;
@@ -492,14 +492,14 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     self.dupCount = 0;
     self.failCount = 0;
 
-    SLToast(urls.count > 1 ? [NSString stringWithFormat:@"导入中 %lu 个", (unsigned long)urls.count]
+    SLVToast(urls.count > 1 ? [NSString stringWithFormat:@"导入中 %lu 个", (unsigned long)urls.count]
                            : @"导入中");
 
     // asCopy:YES 拿到的已经是沙盒副本，可以慢慢来。
     // 但算指纹 + 体检对 4K 素材是秒级的，一次选五个就会把主线程堵死 —— 挪到后台串行队列。
     __weak typeof(self) ws = self;
-    dispatch_async(SLImportQueue(), ^{
-        SLMediaAdder *ss = ws;
+    dispatch_async(SLVImportQueue(), ^{
+        SLVMediaAdder *ss = ws;
         if (!ss) return;
         for (NSURL *u in urls) [ss sl_importOne:u];
         dispatch_async(dispatch_get_main_queue(), ^{ [ss sl_finish]; });
@@ -514,7 +514,7 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
 
 #pragma mark - 素材行
 
-@interface SLMediaCell : UITableViewCell
+@interface SLVMediaCell : UITableViewCell
 @property (nonatomic, strong) UIImageView *thumb;
 @property (nonatomic, strong) UILabel *nameLab;
 @property (nonatomic, strong) UILabel *kindLab;
@@ -523,7 +523,7 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
 @property (nonatomic, copy) NSString *boundFile;
 @end
 
-@implementation SLMediaCell
+@implementation SLVMediaCell
 
 - (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
     if ((self = [super initWithStyle:style reuseIdentifier:reuseIdentifier])) {
@@ -569,23 +569,23 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     _kindLab.frame = CGRectMake(textX, 30, textW, 14);
 }
 
-- (void)sl_configureWith:(SLMediaItem *)it current:(BOOL)cur {
+- (void)sl_configureWith:(SLVMediaItem *)it current:(BOOL)cur {
     self.boundFile = it.fileName;
     self.nameLab.text = it.displayName;
     self.kindLab.text = it.isImage ? @"图片 · 定格画面" : @"视频 · 循环播放";
     self.kindLab.textColor = it.isImage ? [UIColor systemBlueColor] : [UIColor secondaryLabelColor];
     self.check.hidden = !cur;
 
-    UIImage *cached = [SLThumbCache() objectForKey:it.fileName];
+    UIImage *cached = [SLVThumbCache() objectForKey:it.fileName];
     self.thumb.image = cached;
     if (cached) return;
 
     // 缩略图没现成：先清空，再异步抽。抽不到就留个灰底方块，不显示破图。
     __weak typeof(self) ws = self;
     NSString *name = it.fileName;
-    dispatch_async(SLThumbQueue(), ^{
-        UIImage *img = SLMakeThumb(it);
-        if (img) [SLThumbCache() setObject:img forKey:name];
+    dispatch_async(SLVThumbQueue(), ^{
+        UIImage *img = SLVMakeThumb(it);
+        if (img) [SLVThumbCache() setObject:img forKey:name];
         if (!img) return;
         dispatch_async(dispatch_get_main_queue(), ^{
             // 回来时这一格可能已经滚走、绑到别的素材上了
@@ -598,8 +598,8 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
 
 #pragma mark - 素材页
 
-@interface SLMediaListController ()
-@property (nonatomic, strong) NSArray<SLMediaItem *> *items;
+@interface SLVMediaListController ()
+@property (nonatomic, strong) NSArray<SLVMediaItem *> *items;
 @end
 
 // 素材页和设置页住的是同一个浮窗容器，不能「在浮窗里再叠一个浮窗」——
@@ -611,25 +611,25 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
 //
 // 用 C 函数而不是方法，是因为素材页在 dismiss 之后立刻就被释放了，
 // 捕获 self 的 weak 指针到这里已经是 nil，设置页就永远打不开。
-static void SLPresentSettingsWhenFree(UIViewController *host, NSInteger attempt) {
+static void SLVPresentSettingsWhenFree(UIViewController *host, NSInteger attempt) {
     if (!host) return;
     if (host.presentedViewController == nil) {
-        [SLFloatPanelController presentSettingsFrom:host];
+        [SLVFloatPanelController presentSettingsFrom:host];
         return;
     }
     if (attempt >= 15) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        SLPresentSettingsWhenFree(host, attempt + 1);
+        SLVPresentSettingsWhenFree(host, attempt + 1);
     });
 }
 
-@implementation SLMediaListController
+@implementation SLVMediaListController
 
 + (void)presentAddMenuFrom:(UIViewController *)host
                     anchor:(UIView *)anchorView
                 completion:(void (^)(BOOL))completion {
-    [[SLMediaAdder shared] presentMenuFrom:host anchor:anchorView completion:completion];
+    [[SLVMediaAdder shared] presentMenuFrom:host anchor:anchorView completion:completion];
 }
 
 - (instancetype)init {
@@ -640,15 +640,15 @@ static void SLPresentSettingsWhenFree(UIViewController *host, NSInteger attempt)
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"素材";
-    self.navigationItem.titleView = SLPillTitleView(@"素材");
-    SLApplyGlassTable(self.tableView);
+    self.navigationItem.titleView = SLVPillTitleView(@"素材");
+    SLVApplyGlassTable(self.tableView);
     self.navigationItem.rightBarButtonItems = @[
-        SLPillBarItem(@"完成", self, @selector(sl_done)),
-        SLPillIconBarItem(@"plus", nil, self, @selector(sl_pick)),
+        SLVPillBarItem(@"完成", self, @selector(sl_done)),
+        SLVPillIconBarItem(@"plus", nil, self, @selector(sl_pick)),
     ];
     // 胶囊移除后，设置面板的入口挪到这里：单击球 → 素材页 → 左上角齿轮 → 设置。
     // 放左边是因为右边「完成 / ＋」两个位置都占满了，而「完成」必须留在最右。
-    self.navigationItem.leftBarButtonItem = SLPillIconBarItem(@"gearshape", @"设置", self, @selector(sl_openSettings));
+    self.navigationItem.leftBarButtonItem = SLVPillIconBarItem(@"gearshape", @"设置", self, @selector(sl_openSettings));
     self.tableView.estimatedSectionFooterHeight = 28;
     self.tableView.estimatedSectionHeaderHeight = 26;
     self.tableView.rowHeight = 56;
@@ -661,29 +661,29 @@ static void SLPresentSettingsWhenFree(UIViewController *host, NSInteger attempt)
 }
 
 - (void)sl_reload {
-    self.items = [SLMediaStore allItems];
+    self.items = [SLVMediaStore allItems];
     [self.tableView reloadData];
 }
 
 - (void)sl_done {
-    SLCloseHostingPanel(self);
+    SLVCloseHostingPanel(self);
 }
 
 // 胶囊移除后，设置面板的入口挪到这里：单击球 → 素材页 → 左上角齿轮 → 设置。
 - (void)sl_openSettings {
     UIViewController *host = self.presentingViewController;
     if (!host) return;
-    [SLFloatPanelController dismissSettings];
-    SLPresentSettingsWhenFree(host, 0);
+    [SLVFloatPanelController dismissSettings];
+    SLVPresentSettingsWhenFree(host, 0);
 }
 
 - (void)sl_pick {
     // 小框要贴着「＋」展开。锚点是导航栏里那颗胶囊的自定义视图，
-    // 菜单本身由 SLMediaAdder 挂到导航控制器的视图上（表格会滚，挂表格上会跟着跑）。
+    // 菜单本身由 SLVMediaAdder 挂到导航控制器的视图上（表格会滚，挂表格上会跟着跑）。
     UIView *anchor = self.navigationItem.rightBarButtonItems.lastObject.customView;
 
     __weak typeof(self) ws = self;
-    [SLMediaListController presentAddMenuFrom:self anchor:anchor completion:^(BOOL added) {
+    [SLVMediaListController presentAddMenuFrom:self anchor:anchor completion:^(BOOL added) {
         (void)added;
         [ws sl_reload];
     }];
@@ -717,16 +717,16 @@ static void SLPresentSettingsWhenFree(UIViewController *host, NSInteger attempt)
 
 - (void)tableView:(UITableView *)tv willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)ip {
     (void)tv; (void)ip;
-    cell.backgroundColor = SLGlassCellColor();
+    cell.backgroundColor = SLVGlassCellColor();
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     static NSString *rid = @"media";
-    SLMediaCell *cell = [tv dequeueReusableCellWithIdentifier:rid];
-    if (!cell) cell = [[SLMediaCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:rid];
+    SLVMediaCell *cell = [tv dequeueReusableCellWithIdentifier:rid];
+    if (!cell) cell = [[SLVMediaCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:rid];
 
-    SLMediaItem *it = self.items[ip.row];
-    BOOL cur = [[SLMediaStore currentItem].fileName isEqualToString:it.fileName];
+    SLVMediaItem *it = self.items[ip.row];
+    BOOL cur = [[SLVMediaStore currentItem].fileName isEqualToString:it.fileName];
     [cell sl_configureWith:it current:cur];
     return cell;
 }
@@ -734,34 +734,34 @@ static void SLPresentSettingsWhenFree(UIViewController *host, NSInteger attempt)
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (ip.row >= (NSInteger)self.items.count) return;
-    SLMediaItem *it = self.items[ip.row];
+    SLVMediaItem *it = self.items[ip.row];
     // 再点一次已经打勾的那行 = 取消替换。
-    // SLMediaStore 本来就支持传 nil 清空（内部走 removeObjectForKey），
+    // SLVMediaStore 本来就支持传 nil 清空（内部走 removeObjectForKey），
     // 只是这里从来没给过 nil —— 所以「勾上了就取消不掉」。
-    BOOL cur = [[SLMediaStore currentItem].fileName isEqualToString:it.fileName];
+    BOOL cur = [[SLVMediaStore currentItem].fileName isEqualToString:it.fileName];
     if (cur) {
-        [SLMediaStore setCurrentItem:nil];
-        SLToast(@"已取消");
+        [SLVMediaStore setCurrentItem:nil];
+        SLVToast(@"已取消");
     } else {
-        [SLMediaStore setCurrentItem:it];
-        SLToast(@"已切换");
+        [SLVMediaStore setCurrentItem:it];
+        SLVToast(@"已切换");
     }
     [tv reloadData];
-    SLCamReloadAll();
+    SLVCamReloadAll();
 }
 
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tv
 trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
     if (ip.row >= (NSInteger)self.items.count) return nil;
-    SLMediaItem *it = self.items[ip.row];
+    SLVMediaItem *it = self.items[ip.row];
     __weak typeof(self) ws = self;
     UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
                                                                      title:@"删除"
                                                                    handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
-        [SLMediaStore removeItem:it];
-        [SLThumbCache() removeObjectForKey:it.fileName];
+        [SLVMediaStore removeItem:it];
+        [SLVThumbCache() removeObjectForKey:it.fileName];
         [ws sl_reload];
-        SLCamReloadAll();
+        SLVCamReloadAll();
         done(YES);
     }];
     return [UISwipeActionsConfiguration configurationWithActions:@[del]];

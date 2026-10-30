@@ -1,5 +1,5 @@
 //
-//  SLMediaPreview.h
+//  SLVMediaPreview.h
 //  声临 · 虚拟摄像头 —— 素材预览
 //
 //  0.2.22：
@@ -17,11 +17,11 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface SLMediaAudioInfo : NSObject
+@interface SLVMediaAudioInfo : NSObject
 
 /// 素材里有没有音轨
 @property (nonatomic, assign) BOOL hasAudio;
-/// 音轨能不能解成 16bit PCM（跟 SLCamFeed 建 reader 的判据一致）
+/// 音轨能不能解成 16bit PCM（跟 SLVCamFeed 建 reader 的判据一致）
 @property (nonatomic, assign) BOOL decodable;
 /// 「AAC」「Opus」「PCM」这类可读名；没有音轨时为空串
 @property (nonatomic, copy) NSString *codec;
@@ -32,13 +32,13 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// 探一次音轨。文件不存在 / 不是素材时返回 nil。
 /// 结果按「文件名 + 修改时间」缓存，设置页反复刷 cell 也不会反复解析。
-SLMediaAudioInfo *_Nullable SLProbeMediaAudio(NSString *_Nullable path);
+SLVMediaAudioInfo *_Nullable SLVProbeMediaAudio(NSString *_Nullable path);
 
 /// 设置页「预览素材」行右侧那一小截字：有声音 / 无声音 / 图片 / 未选素材
-NSString *SLMediaAudioSummary(void);
+NSString *SLVMediaAudioSummary(void);
 
 /// 预览页。推进导航栈（从设置页）或直接当浮窗根页（从悬浮球）都行。
-@interface SLMediaPreviewController : UIViewController
+@interface SLVMediaPreviewController : UIViewController
 @end
 
 NS_ASSUME_NONNULL_END

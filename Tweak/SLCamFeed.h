@@ -1,5 +1,5 @@
 //
-//  SLCamFeed.h
+//  SLVCamFeed.h
 //  声临 · 虚拟摄像头 —— 帧源
 //
 //  职责只有一件：把「一个视频文件」变成「一帧帧符合宿主要求的画面 + 一段段 PCM」。
@@ -17,7 +17,7 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface SLCamFeed : NSObject
+@interface SLVCamFeed : NSObject
 
 + (instancetype)shared;
 

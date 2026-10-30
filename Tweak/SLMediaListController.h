@@ -1,5 +1,5 @@
 //
-//  SLMediaListController.h
+//  SLVMediaListController.h
 //  声临 · 虚拟摄像头 —— 素材列表页（住在玻璃浮窗里）
 //
 
@@ -9,8 +9,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// 底包自带的素材页：导入视频 / 图片、选中、左滑删除。
 /// 业务侧想换一套（比如分成多个文件夹），自己写一个控制器替换
-/// SLFloatPanelController +presentMediaFrom: 里的类即可。
-@interface SLMediaListController : UITableViewController
+/// SLVFloatPanelController +presentMediaFrom: 里的类即可。
+@interface SLVMediaListController : UITableViewController
 
 /// 在 anchorView 下方弹出「添加素材」小框：从相册选择 / 从文件导入。
 ///

@@ -1,5 +1,5 @@
 //
-//  SLCamAudioUnit.h
+//  SLVCamAudioUnit.h
 //  声临 · 虚拟摄像头 —— 麦克风的第二条链路
 //
 //  背景（真机日志得出的结论）：
@@ -25,9 +25,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// 安装 / 补装 AudioUnit 链路。重复调用安全：
 /// 首次注册符号并全量扫描，之后每次调用只做补扫（后加载的 SDK 也能覆盖到）。
-void SLCamInstallAudioUnitHook(void);
+void SLVCamInstallAudioUnitHook(void);
 
 /// 这条链路是否真的接管成功（找到 AudioUnitRender 的符号槽）
-BOOL SLCamAudioUnitHooked(void);
+BOOL SLVCamAudioUnitHooked(void);
 
 NS_ASSUME_NONNULL_END

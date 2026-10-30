@@ -1,5 +1,5 @@
 //
-//  SLCamSymbolHook.m
+//  SLVCamSymbolHook.m
 //  声临 · 虚拟摄像头 —— C 函数 hook（fishhook 精简版）
 //
 //  踩过的坑（0.2.4 一装就闪退的元凶）：
@@ -32,22 +32,22 @@
 #import <string.h>
 #import <unistd.h>
 
-#define SL_MAX_TARGETS 8
+#define SLV_MAX_TARGETS 8
 
 typedef struct {
     const char *name;      // 不带下划线的符号名
     void *replacement;
     void *original;
     void **originalOut;    // 调用方给的传出指针，替换前就写入，避免竞态
-} SLTarget;
+} SLVTarget;
 
-static SLTarget sTargets[SL_MAX_TARGETS];
+static SLVTarget sTargets[SLV_MAX_TARGETS];
 static int sTargetCount = 0;
 
 /// 这块地址是否真的映射过、且可读。
 /// 共享缓存 / 懒加载 / 计算错误都会让指针落在野区，读一下就崩，
 /// 所以每次碰内存之前都先问一遍内核。
-static BOOL SLIsReadable(const void *addr, size_t len) {
+static BOOL SLVIsReadable(const void *addr, size_t len) {
     if (!addr || len == 0) return NO;
     vm_address_t region = (vm_address_t)addr;
     vm_size_t regionSize = 0;
@@ -69,14 +69,14 @@ static BOOL SLIsReadable(const void *addr, size_t len) {
 /// 一段区间是否整段可读。
 /// vm_region 只回答「包含这个地址的那个 region」，区间跨页跨 region 时
 /// 单点查询会漏判，所以首尾各问一次。
-static BOOL SLRangeReadable(const void *addr, size_t len) {
+static BOOL SLVRangeReadable(const void *addr, size_t len) {
     if (!addr || len == 0) return NO;
-    if (!SLIsReadable(addr, 1)) return NO;
-    return SLIsReadable((const uint8_t *)addr + len - 1, 1);
+    if (!SLVIsReadable(addr, 1)) return NO;
+    return SLVIsReadable((const uint8_t *)addr + len - 1, 1);
 }
 
 /// 放开写权限。VM_PROT_COPY 是必须的：iOS 的 COW 页不改它直接写会崩。
-static BOOL SLMakeWritable(void *addr, size_t len) {
+static BOOL SLVMakeWritable(void *addr, size_t len) {
     vm_size_t pageSize = (vm_size_t)getpagesize();
     uintptr_t start = (uintptr_t)addr & ~(uintptr_t)(pageSize - 1);
     uintptr_t end = ((uintptr_t)addr + len + pageSize - 1) & ~(uintptr_t)(pageSize - 1);
@@ -87,7 +87,7 @@ static BOOL SLMakeWritable(void *addr, size_t len) {
 }
 
 /// 这个指针表 section 有多少个槽（已按间接符号表长度裁过）。
-static uint32_t SLSectionSlotCount(const struct section_64 *sect,
+static uint32_t SLVSectionSlotCount(const struct section_64 *sect,
                                    const struct dysymtab_command *dysymtab) {
     if (sect->size < sizeof(void *)) return 0;
     if (sect->reserved1 == 0) return 0;
@@ -101,7 +101,7 @@ static uint32_t SLSectionSlotCount(const struct section_64 *sect,
 
 /// 把间接符号表里的下标翻成符号名（已去掉前导下划线）。
 /// remainOut 给出这条字符串在字符串表里还剩多少字节，供调用方做边界判断。
-static const char *SLNameAtIndex(uint32_t symIdx, const struct nlist_64 *syms,
+static const char *SLVNameAtIndex(uint32_t symIdx, const struct nlist_64 *syms,
                                  const char *strtab, uint32_t strtabSize,
                                  uint32_t nsyms, size_t *remainOut) {
     if (symIdx == INDIRECT_SYMBOL_LOCAL || symIdx == INDIRECT_SYMBOL_ABS) return NULL;
@@ -122,7 +122,7 @@ static const char *SLNameAtIndex(uint32_t symIdx, const struct nlist_64 *syms,
 }
 
 /// 这个名字是不是我们注册过的目标？是就返回下标。
-static int SLTargetIndexForName(const char *sname, size_t remain) {
+static int SLVTargetIndexForName(const char *sname, size_t remain) {
     if (!sname) return -1;
     for (int t = 0; t < sTargetCount; t++) {
         size_t need = strlen(sTargets[t].name);
@@ -133,7 +133,7 @@ static int SLTargetIndexForName(const char *sname, size_t remain) {
     return -1;
 }
 
-static int SLScanImage(const struct mach_header_64 *hdr, const char *imgName,
+static int SLVScanImage(const struct mach_header_64 *hdr, const char *imgName,
                        int *authSkipped) {
     // ---- 第一遍：找 __TEXT 的 vmaddr、__LINKEDIT、符号表命令 ----
     const struct segment_command_64 *linkedit = NULL;
@@ -187,9 +187,9 @@ static int SLScanImage(const struct mach_header_64 *hdr, const char *imgName,
     const uint32_t strtabSize = symtab->strsize;
 
     if (strtabSize < 2) return 0;
-    if (!SLRangeReadable(syms, (size_t)symtab->nsyms * sizeof(struct nlist_64)) ||
-        !SLRangeReadable(strtab, strtabSize) ||
-        !SLRangeReadable(indirect, (size_t)dysymtab->nindirectsyms * sizeof(uint32_t))) {
+    if (!SLVRangeReadable(syms, (size_t)symtab->nsyms * sizeof(struct nlist_64)) ||
+        !SLVRangeReadable(strtab, strtabSize) ||
+        !SLVRangeReadable(indirect, (size_t)dysymtab->nindirectsyms * sizeof(uint32_t))) {
         return 0;
     }
 
@@ -214,37 +214,37 @@ static int SLScanImage(const struct mach_header_64 *hdr, const char *imgName,
             uint32_t type = sect->flags & SECTION_TYPE;
             if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
 
-            uint32_t count = SLSectionSlotCount(sect, dysymtab);
+            uint32_t count = SLVSectionSlotCount(sect, dysymtab);
             if (count == 0) continue;
 
             if (isAuthSeg) {
                 // 只读符号表，一个字节都不碰指针槽本身
                 for (uint32_t k = 0; k < count; k++) {
                     size_t remain = 0;
-                    const char *sname = SLNameAtIndex(indirect[sect->reserved1 + k],
+                    const char *sname = SLVNameAtIndex(indirect[sect->reserved1 + k],
                                                       syms, strtab, strtabSize,
                                                       symtab->nsyms, &remain);
-                    if (SLTargetIndexForName(sname, remain) >= 0) (*authSkipped)++;
+                    if (SLVTargetIndexForName(sname, remain) >= 0) (*authSkipped)++;
                 }
                 continue;
             }
 
             // sect->addr 必须落在本镜像的 VM 区间内。
             // 图片被裁过 / 结构损坏时这个字段可能是垃圾，落进堆里也照样「可读可写」，
-            // 只靠 SLIsReadable 拦不住，所以先用镜像自身的段范围框一遍。
+            // 只靠 SLVIsReadable 拦不住，所以先用镜像自身的段范围框一遍。
             if ((uintptr_t)sect->addr < imgVMLo) continue;
             if ((uintptr_t)sect->addr + (uintptr_t)sect->size > imgVMHi) continue;
 
             // 关键：用 VM 地址（sect->addr），不是文件偏移（sect->offset）
             void **slots = (void **)(imageBase + (uintptr_t)sect->addr);
-            if (!SLRangeReadable(slots, (size_t)count * sizeof(void *))) continue;
+            if (!SLVRangeReadable(slots, (size_t)count * sizeof(void *))) continue;
 
             for (uint32_t k = 0; k < count; k++) {
                 size_t remain = 0;
-                const char *sname = SLNameAtIndex(indirect[sect->reserved1 + k],
+                const char *sname = SLVNameAtIndex(indirect[sect->reserved1 + k],
                                                   syms, strtab, strtabSize,
                                                   symtab->nsyms, &remain);
-                int t = SLTargetIndexForName(sname, remain);
+                int t = SLVTargetIndexForName(sname, remain);
                 if (t < 0) continue;
 
                 void *curAddr = slots[k];
@@ -262,7 +262,7 @@ static int SLScanImage(const struct mach_header_64 *hdr, const char *imgName,
                     tookOrig = YES;
                 }
 
-                if (!SLMakeWritable(&slots[k], sizeof(void *))) {
+                if (!SLVMakeWritable(&slots[k], sizeof(void *))) {
                     // 只读页放不开就放弃，写下去就是闪退。
                     // 只有「这个槽是原函数的来源」时才回收 —— 别的镜像已经成功挂上的话，
                     // 把 original 清空会让我们的实现拿不到原函数，等于把宿主搞坏。
@@ -270,20 +270,20 @@ static int SLScanImage(const struct mach_header_64 *hdr, const char *imgName,
                         if (sTargets[t].originalOut) *sTargets[t].originalOut = NULL;
                         sTargets[t].original = NULL;
                     }
-                    SLLog(@"符号: %s 的指针槽不可写，已放弃（%s）", sTargets[t].name, imgName);
+                    SLVLog(@"符号: %s 的指针槽不可写，已放弃（%s）", sTargets[t].name, imgName);
                     continue;
                 }
                 slots[k] = sTargets[t].replacement;
                 hits++;
                 // 打镜像名：只命中 1 处时，得知道这 1 处在哪个二进制里
-                SLLog(@"符号: 命中 %s ← %s", sTargets[t].name, imgName);
+                SLVLog(@"符号: 命中 %s ← %s", sTargets[t].name, imgName);
             }
         }
     }
     return hits;
 }
 
-int SLSymbolHookRescan(void) {
+int SLVSymbolHookRescan(void) {
     if (sTargetCount == 0) return 0;
 
     int hits = 0;
@@ -303,7 +303,7 @@ int SLSymbolHookRescan(void) {
         const char *base = slash ? slash + 1 : path;
 
         scanned++;
-        hits += SLScanImage((const struct mach_header_64 *)h, base, &authSkipped);
+        hits += SLVScanImage((const struct mach_header_64 *)h, base, &authSkipped);
     }
     // 只在「扫过的镜像数变了」或者「有命中」时出声。
     // 以前是「无命中只记前 3 次」，结果启动那几次把配额吃光，之后补扫全静音 ——
@@ -311,7 +311,7 @@ int SLSymbolHookRescan(void) {
     static int sLastScanned = -1;
     if (hits > 0 || authSkipped > 0 || scanned != sLastScanned) {
         sLastScanned = scanned;
-        SLLog(@"符号: 扫过 %d 个 App 镜像，命中 %d 处，认证 GOT 跳过 %d 处",
+        SLVLog(@"符号: 扫过 %d 个 App 镜像，命中 %d 处，认证 GOT 跳过 %d 处",
               scanned, hits, authSkipped);
     }
     return hits;
@@ -325,7 +325,7 @@ int SLSymbolHookRescan(void) {
 //
 // dyld 的 add-image 回调是在它还持着锁的时候调的，里面不能做重活
 //（遍历 load command、mprotect 都算重活），所以只把活丢给后台串行队列就返回。
-static void SLCamImageAdded(const struct mach_header *mh, intptr_t slide) {
+static void SLVCamImageAdded(const struct mach_header *mh, intptr_t slide) {
     (void)mh; (void)slide;
 
     static dispatch_queue_t q = NULL;
@@ -348,41 +348,41 @@ static void SLCamImageAdded(const struct mach_header *mh, intptr_t slide) {
         scheduled = YES;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), q, ^{
             scheduled = NO;
-            int hits = SLSymbolHookRescan();
-            if (hits > 0) SLLog(@"符号: 新镜像补扫命中 %d 处", hits);
+            int hits = SLVSymbolHookRescan();
+            if (hits > 0) SLVLog(@"符号: 新镜像补扫命中 %d 处", hits);
         });
     });
 }
 
-void SLSymbolHookInstallAutoRescan(void) {
+void SLVSymbolHookInstallAutoRescan(void) {
     static BOOL done = NO;
     if (done) return;
     done = YES;
-    _dyld_register_func_for_add_image(SLCamImageAdded);
-    SLLog(@"符号: 已挂镜像加载回调，后加载的 framework 会自动补扫");
+    _dyld_register_func_for_add_image(SLVCamImageAdded);
+    SLVLog(@"符号: 已挂镜像加载回调，后加载的 framework 会自动补扫");
 }
 
-int SLSymbolHook(const char *name, void *replacement, void **original) {
+int SLVSymbolHook(const char *name, void *replacement, void **original) {
     if (!name || !replacement) return 0;
 
     for (int i = 0; i < sTargetCount; i++) {
         if (strcmp(sTargets[i].name, name) == 0) {
             // 已注册过：只补扫（后加载的镜像可能刚进来）
-            int hits = SLSymbolHookRescan();
+            int hits = SLVSymbolHookRescan();
             if (original) *original = sTargets[i].original;
             return hits;
         }
     }
 
-    if (sTargetCount >= SL_MAX_TARGETS) return 0;
+    if (sTargetCount >= SLV_MAX_TARGETS) return 0;
 
-    SLTarget *t = &sTargets[sTargetCount++];
+    SLVTarget *t = &sTargets[sTargetCount++];
     t->name = name;
     t->replacement = replacement;
     t->original = NULL;
     t->originalOut = original;
 
-    int hits = SLSymbolHookRescan();
+    int hits = SLVSymbolHookRescan();
     if (original) *original = t->original;
     return hits;
 }

@@ -1,5 +1,5 @@
 //
-//  SLMediaStore.h
+//  SLVMediaStore.h
 //  声临 · 虚拟摄像头 —— 素材库（相册 / 文件导入的视频和图片）
 //
 //  只做「文件怎么放、哪个算当前素材」这一件事，不碰解码和注入。
@@ -17,7 +17,7 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface SLMediaItem : NSObject
+@interface SLVMediaItem : NSObject
 @property (nonatomic, copy) NSString *fileName;
 @property (nonatomic, copy) NSString *path;
 /// 去掉扩展名的显示名
@@ -28,26 +28,26 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, strong) NSDate *addedAt;
 @end
 
-@interface SLMediaStore : NSObject
+@interface SLVMediaStore : NSObject
 
 /// 素材目录（不存在会建）
 + (NSString *)mediaDir;
 
 /// 全部素材，**最新的在前**
-+ (NSArray<SLMediaItem *> *)allItems;
++ (NSArray<SLVMediaItem *> *)allItems;
 
 /// 当前选中的素材；没选或文件已经不存在时返回 nil
-+ (nullable SLMediaItem *)currentItem;
++ (nullable SLVMediaItem *)currentItem;
 
 /// 选中某个素材（只存文件名）
-+ (void)setCurrentItem:(nullable SLMediaItem *)item;
++ (void)setCurrentItem:(nullable SLVMediaItem *)item;
 
 /// 从外部 URL 导入（相册 / 文件 App 给的都是临时文件，必须复制进来）。
 ///
 /// 导入成功后**自动选中**这个素材。
 /// @param duplicate 传出「库里已经有同样内容的文件」——此时不复制，直接返回已有的那条
 /// @return 素材条目；失败返回 nil
-+ (nullable SLMediaItem *)importItemAtURL:(NSURL *)url
++ (nullable SLVMediaItem *)importItemAtURL:(NSURL *)url
                                     error:(NSError *_Nullable *_Nullable)error
                                 duplicate:(BOOL *_Nullable)duplicate;
 
@@ -55,7 +55,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)importFileAtURL:(NSURL *)url error:(NSError *_Nullable *_Nullable)error;
 
 /// 删除某个素材；删的正好是当前素材时顺手清空选中
-+ (void)removeItem:(SLMediaItem *)item;
++ (void)removeItem:(SLVMediaItem *)item;
 
 /// 文件名是不是我们认的图片格式
 + (BOOL)isImageFileName:(NSString *)name;

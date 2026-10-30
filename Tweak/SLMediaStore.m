@@ -1,5 +1,5 @@
 //
-//  SLMediaStore.m
+//  SLVMediaStore.m
 //  声临 · 虚拟摄像头 —— 素材库
 //
 
@@ -11,19 +11,19 @@
 #import <ImageIO/ImageIO.h>
 #import <CommonCrypto/CommonDigest.h>
 
-static NSString *const kSLCurrentMediaKey = @"SLCamCurrentMedia";
+static NSString *const kSLCurrentMediaKey = @"SLVCamCurrentMedia";
 
 /// 去重用的内容指纹。放在素材目录里但用隐藏名 + .plist 后缀，
 /// 所以 allItems 的扩展名过滤天然看不到它。
 static NSString *const kSLHashManifestName = @".hashes.plist";
 
-@implementation SLMediaItem
+@implementation SLVMediaItem
 @end
 
 #pragma mark - 文件名
 
 // iOS 只禁 "/" 和 NUL，但冒号、引号、控制字符在别的地方会出事，一并换掉。
-static NSString *SLCleanBaseName(NSString *raw, NSUInteger maxLen) {
+static NSString *SLVCleanBaseName(NSString *raw, NSUInteger maxLen) {
     if (!raw.length) return nil;
     NSCharacterSet *bad = [NSCharacterSet characterSetWithCharactersInString:@"/\\:*?\"<>|\r\n\t"];
     NSString *s = [[raw componentsSeparatedByCharactersInSet:bad] componentsJoinedByString:@"_"];
@@ -37,7 +37,7 @@ static NSString *SLCleanBaseName(NSString *raw, NSUInteger maxLen) {
 
 // 相册偶尔给的是纯数字或 UUID 的临时名。这种名字拿来当显示名，跟时间戳一样没法看，
 // 所以判定成「机器名」，退回时间戳命名。
-static BOOL SLLooksMachineName(NSString *s) {
+static BOOL SLVLooksMachineName(NSString *s) {
     if (!s.length) return YES;
     NSCharacterSet *digits = [NSCharacterSet decimalDigitCharacterSet];
     if ([s stringByTrimmingCharactersInSet:digits].length == 0) return YES;
@@ -49,10 +49,10 @@ static BOOL SLLooksMachineName(NSString *s) {
     return NO;
 }
 
-static NSString *SLBaseNameForURL(NSURL *url) {
+static NSString *SLVBaseNameForURL(NSURL *url) {
     NSString *raw = url.lastPathComponent.stringByDeletingPathExtension;
-    NSString *s = SLCleanBaseName(raw, 60);
-    if (SLLooksMachineName(s)) {
+    NSString *s = SLVCleanBaseName(raw, 60);
+    if (SLVLooksMachineName(s)) {
         NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
         fmt.dateFormat = @"yyyyMMdd-HHmmss";
         s = [fmt stringFromDate:[NSDate date]];
@@ -63,7 +63,7 @@ static NSString *SLBaseNameForURL(NSURL *url) {
 // 老版本用 Unix 秒当文件名（1793354943），显示成一串数字完全看不出是哪段。
 // 这里把 10 位时间戳翻译成「2026-10-30 19:20」。只影响显示，文件名不动 ——
 // 改名会连带去重指纹表、当前选中项一起失效。
-static NSDateFormatter *SLStampFormatter(void) {
+static NSDateFormatter *SLVStampFormatter(void) {
     static NSDateFormatter *f = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -73,12 +73,12 @@ static NSDateFormatter *SLStampFormatter(void) {
     return f;
 }
 
-static NSString *SLDisplayNameForFile(NSString *fileName) {
+static NSString *SLVDisplayNameForFile(NSString *fileName) {
     NSString *base = fileName.stringByDeletingPathExtension;
-    if (base.length == 10 && SLLooksMachineName(base)) {
+    if (base.length == 10 && SLVLooksMachineName(base)) {
         double t = base.doubleValue;
         if (t > 1500000000.0 && t < 4000000000.0) {
-            NSDateFormatter *f = SLStampFormatter();
+            NSDateFormatter *f = SLVStampFormatter();
             NSString *s = nil;
             @synchronized (f) {   // NSDateFormatter 不是线程安全的
                 s = [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:t]];
@@ -89,10 +89,10 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
     return base;
 }
 
-@implementation SLMediaStore
+@implementation SLVMediaStore
 
 + (NSString *)mediaDir {
-    NSString *dir = [SLStoreDir() stringByAppendingPathComponent:@"media"];
+    NSString *dir = [SLVStoreDir() stringByAppendingPathComponent:@"media"];
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         [[NSFileManager defaultManager] createDirectoryAtPath:dir
@@ -120,28 +120,28 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
     return [self sl_isImageExt:name.pathExtension];
 }
 
-+ (NSArray<SLMediaItem *> *)allItems {
++ (NSArray<SLVMediaItem *> *)allItems {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *dir = [self mediaDir];
     NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:dir error:nil];
-    NSMutableArray<SLMediaItem *> *out = [NSMutableArray array];
+    NSMutableArray<SLVMediaItem *> *out = [NSMutableArray array];
     for (NSString *n in names) {
         BOOL vid = [self sl_isVideoName:n];
         BOOL img = [self isImageFileName:n];
         if (!vid && !img) continue;
 
         NSString *path = [dir stringByAppendingPathComponent:n];
-        SLMediaItem *it = [[SLMediaItem alloc] init];
+        SLVMediaItem *it = [[SLVMediaItem alloc] init];
         it.fileName = n;
         it.path = path;
-        it.displayName = SLDisplayNameForFile(n);
+        it.displayName = SLVDisplayNameForFile(n);
         it.isImage = img;
         NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
         it.addedAt = attrs[NSFileModificationDate] ?: [NSDate dateWithTimeIntervalSince1970:0];
         [out addObject:it];
     }
     // 最新的排最上面；时间戳撞车时用文件名兜底，保证顺序稳定
-    [out sortUsingComparator:^NSComparisonResult(SLMediaItem *a, SLMediaItem *b) {
+    [out sortUsingComparator:^NSComparisonResult(SLVMediaItem *a, SLVMediaItem *b) {
         NSComparisonResult r = [b.addedAt compare:a.addedAt];
         if (r != NSOrderedSame) return r;
         return [b.fileName compare:a.fileName];
@@ -149,16 +149,16 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
     return out;
 }
 
-+ (SLMediaItem *)currentItem {
++ (SLVMediaItem *)currentItem {
     NSString *want = [[NSUserDefaults standardUserDefaults] stringForKey:kSLCurrentMediaKey];
     if (!want.length) return nil;
-    for (SLMediaItem *it in [self allItems]) {
+    for (SLVMediaItem *it in [self allItems]) {
         if ([it.fileName isEqualToString:want]) return it;
     }
     return nil;
 }
 
-+ (void)setCurrentItem:(SLMediaItem *)item {
++ (void)setCurrentItem:(SLVMediaItem *)item {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     if (item.fileName.length) [d setObject:item.fileName forKey:kSLCurrentMediaKey];
     else [d removeObjectForKey:kSLCurrentMediaKey];
@@ -206,7 +206,7 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
 #pragma mark - 体检
 
 /// 这段视频我们到底能不能解？
-/// 判据和 SLCamFeed 建 reader 时完全一致：有视频轨，且能挂上 420f（退 BGRA）输出。
+/// 判据和 SLVCamFeed 建 reader 时完全一致：有视频轨，且能挂上 420f（退 BGRA）输出。
 /// 用同一套条件才不会出现「体检通过、真跑起来却黑屏」。
 + (BOOL)sl_isDecodableVideoAtPath:(NSString *)path {
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
@@ -216,7 +216,7 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
     NSError *err = nil;
     AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&err];
     if (!reader) {
-        SLLog(@"导入: 建 reader 失败 %@", err.localizedDescription ?: @"?");
+        SLVLog(@"导入: 建 reader 失败 %@", err.localizedDescription ?: @"?");
         return NO;
     }
 
@@ -226,7 +226,7 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
         AVAssetReaderTrackOutput *o = [[AVAssetReaderTrackOutput alloc] initWithTrack:vt outputSettings:settings];
         if ([reader canAddOutput:o]) return YES;
     }
-    SLLog(@"导入: 视频轨解不出 420f/BGRA（%@）", vt.formatDescriptions.firstObject ? @"有格式描述" : @"无格式描述");
+    SLVLog(@"导入: 视频轨解不出 420f/BGRA（%@）", vt.formatDescriptions.firstObject ? @"有格式描述" : @"无格式描述");
     return NO;
 }
 
@@ -247,7 +247,7 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
 
 #pragma mark - 导入
 
-+ (SLMediaItem *)importItemAtURL:(NSURL *)url
++ (SLVMediaItem *)importItemAtURL:(NSURL *)url
                            error:(NSError **)error
                        duplicate:(BOOL *)duplicate {
     if (duplicate) *duplicate = NO;
@@ -269,7 +269,7 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
     NSMutableDictionary<NSString *, NSString *> *hashes = [self sl_loadHashes];
 
     // 0.2.20 之前导入的素材没有指纹记录，这里补算一次（一次性开销，之后走缓存）
-    for (SLMediaItem *it in [self allItems]) {
+    for (SLVMediaItem *it in [self allItems]) {
         if (hashes[it.fileName]) continue;
         NSString *h = [self sl_hashOfFileAtPath:it.path];
         if (h) hashes[it.fileName] = h;
@@ -284,17 +284,17 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
             NSString *p = [[self mediaDir] stringByAppendingPathComponent:hit];
             if ([fm fileExistsAtPath:p]) {
                 // 库里已经有同样内容 —— 不复制，直接选中它
-                SLMediaItem *it = [[SLMediaItem alloc] init];
+                SLVMediaItem *it = [[SLVMediaItem alloc] init];
                 it.fileName = hit;
                 it.path = p;
-                it.displayName = SLDisplayNameForFile(hit);
+                it.displayName = SLVDisplayNameForFile(hit);
                 it.isImage = [self isImageFileName:hit];
                 it.addedAt = [fm attributesOfItemAtPath:p error:nil][NSFileModificationDate]
                               ?: [NSDate date];
                 [self setCurrentItem:it];
                 [self sl_saveHashes:hashes];
                 if (duplicate) *duplicate = YES;
-                SLLog(@"导入: %@ 内容重复，复用已有素材 %@", url.lastPathComponent, hit);
+                SLVLog(@"导入: %@ 内容重复，复用已有素材 %@", url.lastPathComponent, hit);
                 return it;
             }
             // 记录还在但文件没了，清掉这条脏数据
@@ -305,7 +305,7 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
     // ---- 2. 复制进来 ----
     // 0.2.24：保留原始文件名。以前一律用时间戳命名，素材页里全是 1793354943 这种数字，
     // 完全看不出哪段是哪段。只有拿到机器名（纯数字 / UUID）才退回时间戳。
-    NSString *base = SLBaseNameForURL(url);
+    NSString *base = SLVBaseNameForURL(url);
     NSString *name = [NSString stringWithFormat:@"%@.%@", base, ext];
     NSString *dst = [[self mediaDir] stringByAppendingPathComponent:name];
     for (int i = 2; [fm fileExistsAtPath:dst] && i < 1000; i++) {
@@ -315,7 +315,7 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
 
     NSError *copyErr = nil;
     if (![fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:dst] error:&copyErr]) {
-        SLLog(@"导入: 拷贝失败 %@", copyErr.localizedDescription ?: @"?");
+        SLVLog(@"导入: 拷贝失败 %@", copyErr.localizedDescription ?: @"?");
         if (error) *error = copyErr;
         return nil;
     }
@@ -330,9 +330,9 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
     BOOL ok = isImage ? [self sl_isDecodableImageAtPath:dst] : [self sl_isDecodableVideoAtPath:dst];
     if (!ok) {
         [fm removeItemAtPath:dst error:nil];
-        SLLog(@"导入: %@ 解码不可用，已删除", name);
+        SLVLog(@"导入: %@ 解码不可用，已删除", name);
         if (error) {
-            *error = [NSError errorWithDomain:@"SLCamMedia" code:-2 userInfo:@{
+            *error = [NSError errorWithDomain:@"SLVCamMedia" code:-2 userInfo:@{
                 NSLocalizedDescriptionKey: isImage
                     ? @"这张图片读不出来，换一张试试"
                     : @"这段视频的编码不支持，换一段试试",
@@ -346,16 +346,16 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
         [self sl_saveHashes:hashes];
     }
 
-    SLMediaItem *it = [[SLMediaItem alloc] init];
+    SLVMediaItem *it = [[SLVMediaItem alloc] init];
     it.fileName = name;
     it.path = dst;
-    it.displayName = SLDisplayNameForFile(name);
+    it.displayName = SLVDisplayNameForFile(name);
     it.isImage = isImage;
     it.addedAt = [NSDate date];
     // 0.2.20 起：每次导入都自动选中（以前只有库里空着才选，加第二个素材还得再点一次）
     [self setCurrentItem:it];
 
-    SLLog(@"media imported: %@（%@）", name, isImage ? @"图片" : @"视频");
+    SLVLog(@"media imported: %@（%@）", name, isImage ? @"图片" : @"视频");
     return it;
 }
 
@@ -363,7 +363,7 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
     return [self importItemAtURL:url error:error duplicate:NULL] != nil;
 }
 
-+ (void)removeItem:(SLMediaItem *)item {
++ (void)removeItem:(SLVMediaItem *)item {
     if (!item.path.length) return;
     [[NSFileManager defaultManager] removeItemAtPath:item.path error:nil];
 
@@ -375,7 +375,7 @@ static NSString *SLDisplayNameForFile(NSString *fileName) {
 
     NSString *cur = [[NSUserDefaults standardUserDefaults] stringForKey:kSLCurrentMediaKey];
     if ([cur isEqualToString:item.fileName]) [self setCurrentItem:nil];
-    SLLog(@"media removed: %@", item.fileName);
+    SLVLog(@"media removed: %@", item.fileName);
 }
 
 @end

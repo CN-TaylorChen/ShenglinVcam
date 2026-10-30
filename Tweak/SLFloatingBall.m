@@ -1,11 +1,11 @@
 //
-//  SLFloatingBall.m
+//  SLVFloatingBall.m
 //  声临 · 虚拟摄像头 —— 悬浮球 / 胶囊 / 玻璃浮窗（底包外壳，不含任何业务）
 //
-//  从 ShenglinMomo 的 SLEntry.m 抽出来，删掉了语音包列表三个类（SLPackMenu /
-//  SLPackMenuRow / SLPackGroupRow）和所有 SLVoicePack 调用，改成 SLCamBridge 里
-//  那几个函数。业务侧只看到三件事：开关（SLCamEnabled）、胶囊上的名字
-//  （SLCamCurrentName）、点箭头弹什么（SLCamHandleArrowTap）。
+//  从 ShenglinMomo 的 SLVEntry.m 抽出来，删掉了语音包列表三个类（SLVPackMenu /
+//  SLVPackMenuRow / SLVPackGroupRow）和所有 SLVVoicePack 调用，改成 SLVCamBridge 里
+//  那几个函数。业务侧只看到三件事：开关（SLVCamEnabled）、胶囊上的名字
+//  （SLVCamCurrentName）、点箭头弹什么（SLVCamHandleArrowTap）。
 //
 //  外观部分沿用底包：状态配色、光环呼吸、自定义图标律动、名字滚动、
 //  拖动跟手 + 越线翻面 + 松手贴边、球位比例存储、窗口迁移。
@@ -24,7 +24,7 @@
 #import "SLGlass.h"
 #import <PhotosUI/PhotosUI.h>
 #import <AVFoundation/AVFoundation.h>
-#include <stdlib.h>   // v0.4.75：SLHazeImage 里的 calloc/free
+#include <stdlib.h>   // v0.4.75：SLVHazeImage 里的 calloc/free
 
 // ===================== 悬浮球图标 =====================
 // v0.4.33：默认图标换成「双声波」品牌图形（代码绘制，黑底 + 六根条：
@@ -33,7 +33,9 @@
 //   brand            品牌图形（默认）
 //   image:icon.png   相册选的自定义图片（已裁成圆形，存沙盒）
 //   text:xxx         旧版遗留值，读取时自动迁移成默认
-#define kSLFloatIconKey @"SLFloatIcon"
+#define kSLFloatIconKey @"SLVFloatIcon"
+// 0.3.0 改名前的旧键（当时和声临陌陌同名，同进程会互相抢图标）。只读不写。
+#define kSLFloatIconKeyOld @"SLFloatIcon"
 #define kSLFloatIconDefault @"brand"
 
 // v0.4.74：自定义图标动效。外圈（光晕 + 26% 状态底色）永远不动，
@@ -41,10 +43,10 @@
 // v0.4.80：动效不再是可选项 —— 设置页里「图标动效」整段删掉，只要当前图标是
 // 自定义图片就默认走律动（四态缩放，合成态「泵动」：慢缩 → 急弹 → 缓落）。
 // 这个键 v0.4.80 起不再读写，留着只为旧版本存过的值不显得突兀。
-#define kSLFloatEffectKey @"SLFloatEffect"
+#define kSLFloatEffectKey @"SLVFloatEffect"
 
-static NSString *SLFloatIconDir(void) {
-    NSString *dir = [SLDocumentsPath() stringByAppendingPathComponent:@"ShenglinMomo/float"];
+static NSString *SLVFloatIconDir(void) {
+    NSString *dir = [SLVDocumentsPath() stringByAppendingPathComponent:@"ShenglinMomo/float"];
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:dir]) {
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -52,8 +54,8 @@ static NSString *SLFloatIconDir(void) {
     return dir;
 }
 
-static NSString *SLFloatIconImagePath(NSString *name) {
-    return [SLFloatIconDir() stringByAppendingPathComponent:(name.length ? name : @"icon.png")];
+static NSString *SLVFloatIconImagePath(NSString *name) {
+    return [SLVFloatIconDir() stringByAppendingPathComponent:(name.length ? name : @"icon.png")];
 }
 
 // v0.4.75：胶囊底色 = 图标图的「色晕」。
@@ -61,7 +63,7 @@ static NSString *SLFloatIconImagePath(NSString *name) {
 // 只留大块明暗与色相分布、不留任何细节，所以胶囊上不会出现「一张缩略图糊上去」。
 // 取景跟 _thumb 的 aspectFill 对齐（中心横条），色晕和图标才是同一段画面。
 // v0.4.76：目标网格改成参数 —— 胶囊用 32×6；列表卡片用 6×1（面积大，32 段会拉出竖光带）。
-static UIImage *SLHazeImage(UIImage *src, size_t w, size_t h) {
+static UIImage *SLVHazeImage(UIImage *src, size_t w, size_t h) {
     if (!src.CGImage || w == 0 || h == 0) return nil;
     unsigned char *buf = (unsigned char *)calloc(w * h * 4, sizeof(unsigned char));
     if (!buf) return nil;
@@ -89,8 +91,17 @@ static UIImage *SLHazeImage(UIImage *src, size_t w, size_t h) {
     return out;
 }
 
-static NSString *SLFloatIconValue(void) {
-    NSString *v = [[NSUserDefaults standardUserDefaults] stringForKey:kSLFloatIconKey];
+static NSString *SLVFloatIconValue(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    NSString *v = [d stringForKey:kSLFloatIconKey];
+    if (!v.length) {
+        // 0.3.0 改名迁移：旧键里的值搬过来，用户选过的自定义图标不会丢。
+        NSString *old = [d stringForKey:kSLFloatIconKeyOld];
+        if (old.length) {
+            [d setObject:old forKey:kSLFloatIconKey];
+            v = old;
+        }
+    }
     if (!v.length) return kSLFloatIconDefault;
     if ([v hasPrefix:@"text:"]) return kSLFloatIconDefault;        // 旧版文字图标 → 默认
     return v;
@@ -99,12 +110,12 @@ static NSString *SLFloatIconValue(void) {
 // v0.4.80：没有「关闭」这一档了。只要图标是自定义图片就走律动，
 // 真正决定动不动的是 sl_updateIconMotion 里的「当前有没有图」——
 // 默认叠层图标本来就是自己那套动画，不走这里。
-static NSInteger SLFloatEffectValue(void) {
+static NSInteger SLVFloatEffectValue(void) {
     return 1;
 }
 
-NSString *SLFloatIconSummary(void) {
-    NSString *v = SLFloatIconValue();
+NSString *SLVFloatIconSummary(void) {
+    NSString *v = SLVFloatIconValue();
     NSString *base = @"默认";
     if ([v hasPrefix:@"image:"]) base = @"自定义图片";
     // v0.4.80：动效固定随图片开启，右侧不再挂「· 律动」后缀
@@ -120,7 +131,7 @@ NSString *SLFloatIconSummary(void) {
 // 底下还压着另一层，正好对上虚拟摄像头的实际行为（送去编码的是素材，不是现场）。
 //
 // 100 单位为画布基准，跟设计稿一一对应，48pt 球和 44pt 标题栏图标是同一张图。
-static UIImage *SLBrandIcon(CGFloat side, UIColor *bg) {
+static UIImage *SLVBrandIcon(CGFloat side, UIColor *bg) {
     if (side <= 0) side = 96;
     UIColor *base = bg ?: [UIColor blackColor];
     UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
@@ -148,43 +159,61 @@ static UIImage *SLBrandIcon(CGFloat side, UIColor *bg) {
     }];
 }
 
-UIImage *SLBrandIconImage(CGFloat side) {
-    return SLBrandIcon(side, nil);
+UIImage *SLVBrandIconImage(CGFloat side) {
+    return SLVBrandIcon(side, nil);
 }
 
-UIImage *SLBrandIconImageTinted(CGFloat side, UIColor *bg) {
-    return SLBrandIcon(side, bg);
+UIImage *SLVBrandIconImageTinted(CGFloat side, UIColor *bg) {
+    return SLVBrandIcon(side, bg);
 }
 
-// 小尺寸版本，几何跟 SLBrandIcon 完全一致，只是把底色去掉、线条换成传进来的颜色。
-// 球上真正显示的是 _frameCell 那套可独立动画的视图，这张图只在
-// 「模板图占位」和「20pt 标题栏」这类静态场合用得到。
-static UIImage *SLBrandGlyphCompact(CGFloat side, UIColor *color) {
+// 小尺寸版本：去掉底色，线条换成传进来的颜色，供模板图 / 标题栏这类静态场合用。
+//
+// 0.3.0：后框加了一道裁切 —— 只保留「前框右边线以右」的那半截。
+// 原来后框整条画出来，它的左边线（x=42）正好落在前框内部（2..58），
+// 两条竖线只隔 7.5 单位，22pt 标题栏上糊成「|||」，看起来像三根柱子而不是两张叠起来的卡。
+// 裁掉之后后框只剩右侧露出的一小截，语义回到「前面这张挡着后面那张」。
+// 尺寸小的时候描边和圆角再收一点，否则 22pt 下前框的洞会被描边吃掉。
+static UIImage *SLVBrandGlyphCompact(CGFloat side, UIColor *color) {
     if (side <= 0) side = 44;
     UIColor *c = color ?: [UIColor labelColor];
+    BOOL small = (side < 32.0);
+    CGFloat lwU = small ? 6.5 : 8.5;
+    CGFloat radU = small ? 15.0 : 17.0;
     UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
     fmt.opaque = NO;
     UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side) format:fmt];
     return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        (void)ctx;
+        CGContextRef cg = ctx.CGContext;
         CGFloat u = side / 100.0;
-        CGFloat lw = 8.5 * u;
-        CGFloat rad = 17.0 * u;
+        CGFloat lw = lwU * u;
+        CGFloat rad = radU * u;
+        CGRect frontRect = CGRectMake(2.0 * u, 4.0 * u, 56.0 * u, 92.0 * u);
+        CGRect backRect  = CGRectMake(42.0 * u, 4.0 * u, 56.0 * u, 92.0 * u);
+
+        CGContextSaveGState(cg);
+        CGContextClipToRect(cg, CGRectMake(CGRectGetMaxX(frontRect), 0, side, side));
         [[c colorWithAlphaComponent:0.5] setStroke];
-        UIBezierPath *back = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(42.0 * u, 4.0 * u, 56.0 * u, 92.0 * u)
-                                                          cornerRadius:rad];
+        UIBezierPath *back = [UIBezierPath bezierPathWithRoundedRect:backRect cornerRadius:rad];
         back.lineWidth = lw;
         [back stroke];
+        CGContextRestoreGState(cg);
+
         [c setStroke];
-        UIBezierPath *front = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(2.0 * u, 4.0 * u, 56.0 * u, 92.0 * u)
-                                                           cornerRadius:rad];
+        UIBezierPath *front = [UIBezierPath bezierPathWithRoundedRect:frontRect cornerRadius:rad];
         front.lineWidth = lw;
         [front stroke];
     }];
 }
 
+// 对外：无底色的品牌图形，颜色自己给。标题栏、列表缩略图这类场合用这个，
+// 别再拿 SLVBrandIconImage（那张带黑色圆底，小尺寸下会糊成一坨黑）。
+UIImage *SLVBrandGlyphImage(CGFloat side, UIColor *color) {
+    return SLVBrandGlyphCompact(side, color);
+}
+
 // 把任意图片居中裁成圆形（直接当 backgroundImage 用，省得给按钮加裁剪打断阴影）
-static UIImage *SLCircleIcon(UIImage *src) {
+static UIImage *SLVCircleIcon(UIImage *src) {
     if (!src) return nil;
     CGSize s = CGSizeMake(120, 120);
     UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
@@ -202,17 +231,17 @@ static UIImage *SLCircleIcon(UIImage *src) {
     }];
 }
 
-static BOOL SLSaveFloatIconImage(UIImage *img) {
-    UIImage *c = SLCircleIcon(img);
+static BOOL SLVSaveFloatIconImage(UIImage *img) {
+    UIImage *c = SLVCircleIcon(img);
     NSData *d = c ? UIImagePNGRepresentation(c) : nil;
     if (!d.length) return NO;
-    if (![d writeToFile:SLFloatIconImagePath(@"icon.png") atomically:YES]) return NO;
+    if (![d writeToFile:SLVFloatIconImagePath(@"icon.png") atomically:YES]) return NO;
     [[NSUserDefaults standardUserDefaults] setObject:@"image:icon.png" forKey:kSLFloatIconKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
     return YES;
 }
 
-static void SLApplyFloatIcon(UIButton *btn);
+static void SLVApplyFloatIcon(UIButton *btn);
 
 // 0.2.27：球贴边时离屏幕边缘留多少。
 //
@@ -220,13 +249,13 @@ static void SLApplyFloatIcon(UIButton *btn);
 // 留 4pt 装 8pt 的东西，贴边那一侧的光晕就被屏幕切掉一条弧，看着像缺了一块。
 // 10pt = 光晕 8pt + 2pt 余量，阴影（radius 9 / offset y+3）也基本容得下。
 // 拖动的实时夹取和松手贴边都用这一个值，别各写一份。
-static const CGFloat SLBallEdgeInset = 10.0;
+static const CGFloat SLVBallEdgeInset = 10.0;
 
 // v0.4.40：位置相关的三个工具（定义在文件后面，拖动手势要用到）
-static CGSize SLHostSizeFor(UIView *sv);
-static CGPoint SLClampFloatPos(CGPoint c, CGSize size);
-static void SLStoreFloatPos(CGPoint c, CGSize size);
-static CGPoint SLLoadFloatPos(CGSize size);
+static CGSize SLVHostSizeFor(UIView *sv);
+static CGPoint SLVClampFloatPos(CGPoint c, CGSize size);
+static void SLVStoreFloatPos(CGPoint c, CGSize size);
+static CGPoint SLVLoadFloatPos(CGSize size);
 
 // v0.4.60：合成完成「落定」回弹的静音开关。
 // 试听面板那条路本身有卡片弹入动画，「完成」的信号已经给足了，球再缩一下就撞车；
@@ -235,14 +264,17 @@ static BOOL sSLFloatSettleMuted = NO;
 
 // ===================== 浮动入口 =====================
 
-#define SLBtnTag 20931
+// 20931 是声临陌陌在用的 tag。两个 dylib 同进程加载时，同 tag 会互相 viewWithTag
+// 抢到对方的球，所以 Vcam 单独换一个值。改 tag 只是避让，不是根治 ——
+// 类名/函数名同名的那批（见 0.3.0 改名）才是真正的符号冲突。
+#define SLVBtnTag 20941
 
 // ===================== 设置 / 语音包浮窗 =====================
 // v0.4.33：设置页不再用 PageSheet 从底部整页推上来，改成一张固定尺寸的
 // 圆角毛玻璃浮窗，浮在陌陌界面中间。尺寸写死，只有窗内内容能滚动。
 // v0.4.34：语音包也住进同一个容器（原先还是 PageSheet，跟设置页两套观感）。
 
-// 接口声明在 SLFloatingBall.h（底包对外暴露），实现见本文件末尾
+// 接口声明在 SLVFloatingBall.h（底包对外暴露），实现见本文件末尾
 
 // ===================== 悬浮球：毛玻璃 + 呼吸光晕 + 胶囊下拉 =====================
 // v0.4.36 交互重排（用户定稿）：
@@ -252,7 +284,7 @@ static BOOL sSLFloatSettleMuted = NO;
 // 状态：空闲灰白光晕 2.8s / 录音红 0.9s / 合成蓝 1.4s / 就绪蓝常亮到发送完成。
 // 就绪不再自动回空闲，发出去的那一刻外扩一圈涟漪再回空闲。
 
-#define SLBallSide 48.0
+#define SLVBallSide 48.0
 
 // v0.4.44：下压留白改成 0。
 // 之前留 14pt 是为了让搜索栏不压圆角，但导航栏是透明的 —— 那 14pt 成了整张卡片上
@@ -266,7 +298,7 @@ static const CGFloat kSLPanelTopPad = 0.0;
 // 老写法 setBackgroundImage:[UIImage new] 传的是 0×0 的空图，UIKit 会**当没设**，
 // 于是回落到系统默认的导航栏背景图 —— 那张图是「顶部纯白 → 向下渐隐 + 底部 0.5pt 线」，
 // 视觉上就是压不掉的一条顶部白。必须给真图，尺寸 0 的图不算数。
-static UIImage *SLTransparentImage(void) {
+static UIImage *SLVTransparentImage(void) {
     static UIImage *img = nil;
     if (img) return img;
     UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
@@ -279,10 +311,10 @@ static UIImage *SLTransparentImage(void) {
     return img;
 }
 
-@interface SLFloatButton : UIButton
-@property (nonatomic, assign) SLFloatState slState;
+@interface SLVFloatButton : UIButton
+@property (nonatomic, assign) SLVFloatState slState;
 - (void)sl_loadIcon;
-- (void)sl_applyState:(SLFloatState)state;
+- (void)sl_applyState:(SLVFloatState)state;
 /// 0.2.26：叠层图标的两态动画（空闲单框呼吸 / 装填双框错拍）
 - (void)sl_layoutFrames;
 - (void)sl_updateFrameMotion;
@@ -292,7 +324,7 @@ static UIImage *SLTransparentImage(void) {
 - (void)sl_restartHalo;
 @end
 
-@implementation SLFloatButton {
+@implementation SLVFloatButton {
     UIView *_glassHost;
     UIVisualEffectView *_chrome;
     CAShapeLayer *_glassMask;
@@ -312,7 +344,7 @@ static UIImage *SLTransparentImage(void) {
     CFTimeInterval _longPressAt;
     // 长按期间要临时关掉它，否则手指在扇上滑动会同时把球拖走
     UIPanGestureRecognizer *_pan;
-    SLFanView *_fan;
+    SLVFanView *_fan;
     // 展开前球停在哪。扇心被推进安全区时球会滑过去，收起要滑回原处，
     // 不然用户拖了半天的位置会被一次长按改掉。
     CGPoint _fanHomePos;
@@ -357,7 +389,7 @@ static UIImage *SLTransparentImage(void) {
         // 铺在聊天背景上基本看不到背后内容；换成超薄材质后是真正的玻璃感（透 + 轻模糊），
         // 玻璃的边界靠 _glassHost 那圈 0.8pt 高光勾出来。
         _chrome = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial]];
-        _chrome.frame = CGRectMake(0, 0, SLBallSide, SLBallSide);
+        _chrome.frame = CGRectMake(0, 0, SLVBallSide, SLVBallSide);
         [_glassHost addSubview:_chrome];
 
         _tint = [[UIView alloc] initWithFrame:CGRectZero];
@@ -391,7 +423,7 @@ static UIImage *SLTransparentImage(void) {
         // 用户圈的就是这条「本该顺着椭圆走、却被裁掉一截」的线。
         // 正圆与胶囊左端圆头半径同为 24，天然贴合，右缘是一整圈连续弧，没有断头。
         _thumb.clipsToBounds = YES;
-        _thumb.layer.cornerRadius = SLBallSide / 2.0;
+        _thumb.layer.cornerRadius = SLVBallSide / 2.0;
         _thumb.userInteractionEnabled = NO;
         [self addSubview:_thumb];
 
@@ -438,7 +470,7 @@ static UIImage *SLTransparentImage(void) {
                                                    object:nil];
 
         [self sl_loadIcon];
-        [self sl_applyState:SLFloatStateIdle];
+        [self sl_applyState:SLVFloatStateIdle];
     }
     return self;
 }
@@ -446,19 +478,19 @@ static UIImage *SLTransparentImage(void) {
 #pragma mark 图标
 
 - (UIImage *)sl_customIconImage {
-    NSString *v = SLFloatIconValue();
+    NSString *v = SLVFloatIconValue();
     if (![v hasPrefix:@"image:"]) return nil;
-    return [UIImage imageWithContentsOfFile:SLFloatIconImagePath([v substringFromIndex:6])];
+    return [UIImage imageWithContentsOfFile:SLVFloatIconImagePath([v substringFromIndex:6])];
 }
 
 - (void)sl_loadIcon {
-    NSString *v = SLFloatIconValue();
+    NSString *v = SLVFloatIconValue();
     _glyph.hidden = YES;
     _thumb.hidden = YES;
 
     UIImage *img = nil;
     if ([v hasPrefix:@"image:"]) {
-        img = [UIImage imageWithContentsOfFile:SLFloatIconImagePath([v substringFromIndex:6])];
+        img = [UIImage imageWithContentsOfFile:SLVFloatIconImagePath([v substringFromIndex:6])];
         if (!img) v = kSLFloatIconDefault;
     }
     if (img) {
@@ -467,7 +499,7 @@ static UIImage *SLTransparentImage(void) {
     } else {
         // 48pt 里六根条太密，前 3 根 30% 的几乎看不见，糊成一团。
         // 球和胶囊上换成四根（两淡两实）、条更粗；大尺寸仍用六根。
-        _glyph.image = [SLBrandGlyphCompact(44, [UIColor blackColor]) imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        _glyph.image = [SLVBrandGlyphCompact(44, [UIColor blackColor]) imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
         _glyph.tintColor = [UIColor labelColor];
         _glyph.hidden = NO;
         _glyph.alpha = 0.0;   // v0.4.49：静态图不显示，实际由 _frames 逐根绘制 + 动画
@@ -480,7 +512,7 @@ static UIImage *SLTransparentImage(void) {
 // 描边色是 CALayer 属性，UIView 动画块管不到它 —— 直接赋值会硬切，
 // 状态从灰跳到绿时那一下「啪」很显眼。这里手动补一个过渡。
 // 颜色没变就直接返回：layoutSubviews 会频繁调过来，不能每次都起一遍动画。
-static void SLSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInterval dur) {
+static void SLVSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInterval dur) {
     l.borderWidth = width;
     CGColorRef old = l.borderColor;
     CGColorRef now = c.CGColor;
@@ -495,7 +527,7 @@ static void SLSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInterv
     [l addAnimation:a forKey:@"borderColor"];
 }
 
-// 0.2.26：把两个框摆到 _frames 里。几何沿用 SLBrandGlyphCompact 的 100 单位基准：
+// 0.2.26：把两个框摆到 _frames 里。几何沿用 SLVBrandGlyphCompact 的 100 单位基准：
 // 框 56×92、圆角 17、描边 8.5。用 bounds + center 摆放，锚点天然在正中，
 // 缩放就是「绕中心」，不会偏。
 //
@@ -511,7 +543,7 @@ static void SLSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInterv
     CGFloat h = 92.0 * u;
     CGFloat lw = 8.5 * u;
     CGFloat rad = 17.0 * u;
-    BOOL ready = (self.slState == SLFloatStateReady);
+    BOOL ready = (self.slState == SLVFloatStateReady);
     UIColor *c = _glyph.tintColor ?: [UIColor labelColor];
 
     CGFloat frontX = ready ? 2.0 * u : 22.0 * u;
@@ -521,14 +553,14 @@ static void SLSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInterv
     front.center = CGPointMake(frontX + w / 2.0, side / 2.0);
     front.layer.cornerRadius = rad;
     front.layer.cornerCurve = kCACornerCurveContinuous;
-    SLSetFrameBorder(front.layer, c, lw, 0.26);
+    SLVSetFrameBorder(front.layer, c, lw, 0.26);
 
     UIView *back = _frameCell[1];
     back.bounds = CGRectMake(0, 0, w, h);
     back.center = CGPointMake(42.0 * u + w / 2.0, side / 2.0);
     back.layer.cornerRadius = rad;
     back.layer.cornerCurve = kCACornerCurveContinuous;
-    SLSetFrameBorder(back.layer, [c colorWithAlphaComponent:0.5], lw, 0.26);
+    SLVSetFrameBorder(back.layer, [c colorWithAlphaComponent:0.5], lw, 0.26);
     back.hidden = !ready;
 }
 
@@ -551,7 +583,7 @@ static void SLSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInterv
     CAMediaTimingFunction *ease =
         [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
 
-    if (self.slState == SLFloatStateReady) {
+    if (self.slState == SLVFloatStateReady) {
         CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
         a.fromValue = @0.95;
         a.toValue = @1.0;
@@ -594,22 +626,22 @@ static void SLSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInterv
     UIView *target = nil;
     if (!_thumb.hidden) target = _thumb;
 
-    NSInteger fx = SLFloatEffectValue();
+    NSInteger fx = SLVFloatEffectValue();
 
     // 先无条件清干净：换图标、关动效、切回叠层形态都走这一条
     [_thumb.layer removeAnimationForKey:@"slIconMotion"];
 
     if (!target || fx <= 0) return;
 
-    SLFloatState st = self.slState;
+    SLVFloatState st = self.slState;
 
     // 半周期与光晕一致：空闲 1.4 / 录音 0.45 / 合成 0.70 / 就绪 0.80
     CGFloat half = 1.4;
     CGFloat lo = 0.96;
     BOOL pump = NO, hop = NO;
-    if (st == SLFloatStateRecording) { half = 0.45; lo = 0.94; }
-    else if (st == SLFloatStateSynthesizing) { half = 0.70; pump = YES; }
-    else if (st == SLFloatStateReady) { half = 0.80; hop = YES; }
+    if (st == SLVFloatStateRecording) { half = 0.45; lo = 0.94; }
+    else if (st == SLVFloatStateSynthesizing) { half = 0.70; pump = YES; }
+    else if (st == SLVFloatStateReady) { half = 0.80; hop = YES; }
 
     if (pump) {
         // 合成态「泵动」：前一半慢慢蓄到 0.945，14% 的时间急弹到 1.03，再缓落回 1.0。
@@ -649,16 +681,16 @@ static void SLSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInterv
 
 #pragma mark 状态
 
-- (void)sl_applyState:(SLFloatState)state {
-    SLFloatState prev = self.slState;
+- (void)sl_applyState:(SLVFloatState)state {
+    SLVFloatState prev = self.slState;
     self.slState = state;
 
     UIColor *accent = nil;
     // v0.4.52：四种状态各自一个颜色。原来「合成中」和「已装填」都是蓝，肉眼分不出
     // 到底是在生成还是已经就绪 —— 就绪单独用绿。
-    if (state == SLFloatStateRecording) accent = [UIColor systemRedColor];
-    else if (state == SLFloatStateSynthesizing) accent = [UIColor systemBlueColor];
-    else if (state == SLFloatStateReady) accent = [UIColor systemGreenColor];
+    if (state == SLVFloatStateRecording) accent = [UIColor systemRedColor];
+    else if (state == SLVFloatStateSynthesizing) accent = [UIColor systemBlueColor];
+    else if (state == SLVFloatStateReady) accent = [UIColor systemGreenColor];
 
     // v0.4.77：选了自定义图片时，胶囊底永远只铺图色晕，一点状态色都不掺。
     // 原来状态色一来就把色晕让掉（0.36 → 0），剩下 74% 是超薄毛玻璃自己的白，
@@ -692,8 +724,8 @@ static void SLSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInterv
     [self sl_updateIconMotion];
     // v0.4.57：合成完成→就绪，整颗胶囊轻轻「落定」一下（缩放回弹）。
     // v0.4.60：只在「没有试听面板」时才弹 —— 面板自己有 0.94→1.0 的弹入，
-    // 两下缩放同帧叠加会像「球被按了一下」，所以面板路径改走 SLFloatSetStateQuiet 静音。
-    if (!sSLFloatSettleMuted && prev == SLFloatStateSynthesizing && state == SLFloatStateReady) {
+    // 两下缩放同帧叠加会像「球被按了一下」，所以面板路径改走 SLVFloatSetStateQuiet 静音。
+    if (!sSLFloatSettleMuted && prev == SLVFloatStateSynthesizing && state == SLVFloatStateReady) {
         [self sl_playCompletionSettle];
     }
     // v0.4.50：四套节奏的幅度差得远（0.30 / 0.55 / 0.86 / 1.15），硬切会「跳一下」。
@@ -706,7 +738,7 @@ static void SLSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInterv
         fade.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
         [_frames.layer addAnimation:fade forKey:@"slFade"];
     }
-    _readyDot.hidden = (state != SLFloatStateReady);
+    _readyDot.hidden = (state != SLVFloatStateReady);
 
     // v0.4.57：光环描边是 CAShapeLayer 属性，UIView 动画块管不到，单独用 CATransaction 交叉淡出。
     // 必须放在 sl_startBreath 之后：后者会 removeAllAnimations，提前加的描边动画会被清掉。
@@ -721,18 +753,18 @@ static void SLSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInterv
     [self setNeedsLayout];
 }
 
-- (void)sl_startBreath:(SLFloatState)state {
+- (void)sl_startBreath:(SLVFloatState)state {
     [_haloIn removeAllAnimations];
     [_haloOut removeAllAnimations];
 
     // 半周期时长：一轮完整呼吸 = 2 倍
     CGFloat half = 1.4;      // 空闲 2.8s
     CGFloat a0 = 0.06, a1 = 0.20;   // 空闲只到 0.20，看着「活」但不抢注意力
-    if (state == SLFloatStateRecording) {
+    if (state == SLVFloatStateRecording) {
         half = 0.45; a0 = 0.28; a1 = 0.85;   // 0.9s，急促
-    } else if (state == SLFloatStateSynthesizing) {
+    } else if (state == SLVFloatStateSynthesizing) {
         half = 0.70; a0 = 0.22; a1 = 0.70;   // 1.4s
-    } else if (state == SLFloatStateReady) {
+    } else if (state == SLVFloatStateReady) {
         half = 0.80; a0 = 0.34; a1 = 0.90;   // 1.6s，一直亮到发出去
     }
 
@@ -791,17 +823,17 @@ static void SLSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInterv
 #pragma mark 长按扇
 
 /// 0.2.22：长按停在「启用」球上不动 → 松手进预览。定义在文件末尾。
-static void SLShowMediaPreview(void);
+static void SLVShowMediaPreview(void);
 
 // 球贴哪条边：取四个方向里最近的那条。贴角落时上下 / 左右距离接近，
-// 取到哪条都不算错 —— SLFanView 内部会把扇角收窄、半径缩小，保证不出屏。
-- (SLFanEdge)sl_edgeForCenter:(CGPoint)c inSize:(CGSize)sz {
+// 取到哪条都不算错 —— SLVFanView 内部会把扇角收窄、半径缩小，保证不出屏。
+- (SLVFanEdge)sl_edgeForCenter:(CGPoint)c inSize:(CGSize)sz {
     CGFloat dL = c.x, dR = sz.width - c.x, dT = c.y, dB = sz.height - c.y;
     CGFloat m = MIN(MIN(dL, dR), MIN(dT, dB));
-    if (m == dL) return SLFanEdgeLeft;
-    if (m == dR) return SLFanEdgeRight;
-    if (m == dT) return SLFanEdgeTop;
-    return SLFanEdgeBottom;
+    if (m == dL) return SLVFanEdgeLeft;
+    if (m == dR) return SLVFanEdgeRight;
+    if (m == dT) return SLVFanEdgeTop;
+    return SLVFanEdgeBottom;
 }
 
 - (void)sl_showFan {
@@ -811,15 +843,15 @@ static void SLShowMediaPreview(void);
         [_fan removeFromSuperview];
         _fan = nil;
     }
-    // 几何一律按屏幕量。sv 是 SLKeyWindow() 挑出来的那个窗口，它可能是 QQRTCWindow
+    // 几何一律按屏幕量。sv 是 SLVKeyWindow() 挑出来的那个窗口，它可能是 QQRTCWindow
     // 这类只覆盖屏幕一块的浮层 —— 拿它的 bounds 当屏幕，扇就会被夹小、位置也偏。
     // 但子视图画不到父视图外面，所以实际可用区域取「屏幕」和「sv」里小的那个：
     // 正常 App 两者相等，退化成屏幕；浮层窗口时至少不会画出界。
-    CGSize scr = SLScreenSize();
+    CGSize scr = SLVScreenSize();
     CGSize sz = CGSizeMake(MIN(sv.bounds.size.width, scr.width),
                            MIN(sv.bounds.size.height, scr.height));
     _fanHomePos = self.center;
-    _fan = [[SLFanView alloc] initWithHostSize:sz ballCenter:self.center
+    _fan = [[SLVFanView alloc] initWithHostSize:sz ballCenter:self.center
                                           edge:[self sl_edgeForCenter:self.center inSize:sz]];
     // 扇压在球下面：手指是从球心出发的，球本身不能被盖住
     [sv insertSubview:_fan belowSubview:self];
@@ -837,7 +869,7 @@ static void SLShowMediaPreview(void);
 }
 
 - (void)sl_hideFan {
-    SLFanView *f = _fan;
+    SLVFanView *f = _fan;
     _fan = nil;
     if (!f) return;
     [f sl_hide];
@@ -858,29 +890,29 @@ static void SLShowMediaPreview(void);
 - (void)sl_pan:(UIPanGestureRecognizer *)g {
     UIView *sv = self.superview;
     if (!sv) return;
-    CGSize sz = SLHostSizeFor(sv);
+    CGSize sz = SLVHostSizeFor(sv);
 
     if (g.state == UIGestureRecognizerStateChanged) {
         CGPoint t = [g translationInView:sv];
         // 原来只做 center += 位移，没有任何边界判断 → 能整颗拖出屏幕，
         // 存下来的又是绝对坐标，换设备/横屏恢复后就在屏外。
-        // 现在实时夹在界内（左右各留 SLBallEdgeInset，上让状态栏，下让底部安全区）。
-        self.center = SLClampFloatPos(CGPointMake(self.center.x + t.x, self.center.y + t.y), sz);
+        // 现在实时夹在界内（左右各留 SLVBallEdgeInset，上让状态栏，下让底部安全区）。
+        self.center = SLVClampFloatPos(CGPointMake(self.center.x + t.x, self.center.y + t.y), sz);
         [g setTranslation:CGPointZero inView:sv];
     } else if (g.state == UIGestureRecognizerStateEnded
                || g.state == UIGestureRecognizerStateCancelled) {
         // 松手吸附到最近的一条边，避免球卡在屏幕中间挡住内容
-        CGFloat half = SLBallSide / 2.0;
+        CGFloat half = SLVBallSide / 2.0;
         CGPoint c = self.center;
-        c.x = (c.x < sz.width / 2.0) ? (half + SLBallEdgeInset)
-                                     : (sz.width - half - SLBallEdgeInset);
-        c = SLClampFloatPos(c, sz);
+        c.x = (c.x < sz.width / 2.0) ? (half + SLVBallEdgeInset)
+                                     : (sz.width - half - SLVBallEdgeInset);
+        c = SLVClampFloatPos(c, sz);
         [UIView animateWithDuration:0.22 delay:0
              usingSpringWithDamping:0.85 initialSpringVelocity:0
                             options:UIViewAnimationOptionBeginFromCurrentState
                          animations:^{ self.center = c; }
                          completion:nil];
-        SLStoreFloatPos(c, SLScreenSize());
+        SLVStoreFloatPos(c, SLVScreenSize());
     }
 }
 
@@ -890,7 +922,7 @@ static void SLShowMediaPreview(void);
     if (CFAbsoluteTimeGetCurrent() - _longPressAt < 0.7) return;
     // 关掉「启用」之后球也要能点：素材库跟启用状态无关，
     // 用户常常是「先换素材，再打开开关」，这里不能拦。
-    SLCamHandleArrowTap(self);
+    SLVCamHandleArrowTap(self);
 }
 
 - (void)sl_longPress:(UILongPressGestureRecognizer *)g {
@@ -920,8 +952,8 @@ static void SLShowMediaPreview(void);
             [self sl_hideFan];
             if (g.state == UIGestureRecognizerStateEnded) {
                 // 停住「启用」球再松手 = 预览素材，不切开关
-                if (preview) SLShowMediaPreview();
-                else SLFanCommit(sw, ang);
+                if (preview) SLVShowMediaPreview();
+                else SLVFanCommit(sw, ang);
             }
         }
     }
@@ -935,7 +967,7 @@ static void SLShowMediaPreview(void);
     [super layoutSubviews];
     CGRect b = self.bounds;
     CGFloat w = CGRectGetWidth(b);
-    CGFloat h = SLBallSide;
+    CGFloat h = SLVBallSide;
 
     _glassHost.frame = b;
     _glassHost.layer.cornerRadius = h / 2.0;
@@ -971,7 +1003,7 @@ static void SLShowMediaPreview(void);
 
 @end
 
-@interface SLFloatPanelController ()
+@interface SLVFloatPanelController ()
 @property (nonatomic, strong) UIControl *dim;
 @property (nonatomic, strong) UIView *cardWrap;
 /// v0.4.44：卡片圆角的硬裁剪（mask 比 clipsToBounds 可靠，contentView 是系统私有类）
@@ -985,9 +1017,9 @@ static void SLShowMediaPreview(void);
 @end
 
 // v0.4.55：记住当前浮窗实例，避免长按球等在设置已开时又叠第二层
-static SLFloatPanelController *sSLFloatPanel = nil;
+static SLVFloatPanelController *sSLFloatPanel = nil;
 
-@implementation SLFloatPanelController
+@implementation SLVFloatPanelController
 
 + (void)presentFrom:(UIViewController *)host root:(UIViewController *)root {
     if (!host || !root) return;
@@ -996,19 +1028,19 @@ static SLFloatPanelController *sSLFloatPanel = nil;
     if (sSLFloatPanel && sSLFloatPanel.presentingViewController) return;
     // 已经有浮窗开着就不叠第二层，避免连点两次出现两张卡片
     if (host.presentedViewController) return;
-    SLFloatPanelController *vc = [[SLFloatPanelController alloc] init];
+    SLVFloatPanelController *vc = [[SLVFloatPanelController alloc] init];
     sSLFloatPanel = vc;
     vc.rootVC = root;
     vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
     vc.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
     // v0.4.54：浮窗盖上来之后把球重新抬到最上层，别让卡片压住它
     [host presentViewController:vc animated:YES completion:^{
-        SLRaiseFloatButton();
+        SLVRaiseFloatButton();
     }];
 }
 
 + (void)presentSettingsFrom:(UIViewController *)host {
-    [self presentFrom:host root:[[SLSettingsPanel alloc] init]];
+    [self presentFrom:host root:[[SLVSettingsPanel alloc] init]];
 }
 
 + (BOOL)isSettingsOpen {
@@ -1022,7 +1054,7 @@ static SLFloatPanelController *sSLFloatPanel = nil;
 }
 
 + (void)presentMediaFrom:(UIViewController *)host {
-    [self presentFrom:host root:[[SLMediaListController alloc] init]];
+    [self presentFrom:host root:[[SLVMediaListController alloc] init]];
 }
 
 - (void)viewDidLoad {
@@ -1075,7 +1107,7 @@ static SLFloatPanelController *sSLFloatPanel = nil;
     self.cardMask = [CAShapeLayer layer];
     self.blur.layer.mask = self.cardMask;
 
-    SLSettingsPanel *root = [[SLSettingsPanel alloc] init];
+    SLVSettingsPanel *root = [[SLVSettingsPanel alloc] init];
     self.nav = [[UINavigationController alloc] initWithRootViewController:(self.rootVC ?: root)];
     self.nav.view.backgroundColor = [UIColor clearColor];
     [self addChildViewController:self.nav];
@@ -1092,7 +1124,7 @@ static SLFloatPanelController *sSLFloatPanel = nil;
 - (void)sl_applyNavTransparency {
     UINavigationBar *nb = self.nav.navigationBar;
     if (!nb) return;
-    UIImage *clear1x1 = SLTransparentImage();
+    UIImage *clear1x1 = SLVTransparentImage();
     if (@available(iOS 13.0, *)) {
         UINavigationBarAppearance *ap = [[UINavigationBarAppearance alloc] init];
         [ap configureWithTransparentBackground];
@@ -1152,7 +1184,7 @@ static SLFloatPanelController *sSLFloatPanel = nil;
     // 不同 App 的容器可能不一样（带 inset、formSheet、被 Scene 改过），
     // 表现就是「设置菜单在每个 App 里大小不同」。
     // 位置仍按容器居中，因为卡片是加在容器上的，坐标基准是容器。
-    CGSize scr = SLScreenSize();
+    CGSize scr = SLVScreenSize();
     CGFloat w = MIN(scr.width - 24.0, 380.0);
     CGFloat h = MIN(scr.height * 0.66, 560.0);
     CGRect r = CGRectMake(round((host.width - w) / 2.0), round((host.height - h) / 2.0) - 18.0, w, h);
@@ -1240,7 +1272,7 @@ static SLFloatPanelController *sSLFloatPanel = nil;
         self.cardWrap.transform = CGAffineTransformIdentity;
     } completion:nil];
     // v0.4.54：卡片进场动画结束时再抬一次球（present 的 completion 有时早于最后一次布局）
-    SLRaiseFloatButton();
+    SLVRaiseFloatButton();
 }
 
 - (void)sl_dismiss {
@@ -1251,36 +1283,36 @@ static SLFloatPanelController *sSLFloatPanel = nil;
 @end
 
 // 按当前设置把图标套到按钮上
-static void SLApplyFloatIcon(UIButton *btn) {
-    if (![btn isKindOfClass:[SLFloatButton class]]) return;
-    [(SLFloatButton *)btn sl_loadIcon];
+static void SLVApplyFloatIcon(UIButton *btn) {
+    if (![btn isKindOfClass:[SLVFloatButton class]]) return;
+    [(SLVFloatButton *)btn sl_loadIcon];
 }
 
 // v0.4.34：三态入口。Tweak.x 在录音 / 合成钩子里调用，界面只改颜色和环，不做任何业务判断。
-static __weak SLFloatButton *sSLFloatBtn = nil;
+static __weak SLVFloatButton *sSLFloatBtn = nil;
 
-void SLFloatSetState(SLFloatState state) {
+void SLVFloatSetState(SLVFloatState state) {
     // 录音 / 合成的钩子不一定在主线程，碰 UI 一律回主队列
     if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ SLFloatSetState(state); });
+        dispatch_async(dispatch_get_main_queue(), ^{ SLVFloatSetState(state); });
         return;
     }
-    SLFloatButton *b = sSLFloatBtn;
+    SLVFloatButton *b = sSLFloatBtn;
     if (!b) return;
     // v0.4.36：就绪不再 1.6 秒后自己退回空闲 —— 它要一直亮着，
     // 直到语音真正发出去（发送完成那一刻会走 Ready → Idle，顺带外扩一圈涟漪）。
     [b sl_applyState:state];
 }
 
-// v0.4.60：同 SLFloatSetState，但不触发「落定」缩放回弹。
+// v0.4.60：同 SLVFloatSetState，但不触发「落定」缩放回弹。
 // 用途只有一个：试听面板弹出后把球点成 Ready 绿 —— 那一刻面板自己在弹入，
 // 球再缩一下就成了两个动画撞车。静音范围严格限定在这次 apply 之内。
-void SLFloatSetStateQuiet(SLFloatState state) {
+void SLVFloatSetStateQuiet(SLVFloatState state) {
     if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ SLFloatSetStateQuiet(state); });
+        dispatch_async(dispatch_get_main_queue(), ^{ SLVFloatSetStateQuiet(state); });
         return;
     }
-    SLFloatButton *b = sSLFloatBtn;
+    SLVFloatButton *b = sSLFloatBtn;
     if (!b) return;
     BOOL prevMuted = sSLFloatSettleMuted;
     sSLFloatSettleMuted = YES;
@@ -1289,7 +1321,7 @@ void SLFloatSetStateQuiet(SLFloatState state) {
 }
 
 // 浮窗内部是子控制器，点「完成」时先向上找真正的呈现者
-void SLCloseHostingPanel(UIViewController *vc) {
+void SLVCloseHostingPanel(UIViewController *vc) {
     if (!vc) return;
     UIViewController *c = vc;
     while (c && !c.presentingViewController) c = c.parentViewController;
@@ -1299,7 +1331,7 @@ void SLCloseHostingPanel(UIViewController *vc) {
 }
 
 // 键盘 / 状态栏 / 文本特效这些私有窗口不能挂球：挂上去要么看不见，要么跟着窗口一起消失
-static BOOL SLIsSystemOverlayWindow(UIWindow *w) {
+static BOOL SLVIsSystemOverlayWindow(UIWindow *w) {
     NSString *cn = NSStringFromClass([w class]);
     if (cn.length == 0) return NO;
     return [cn containsString:@"TextEffects"] || [cn containsString:@"Keyboard"]
@@ -1310,7 +1342,7 @@ static BOOL SLIsSystemOverlayWindow(UIWindow *w) {
 // v0.4.37：不再只认 ForegroundActive + isKeyWindow。陌陌启动早期常是启动页 / 广告窗，
 // 球挂上去那窗一关就跟着没了；另一种是球被更高层的窗压住，viewWithTag 还能找到，
 // 于是永不重建、也永不可见。现在改成「所有场景里挑最顶层且可见的那个窗」，球永远住最上面。
-static UIWindow *SLKeyWindow(void) {
+static UIWindow *SLVKeyWindow(void) {
     NSMutableArray<UIWindow *> *list = [NSMutableArray array];
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -1318,7 +1350,7 @@ static UIWindow *SLKeyWindow(void) {
             UIWindowScene *ws = (UIWindowScene *)scene;
             for (UIWindow *w in ws.windows) {
                 if (!w || w.hidden || w.alpha < 0.02) continue;
-                if (SLIsSystemOverlayWindow(w)) continue;
+                if (SLVIsSystemOverlayWindow(w)) continue;
                 [list addObject:w];
             }
         }
@@ -1327,7 +1359,7 @@ static UIWindow *SLKeyWindow(void) {
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     if (list.count == 0) {
         UIWindow *kw = [UIApplication sharedApplication].keyWindow;
-        if (kw && !kw.hidden && !SLIsSystemOverlayWindow(kw)) [list addObject:kw];
+        if (kw && !kw.hidden && !SLVIsSystemOverlayWindow(kw)) [list addObject:kw];
         id del = [UIApplication sharedApplication].delegate;
         if ([del respondsToSelector:NSSelectorFromString(@"window")]) {
             id dw = [del valueForKey:@"window"];
@@ -1358,16 +1390,16 @@ static UIWindow *SLKeyWindow(void) {
 // 设置浮窗与试听卡片都是 OverFullScreen 呈现，直接盖在球上面 —— 用户看到的是
 // 「球被卡片压掉一半」。这里在面板每次出现后调一次：球若落在别的窗口就先迁到最顶层窗口，
 // 再在同一个窗口里 bringSubviewToFront；转场结束后补抬一次（系统重排图层会把它压回去）。
-void SLRaiseFloatButton(void) {
+void SLVRaiseFloatButton(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        SLFloatButton *btn = sSLFloatBtn;
+        SLVFloatButton *btn = sSLFloatBtn;
         if (!btn) {
-            UIWindow *w0 = SLKeyWindow();
-            btn = (SLFloatButton *)[w0 viewWithTag:SLBtnTag];
+            UIWindow *w0 = SLVKeyWindow();
+            btn = (SLVFloatButton *)[w0 viewWithTag:SLVBtnTag];
         }
         if (!btn) return;
 
-        UIWindow *top = SLKeyWindow();
+        UIWindow *top = SLVKeyWindow();
         UIWindow *cur = btn.window;
         if (top && cur && top != cur && top.windowLevel >= cur.windowLevel) {
             [btn removeFromSuperview];
@@ -1379,38 +1411,38 @@ void SLRaiseFloatButton(void) {
         // superview 提，并把补抬从 0.4s 提前到 0.05 / 0.18s（仍在系统重排之后）。
         [btn.superview bringSubviewToFront:btn];
 
-        __weak SLFloatButton *weakBtn = btn;
+        __weak SLVFloatButton *weakBtn = btn;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            SLFloatButton *b = weakBtn;
+            SLVFloatButton *b = weakBtn;
             if (!b || !b.superview) return;
             [b.superview bringSubviewToFront:b];
         });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            SLFloatButton *b = weakBtn;
+            SLVFloatButton *b = weakBtn;
             if (!b || !b.superview) return;
             [b.superview bringSubviewToFront:b];
         });
     });
 }
 
-void SLRefreshFloatButton(void) {
-    SLFloatButton *btn = sSLFloatBtn;
+void SLVRefreshFloatButton(void) {
+    SLVFloatButton *btn = sSLFloatBtn;
     if (!btn) {
-        UIWindow *w = SLKeyWindow();
-        btn = (SLFloatButton *)[w viewWithTag:SLBtnTag];
+        UIWindow *w = SLVKeyWindow();
+        btn = (SLVFloatButton *)[w viewWithTag:SLVBtnTag];
     }
-    SLApplyFloatIcon(btn);
+    SLVApplyFloatIcon(btn);
     // 0.2.28：绿球 = 「现在正在替换」，两个条件缺一不可。
     //
-    // 原来只判 SLCamArmed()（素材就绪 + 帧源 ready），漏了总开关 —— 关掉「启用」但
+    // 原来只判 SLVCamArmed()（素材就绪 + 帧源 ready），漏了总开关 —— 关掉「启用」但
     // 素材还留着的时候，球依然是绿的，等于告诉用户「在替换」，其实早就放行了原画面。
     //
     // 关掉就退回 Idle：单框、中性色、42% 透明度，跟「没素材」完全一样。
     // 这两件事对用户的意义本来就是同一个 —— 没在替换，没必要再造第三种颜色。
-    BOOL working = SLCamEnabled() && SLCamArmed();
-    SLFloatState want = working ? SLFloatStateReady : SLFloatStateIdle;
+    BOOL working = SLVCamEnabled() && SLVCamArmed();
+    SLVFloatState want = working ? SLVFloatStateReady : SLVFloatStateIdle;
     // 状态没变就别再调 —— sl_applyState 会重挂一遍动画，窗口轮询每 2 秒走一次这里，
     // 每次都重挂的话球上的呼吸会一顿一顿的。
     if (btn && btn.slState != want) [btn sl_applyState:want];
@@ -1418,12 +1450,12 @@ void SLRefreshFloatButton(void) {
 
 // 球/扇能用的那块区域。
 //
-// 不能直接用 sv.bounds：sv 是 SLKeyWindow() 挑的窗口，它挑的是 windowLevel 最高的，
+// 不能直接用 sv.bounds：sv 是 SLVKeyWindow() 挑的窗口，它挑的是 windowLevel 最高的，
 // 而 iOS 里最高的常常不是主窗口（QQRTCWindow、键盘窗、Alert 窗都排在前面），
 // bounds 只是屏幕的一块。也不能只用屏幕：子视图画不到父视图外面，会裁。
 // 取两者较小的一边，正常 App 退化成屏幕，浮层窗口时至少不出界。
-static CGSize SLHostSizeFor(UIView *sv) {
-    CGSize scr = SLScreenSize();
+static CGSize SLVHostSizeFor(UIView *sv) {
+    CGSize scr = SLVScreenSize();
     if (!sv) return scr;
     CGSize s = sv.bounds.size;
     if (s.width <= 0 || s.height <= 0) return scr;
@@ -1432,11 +1464,11 @@ static CGSize SLHostSizeFor(UIView *sv) {
 
 // 把中心点夹在「不会被屏幕边缘切掉」的范围内。
 // 原来那版是「越界就重置」—— 拖到边上会突然跳回中间，而且重置值本身也可能越界。
-static CGPoint SLClampFloatPos(CGPoint c, CGSize size) {
+static CGPoint SLVClampFloatPos(CGPoint c, CGSize size) {
     if (size.width <= 0 || size.height <= 0) return c;
-    CGFloat half = SLBallSide / 2.0;
-    CGFloat minX = half + SLBallEdgeInset;
-    CGFloat maxX = size.width - half - SLBallEdgeInset;
+    CGFloat half = SLVBallSide / 2.0;
+    CGFloat minX = half + SLVBallEdgeInset;
+    CGFloat maxX = size.width - half - SLVBallEdgeInset;
     CGFloat minY = half + 56.0;                 // 让开状态栏 / 刘海
     CGFloat maxY = size.height - half - 34.0;   // 让开底部安全区
     if (maxX < minX) { c.x = size.width / 2.0; }
@@ -1459,10 +1491,15 @@ static CGPoint SLClampFloatPos(CGPoint c, CGSize size) {
 // 走的是 cfprefsd 的 XPC，落盘由 cfprefsd 以用户身份完成，不在 App 沙盒内，所以能成，
 // 顺带也不用判断 rootless 越狱下 /var/jb 的前缀。
 static NSString *const kSLSharedDomain = @"com.taylorchen.shenglinvcam";
-static NSString *const kSLPosRelKey    = @"SLFloatPosRel";
-static NSString *const kSLPosAbsKey    = @"SLFloatPos";
+static NSString *const kSLPosRelKey    = @"SLVFloatPosRel";
+static NSString *const kSLPosAbsKey    = @"SLVFloatPos";
+// 0.3.0 改名前的旧键。当时和声临陌陌用的是同一串（SLFloatPos / SLFloatPosRel），
+// 两个 dylib 同进程时会互相覆盖位置。这里只读不写，读到就立刻搬到新键上，
+// 老用户升级后球不会跳回默认位。
+static NSString *const kSLPosRelKeyOld = @"SLFloatPosRel";
+static NSString *const kSLPosAbsKeyOld = @"SLFloatPos";
 
-static NSString *SLSharedString(NSString *key) {
+static NSString *SLVSharedString(NSString *key) {
     CFStringRef domain = (__bridge CFStringRef)kSLSharedDomain;
     CFPreferencesSynchronize(domain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
     CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)key, domain);
@@ -1473,30 +1510,32 @@ static NSString *SLSharedString(NSString *key) {
     return s;
 }
 
-static void SLSharedSet(NSString *key, NSString *value) {
+static void SLVSharedSet(NSString *key, NSString *value) {
     CFStringRef domain = (__bridge CFStringRef)kSLSharedDomain;
     CFPreferencesSetAppValue((__bridge CFStringRef)key, (__bridge CFStringRef)value, domain);
     CFPreferencesAppSynchronize(domain);
 }
 
-static void SLStoreFloatPos(CGPoint c, CGSize size) {
+static void SLVStoreFloatPos(CGPoint c, CGSize size) {
     if (size.width <= 0 || size.height <= 0) return;
     NSString *rel = [NSString stringWithFormat:@"%.4f,%.4f", c.x / size.width, c.y / size.height];
-    SLSharedSet(kSLPosRelKey, rel);
-    SLSharedSet(kSLPosAbsKey, NSStringFromCGPoint(c));   // 兼容旧版读法
+    SLVSharedSet(kSLPosRelKey, rel);
+    SLVSharedSet(kSLPosAbsKey, NSStringFromCGPoint(c));   // 兼容旧版读法
     // 本 App 也留一份：万一全局域被拒（个别宿主沙盒更严），下次还能读回自己那份，
     // 不至于每次都跳回默认位置。
     [[NSUserDefaults standardUserDefaults] setObject:rel forKey:kSLPosRelKey];
 }
 
-static CGPoint SLLoadFloatPos(CGSize size) {
-    NSString *rel = SLSharedString(kSLPosRelKey);
+static CGPoint SLVLoadFloatPos(CGSize size) {
+    NSString *rel = SLVSharedString(kSLPosRelKey);
+    if (!rel.length) rel = SLVSharedString(kSLPosRelKeyOld);   // 0.3.0 改名迁移
     if (!rel.length) {
         // 全局域还是空的（第一次装 0.2.15）→ 从本 App 的旧值迁移过来，
         // 老用户升级后球不会跳位。
         NSString *old = [[NSUserDefaults standardUserDefaults] stringForKey:kSLPosRelKey];
+        if (!old.length) old = [[NSUserDefaults standardUserDefaults] stringForKey:kSLPosRelKeyOld];
         if (old.length) {
-            SLSharedSet(kSLPosRelKey, old);
+            SLVSharedSet(kSLPosRelKey, old);
             rel = old;
         }
     }
@@ -1505,35 +1544,46 @@ static CGPoint SLLoadFloatPos(CGSize size) {
         if (p.count == 2) {
             double rx = [p[0] doubleValue], ry = [p[1] doubleValue];
             if (rx > 0.03 && rx < 0.97 && ry > 0.03 && ry < 0.97) {
+                SLVSharedSet(kSLPosRelKey, rel);   // 从旧键读来的，顺手写进新键
                 return CGPointMake(rx * size.width, ry * size.height);
             }
         }
     }
-    NSString *abs = SLSharedString(kSLPosAbsKey);
+    NSString *abs = SLVSharedString(kSLPosAbsKey);
+    if (!abs.length) abs = SLVSharedString(kSLPosAbsKeyOld);
     if (!abs.length) abs = [[NSUserDefaults standardUserDefaults] stringForKey:kSLPosAbsKey];
-    if (abs.length) return CGPointFromString(abs);
-    return CGPointMake(size.width - 36.0, size.height * 0.55);
+    if (!abs.length) abs = [[NSUserDefaults standardUserDefaults] stringForKey:kSLPosAbsKeyOld];
+    if (abs.length) {
+        SLVSharedSet(kSLPosAbsKey, abs);
+        return CGPointFromString(abs);
+    }
+    // 0.3.0：默认落点从 0.55 挪到 0.72。声临陌陌的默认落点也在 0.55 一带，
+    // 两边同时装、位置又都没存过时，两个球会叠在一起，看起来像「只有一个」。
+    return CGPointMake(size.width - 36.0, size.height * 0.72);
 }
 
-void SLEnsureFloatButton(void) {
-    UIWindow *w = SLKeyWindow();
+void SLVEnsureFloatButton(void) {
+    UIWindow *w = SLVKeyWindow();
     if (!w) {
         // 一直拿不到窗口就静默失败了，下次再出现「没有球」根本查不到原因 —— 限频记一条
         static CFAbsoluteTime last = 0;
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - last > 30.0) {
             last = now;
-            SLLog(@"SL-VCAM: no host window yet, float button not mounted");
+            SLVLog(@"SL-VCAM: no host window yet, float button not mounted");
         }
         return;
     }
-    SLFloatButton *btn = (SLFloatButton *)[w viewWithTag:SLBtnTag];
+    SLVFloatButton *btn = (SLVFloatButton *)[w viewWithTag:SLVBtnTag];
+    // tag 是自己独享的 20941，正常不会撞；但万一宿主的某个视图碰巧也用这个值，
+    // 强转过去会一路把别人的视图当球使 —— 类型不对就当没找到。
+    if (btn && ![btn isKindOfClass:[SLVFloatButton class]]) btn = nil;
     if (!btn) btn = sSLFloatBtn;   // 可能还挂在已经被换下去的旧窗口上
     if (btn && btn.superview != w) {
         // v0.4.37：窗口被换（启动页 / 广告窗关掉、场景重建）时把球迁到新的顶层窗口，
         // 否则球跟着旧窗一起消失，而且在新窗口里找不到 tag、只能等下次冷启动。
         [btn removeFromSuperview];
-        btn.center = SLClampFloatPos(btn.center, SLHostSizeFor(w));
+        btn.center = SLVClampFloatPos(btn.center, SLVHostSizeFor(w));
         [w addSubview:btn];
         // 抖音这类 App 的遮罩窗一秒能换好几次，逐次打日志会把整份日志顶满。
         // 同一类窗口只记第一次，之后每 50 次补一行心跳。
@@ -1545,15 +1595,31 @@ void SLEnsureFloatButton(void) {
         BOOL firstForWindow = ![sSeenWindows containsObject:wn];
         if (firstForWindow) [sSeenWindows addObject:wn];
         if (firstForWindow || sMoveCount % 50 == 0) {
-            SLLog(@"SL-VCAM: float button moved to top window (%@)%@", wn,
+            SLVLog(@"SL-VCAM: float button moved to top window (%@)%@", wn,
                   firstForWindow ? @"" : [NSString stringWithFormat:@" · 累计 %d 次", sMoveCount]);
         }
     }
     if (!btn) {
-        CGPoint c = SLClampFloatPos(SLLoadFloatPos(SLScreenSize()), SLHostSizeFor(w));
-        btn = [[SLFloatButton alloc] initWithFrame:CGRectMake(0, 0, 48, 48)];
+        CGPoint c = SLVClampFloatPos(SLVLoadFloatPos(SLVScreenSize()), SLVHostSizeFor(w));
+        // 0.3.0：窗口里要是已经有声临陌陌的球（它用 20931）且位置几乎重合，
+        // 把我们的往下挪一格。两个球叠在一起，看起来就是「只有一个球」——
+        // 这也是「装了 Vcam 却没有 Vcam 的球」最常见的那种现场。
+        // 只在首次创建时兜底，用户自己拖过的位置不覆盖。
+        UIView *other = [w viewWithTag:20931];
+        if (other && other != btn) {
+            if (fabs(other.center.x - c.x) < 40.0 && fabs(other.center.y - c.y) < 56.0) {
+                CGPoint moved = c;
+                moved.y = other.center.y + 64.0;
+                moved = SLVClampFloatPos(moved, SLVHostSizeFor(w));
+                SLVLog(@"SL-VCAM: momo ball at %@ overlaps ours %@, moved to %@",
+                       NSStringFromCGPoint(other.center), NSStringFromCGPoint(c),
+                       NSStringFromCGPoint(moved));
+                c = moved;
+            }
+        }
+        btn = [[SLVFloatButton alloc] initWithFrame:CGRectMake(0, 0, 48, 48)];
         btn.center = c;
-        btn.tag = SLBtnTag;
+        btn.tag = SLVBtnTag;
         [w addSubview:btn];
         // 球被宿主反复移除重建时位置是一样的，重复打没有信息量
         static CGPoint sLastMountPos;
@@ -1562,7 +1628,7 @@ void SLEnsureFloatButton(void) {
         sMountCount++;
         BOOL posChanged = !sHaveMountPos || !CGPointEqualToPoint(sLastMountPos, c);
         if (posChanged || sMountCount % 50 == 1) {
-            SLLog(@"SL-VCAM: float button mounted at %@%@", NSStringFromCGPoint(c),
+            SLVLog(@"SL-VCAM: float button mounted at %@%@", NSStringFromCGPoint(c),
                   posChanged ? @"" : [NSString stringWithFormat:@" · 累计 %d 次", sMountCount]);
         }
         sLastMountPos = c;
@@ -1572,28 +1638,28 @@ void SLEnsureFloatButton(void) {
 }
 
 // 统一入口：异常不再静默吞掉（限频 30s 一条，避免轮询刷屏）
-static void SLEnsureFloatButtonSafe(NSString *tag) {
+static void SLVEnsureFloatButtonSafe(NSString *tag) {
     @try {
-        SLEnsureFloatButton();
+        SLVEnsureFloatButton();
     } @catch (NSException *e) {
         static CFAbsoluteTime last = 0;
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         if (now - last > 30.0) {
             last = now;
-            SLLog(@"SL-VCAM: ensure float button failed (%@): %@", tag ?: @"?", e.reason);
+            SLVLog(@"SL-VCAM: ensure float button failed (%@): %@", tag ?: @"?", e.reason);
         }
     }
 }
 
 
 // 不用 hook UIViewController：主队列定时检查并挂载（低侵入，避免 Logos 多 hook 嵌套坑）
-void SLStartEntryWatcher(void) {
+void SLVStartEntryWatcher(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
         dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, (uint64_t)(2.0 * NSEC_PER_SEC), (uint64_t)(1.0 * NSEC_PER_SEC));
         dispatch_source_set_event_handler(timer, ^{
-            SLEnsureFloatButtonSafe(@"timer");
+            SLVEnsureFloatButtonSafe(@"timer");
         });
         dispatch_resume(timer);
 
@@ -1601,7 +1667,7 @@ void SLStartEntryWatcher(void) {
         // 这几种情况就是「球突然没了」的高发时刻：广告窗关掉、回前台换窗口、场景重建。
         void (^kick)(NSNotification *) = ^(NSNotification *n) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                SLEnsureFloatButtonSafe(n.name ?: @"notify");
+                SLVEnsureFloatButtonSafe(n.name ?: @"notify");
             });
         };
         for (NSString *name in @[UIWindowDidBecomeVisibleNotification,
@@ -1619,16 +1685,16 @@ void SLStartEntryWatcher(void) {
                                                                queue:[NSOperationQueue mainQueue]
                                                           usingBlock:kick];
         }
-        SLEnsureFloatButtonSafe(@"launch");
+        SLVEnsureFloatButtonSafe(@"launch");
     });
 }
 
 #pragma mark - 图标选择页
 
-@interface SLFloatIconController () <PHPickerViewControllerDelegate>
+@interface SLVFloatIconController () <PHPickerViewControllerDelegate>
 @end
 
-@implementation SLFloatIconController
+@implementation SLVFloatIconController
 
 - (instancetype)init {
     self = [super initWithStyle:UITableViewStyleInsetGrouped];
@@ -1639,10 +1705,10 @@ void SLStartEntryWatcher(void) {
     [super viewDidLoad];
     self.title = @"悬浮球图标";
     // v0.4.50：跟设置页统一 —— 毛玻璃底 + 胶囊标题 + 胶囊「完成」
-    self.navigationItem.titleView = SLPillTitleView(@"悬浮球图标");
-    SLInstallPillBack(self);   // v0.4.53：返回键胶囊
-    SLApplyGlassTable(self.tableView);
-    self.navigationItem.rightBarButtonItem = SLPillBarItem(@"完成", self, @selector(sl_done));
+    self.navigationItem.titleView = SLVPillTitleView(@"悬浮球图标");
+    SLVInstallPillBack(self);   // v0.4.53：返回键胶囊
+    SLVApplyGlassTable(self.tableView);
+    self.navigationItem.rightBarButtonItem = SLVPillBarItem(@"完成", self, @selector(sl_done));
 }
 
 - (void)sl_done {
@@ -1676,7 +1742,7 @@ void SLStartEntryWatcher(void) {
 // v0.4.50：单元格底色统一刷玻璃片（表格透明后不刷就是纯灰行）
 - (void)tableView:(UITableView *)tv willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)ip {
     (void)tv; (void)ip;
-    cell.backgroundColor = SLGlassCellColor();
+    cell.backgroundColor = SLVGlassCellColor();
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -1687,7 +1753,7 @@ void SLStartEntryWatcher(void) {
     cell.textLabel.font = [UIFont systemFontOfSize:16];
     cell.detailTextLabel.text = nil;
 
-    NSString *cur = SLFloatIconValue();
+    NSString *cur = SLVFloatIconValue();
     if (ip.row == 0) {
         cell.textLabel.text = @"从相册选择图片";
         cell.detailTextLabel.text = [cur hasPrefix:@"image:"] ? @"已设置" : @"";
@@ -1711,14 +1777,14 @@ void SLStartEntryWatcher(void) {
     }
     [d setObject:kSLFloatIconDefault forKey:kSLFloatIconKey];
     [d synchronize];
-    [[NSFileManager defaultManager] removeItemAtPath:SLFloatIconImagePath(@"icon.png") error:nil];
+    [[NSFileManager defaultManager] removeItemAtPath:SLVFloatIconImagePath(@"icon.png") error:nil];
     [self sl_applied];
 }
 
 - (void)sl_applied {
-    SLRefreshFloatButton();
+    SLVRefreshFloatButton();
     [self.tableView reloadData];
-    SLToast(@"已更新");
+    SLVToast(@"已更新");
 }
 
 - (void)sl_pickPhoto {
@@ -1735,17 +1801,17 @@ void SLStartEntryWatcher(void) {
     if (!results.count) return;
     NSItemProvider *p = results.firstObject.itemProvider;
     if (![p canLoadObjectOfClass:[UIImage class]]) {
-        SLToast(@"图片读不出来");
+        SLVToast(@"图片读不出来");
         return;
     }
     __weak typeof(self) ws = self;
     [p loadObjectOfClass:[UIImage class] completionHandler:^(id<NSItemProviderReading> obj, NSError *err) {
         dispatch_async(dispatch_get_main_queue(), ^{
             UIImage *img = [obj isKindOfClass:[UIImage class]] ? (UIImage *)obj : nil;
-            if (img && SLSaveFloatIconImage(img)) {
+            if (img && SLVSaveFloatIconImage(img)) {
                 [ws sl_applied];
             } else {
-                SLToast(@"保存失败");
+                SLVToast(@"保存失败");
             }
         });
     }];
@@ -1760,12 +1826,12 @@ void SLStartEntryWatcher(void) {
 // 两种情况分开走：浮窗已经开着（设置页 / 素材页）就直接推进它自己的导航栈；
 // 没开着才新起一层。不能只调 presentFrom: —— 它有「已经开着就不再叠第二层」
 // 的守卫，浮窗开着时这次点击会被静默吃掉。
-static void SLShowMediaPreview(void) {
+static void SLVShowMediaPreview(void) {
     if (sSLFloatPanel && sSLFloatPanel.presentingViewController && sSLFloatPanel.nav) {
-        [sSLFloatPanel.nav pushViewController:[[SLMediaPreviewController alloc] init] animated:YES];
+        [sSLFloatPanel.nav pushViewController:[[SLVMediaPreviewController alloc] init] animated:YES];
         return;
     }
-    UIViewController *host = SLTopViewController();
+    UIViewController *host = SLVTopViewController();
     if (!host) return;
-    [SLFloatPanelController presentFrom:host root:[[SLMediaPreviewController alloc] init]];
+    [SLVFloatPanelController presentFrom:host root:[[SLVMediaPreviewController alloc] init]];
 }

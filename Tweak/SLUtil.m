@@ -1,11 +1,11 @@
 //
-//  SLUtil.m
+//  SLVUtil.m
 //  声临 · 虚拟摄像头 —— 底包通用小工具
 //
 
 #import "SLUtil.h"
 
-NSString *SLDocumentsPath(void) {
+NSString *SLVDocumentsPath(void) {
     static NSString *p = nil;
     if (!p) {
         NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
@@ -14,8 +14,8 @@ NSString *SLDocumentsPath(void) {
     return p;
 }
 
-NSString *SLStoreDir(void) {
-    NSString *dir = [SLDocumentsPath() stringByAppendingPathComponent:@"ShenglinVcam"];
+NSString *SLVStoreDir(void) {
+    NSString *dir = [SLVDocumentsPath() stringByAppendingPathComponent:@"ShenglinVcam"];
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         [[NSFileManager defaultManager] createDirectoryAtPath:dir
@@ -26,8 +26,8 @@ NSString *SLStoreDir(void) {
     return dir;
 }
 
-NSString *SLStorePath(NSString *name) {
-    return [SLStoreDir() stringByAppendingPathComponent:name];
+NSString *SLVStorePath(NSString *name) {
+    return [SLVStoreDir() stringByAppendingPathComponent:name];
 }
 
 // 同一时刻只留一条。以前每条 toast 都往窗口上加一个 UILabel，两次连发就叠在一起 ——
@@ -35,7 +35,7 @@ NSString *SLStorePath(NSString *name) {
 // 现在新 toast 进来先把旧的摘掉（连带取消它的动画，否则旧的那个还会走完淡出再 remove）。
 static UILabel *sToastLab = nil;
 
-static void SLToastDuration(NSString *message, NSTimeInterval dur) {
+static void SLVToastDuration(NSString *message, NSTimeInterval dur) {
     if (!message.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         if (sToastLab) {
@@ -93,15 +93,15 @@ static void SLToastDuration(NSString *message, NSTimeInterval dur) {
     });
 }
 
-void SLToast(NSString *message) {
-    SLToastDuration(message, 1.2);
+void SLVToast(NSString *message) {
+    SLVToastDuration(message, 1.2);
 }
 
-void SLToastLong(NSString *message) {
-    SLToastDuration(message, 2.0);
+void SLVToastLong(NSString *message) {
+    SLVToastDuration(message, 2.0);
 }
 
-UIViewController *SLTopViewController(void) {
+UIViewController *SLVTopViewController(void) {
     UIWindow *win = nil;
     for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
         if (![sc isKindOfClass:[UIWindowScene class]]) continue;
@@ -127,7 +127,7 @@ UIViewController *SLTopViewController(void) {
 // 屏幕尺寸的唯一出口。
 //
 // 为什么不能直接读 superview.bounds / self.view.bounds：
-// 球挂在 SLKeyWindow() 挑出来的那个窗口上，而它挑的是 windowLevel 最高的窗口。
+// 球挂在 SLVKeyWindow() 挑出来的那个窗口上，而它挑的是 windowLevel 最高的窗口。
 // iOS 里 windowLevel 最高的往往不是主窗口 —— QQRTCWindow（通话浮层）、
 // UITextEffectsWindow（键盘）、Alert 窗、状态栏窗都排在主窗口前面。
 // 这些窗口的 bounds 只是屏幕的一块局部区域，拿它当屏幕量几何，扇就会：
@@ -137,7 +137,7 @@ UIViewController *SLTopViewController(void) {
 //
 // coordinateSpace.bounds 的 origin 在分屏 / 台前调度下可能不是 0，这里统一归零：
 // 我们要的只是「能画多大」，不是「画在屏幕的哪个偏移处」。
-CGRect SLScreenRect(void) {
+CGRect SLVScreenRect(void) {
     if (@available(iOS 13.0, *)) {
         CGRect best = CGRectZero;
         for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
@@ -158,11 +158,11 @@ CGRect SLScreenRect(void) {
     return CGRectMake(0, 0, r.size.width, r.size.height);
 }
 
-CGSize SLScreenSize(void) {
-    return SLScreenRect().size;
+CGSize SLVScreenSize(void) {
+    return SLVScreenRect().size;
 }
 
-UIImage *SLRoundedImage(UIImage *src, CGFloat side) {
+UIImage *SLVRoundedImage(UIImage *src, CGFloat side) {
     if (!src || side <= 0) return nil;
     CGSize sz = src.size;
     if (sz.width <= 0 || sz.height <= 0) return nil;

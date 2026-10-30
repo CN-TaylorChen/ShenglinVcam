@@ -1,5 +1,5 @@
 //
-//  SLCamAudioUnit.m
+//  SLVCamAudioUnit.m
 //  声临 · 虚拟摄像头 —— 麦克风的第二条链路（AudioUnit 层）
 //
 
@@ -14,14 +14,14 @@
 #import <string.h>
 #import <stdlib.h>
 
-typedef OSStatus (*SLAudioUnitRenderFn)(AudioUnit, AudioUnitRenderActionFlags *,
+typedef OSStatus (*SLVAudioUnitRenderFn)(AudioUnit, AudioUnitRenderActionFlags *,
                                         const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
-typedef OSStatus (*SLAudioQueueNewInputFn)(const AudioStreamBasicDescription *,
+typedef OSStatus (*SLVAudioQueueNewInputFn)(const AudioStreamBasicDescription *,
                                            AudioQueueInputCallback, void *, CFRunLoopRef,
                                            CFStringRef, UInt32, AudioQueueRef *);
 
-static SLAudioUnitRenderFn gSLRenderOrig = NULL;
-static SLAudioQueueNewInputFn gSLAQOrig = NULL;
+static SLVAudioUnitRenderFn gSLRenderOrig = NULL;
+static SLVAudioQueueNewInputFn gSLAQOrig = NULL;
 
 static BOOL gSLHooked = NO;
 static BOOL gSLRegistered = NO;
@@ -38,7 +38,7 @@ static int  sBus1Calls = 0;     // 其中 bus=1（输入方向）的次数
 // 根本攒不到 3000，日志上完全看不出录制期间麦克风有没有走这条路。
 // 现在只要录几秒就能看到「本轮 +N」，N>0 = 走的是我们挂住的 unit。
 static int  sBus1AtLastBeat = 0;
-#define SL_HEARTBEAT_EVERY 500
+#define SLV_HEARTBEAT_EVERY 500
 static BOOL sLoggedEntry = NO;
 static BOOL sLoggedBus1 = NO;
 static BOOL sLoggedRenderFail = NO;
@@ -72,19 +72,19 @@ typedef struct {
     BOOL logged;               // 「unit 就绪」这行只打一次
     BOOL replacedLogged;       // 「已接管」按 unit 各打一次，不是全局只打一次
     AudioStreamBasicDescription asbd;
-} SLUnitCache;
+} SLVUnitCache;
 
-#define SL_UNIT_CACHE 8
-#define SL_ASBD_MAX_TRIES 200
+#define SLV_UNIT_CACHE 8
+#define SLV_ASBD_MAX_TRIES 200
 // 格式重读间隔。10ms 一包，500 次约 5 秒 —— 切到拍摄页之后几秒内就能看到变化，
 // 又不至于每包都去查属性（AudioUnitGetProperty 内部是加锁的）。
-#define SL_ASBD_RECHECK_EVERY 500
+#define SLV_ASBD_RECHECK_EVERY 500
 
-static SLUnitCache sUnitCache[SL_UNIT_CACHE];
+static SLVUnitCache sUnitCache[SLV_UNIT_CACHE];
 static int sUnitCacheCount = 0;
 
 /// 查一次 StreamFormat。失败不缓存否定结论 —— unit 可能还没初始化完，下次再来。
-static void SLTryASBD(SLUnitCache *c) {
+static void SLVTryASBD(SLVUnitCache *c) {
     if (c->hasASBD) return;
 
     AudioStreamBasicDescription a;
@@ -105,7 +105,7 @@ static void SLTryASBD(SLUnitCache *c) {
 
 /// 逐字段比较。不用 memcmp 是因为 ASBD 里有 `mReserved` 这种保留字段，
 /// 万一系统没清零，memcmp 会一直判「变了」，导致转换器被反复重建、声音一顿一顿。
-static BOOL SLASBDEqual(const AudioStreamBasicDescription *a, const AudioStreamBasicDescription *b) {
+static BOOL SLVASBDEqual(const AudioStreamBasicDescription *a, const AudioStreamBasicDescription *b) {
     return a->mSampleRate == b->mSampleRate
         && a->mFormatID == b->mFormatID
         && a->mFormatFlags == b->mFormatFlags
@@ -123,9 +123,9 @@ static BOOL SLASBDEqual(const AudioStreamBasicDescription *a, const AudioStreamB
 /// 录制往往变成 44100Hz / 2ch。格式变了我们还在按旧格式要 PCM，而
 /// `pcm.length == mDataByteSize` 依然成立（按字节数申请的），memcpy 照做、
 /// 不报错、不打日志，听感就是「声音又慢又低」。这条日志就是为了把它暴露出来。
-static void SLRefreshASBD(SLUnitCache *c) {
-    if (!c->hasASBD) { SLTryASBD(c); return; }
-    if (c->calls % SL_ASBD_RECHECK_EVERY != 0) return;
+static void SLVRefreshASBD(SLVUnitCache *c) {
+    if (!c->hasASBD) { SLVTryASBD(c); return; }
+    if (c->calls % SLV_ASBD_RECHECK_EVERY != 0) return;
 
     AudioStreamBasicDescription a;
     memset(&a, 0, sizeof(a));
@@ -133,23 +133,23 @@ static void SLRefreshASBD(SLUnitCache *c) {
     OSStatus st = AudioUnitGetProperty(c->unit, kAudioUnitProperty_StreamFormat,
                                        kAudioUnitScope_Output, c->bus, &a, &sz);
     if (st != noErr || a.mSampleRate <= 0 || a.mChannelsPerFrame <= 0 || a.mBytesPerFrame <= 0) return;
-    if (SLASBDEqual(&a, &c->asbd)) return;
+    if (SLVASBDEqual(&a, &c->asbd)) return;
 
-    SLLog(@"音频: unit 格式变化 bus=%u %.0fHz %uch %uB/帧 → %.0fHz %uch %uB/帧",
+    SLVLog(@"音频: unit 格式变化 bus=%u %.0fHz %uch %uB/帧 → %.0fHz %uch %uB/帧",
           (unsigned)c->bus,
           c->asbd.mSampleRate, (unsigned)c->asbd.mChannelsPerFrame, (unsigned)c->asbd.mBytesPerFrame,
           a.mSampleRate, (unsigned)a.mChannelsPerFrame, (unsigned)a.mBytesPerFrame);
     c->asbd = a;
 }
 
-static SLUnitCache *SLCacheFor(AudioUnit unit, UInt32 bus, BOOL *isNew) {
+static SLVUnitCache *SLVCacheFor(AudioUnit unit, UInt32 bus, BOOL *isNew) {
     if (isNew) *isNew = NO;
     for (int i = 0; i < sUnitCacheCount; i++) {
         if (sUnitCache[i].unit == unit && sUnitCache[i].bus == bus) return &sUnitCache[i];
     }
-    if (sUnitCacheCount >= SL_UNIT_CACHE) return NULL;
+    if (sUnitCacheCount >= SLV_UNIT_CACHE) return NULL;
 
-    SLUnitCache *c = &sUnitCache[sUnitCacheCount];
+    SLVUnitCache *c = &sUnitCache[sUnitCacheCount];
     memset(c, 0, sizeof(*c));
     c->unit = unit;
     c->bus = bus;
@@ -166,7 +166,7 @@ static SLUnitCache *SLCacheFor(AudioUnit unit, UInt32 bus, BOOL *isNew) {
     }
 
     // ASBD 无条件查 —— 以前被 isInput 短路，连试都没试过，等于自断信息
-    SLTryASBD(c);
+    SLVTryASBD(c);
 
     sUnitCacheCount++;
     if (isNew) *isNew = YES;
@@ -175,10 +175,10 @@ static SLUnitCache *SLCacheFor(AudioUnit unit, UInt32 bus, BOOL *isNew) {
 
 #pragma mark - AudioUnitRender
 
-static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags *flags,
+static OSStatus SLVCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags *flags,
                                      const AudioTimeStamp *ts, UInt32 bus,
                                      UInt32 frames, AudioBufferList *ioData) {
-    SLAudioUnitRenderFn orig = gSLRenderOrig;
+    SLVAudioUnitRenderFn orig = gSLRenderOrig;
     if (!orig) return -1;
 
     // 先让宿主把麦克风数据拿到手，再就地替换 —— 这样无论它怎么处理
@@ -191,26 +191,26 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
 
     if (!sLoggedEntry) {
         sLoggedEntry = YES;
-        SLLog(@"音频: AudioUnitRender 首次被调用 bus=%u frames=%u bufs=%u st=%d",
+        SLVLog(@"音频: AudioUnitRender 首次被调用 bus=%u frames=%u bufs=%u st=%d",
               (unsigned)bus, (unsigned)frames,
               ioData ? (unsigned)ioData->mNumberBuffers : 0, (int)st);
     }
     if (bus == 1 && !sLoggedBus1) {
         sLoggedBus1 = YES;
-        SLLog(@"音频: 首次出现 bus=1 输入调用 frames=%u bufs=%u st=%d",
+        SLVLog(@"音频: 首次出现 bus=1 输入调用 frames=%u bufs=%u st=%d",
               (unsigned)frames,
               ioData ? (unsigned)ioData->mNumberBuffers : 0, (int)st);
     }
-    if (sCalls % SL_HEARTBEAT_EVERY == 0) {
+    if (sCalls % SLV_HEARTBEAT_EVERY == 0) {
         int delta = sBus1Calls - sBus1AtLastBeat;
         sBus1AtLastBeat = sBus1Calls;
-        SLLog(@"音频: 心跳 调用 %d / bus=1 累计 %d（本轮 +%d）", sCalls, sBus1Calls, delta);
+        SLVLog(@"音频: 心跳 调用 %d / bus=1 累计 %d（本轮 +%d）", sCalls, sBus1Calls, delta);
     }
 
     if (st != noErr || !ioData || ioData->mNumberBuffers == 0) {
         if (!sLoggedRenderFail) {
             sLoggedRenderFail = YES;
-            SLLog(@"音频: 放行 —— 宿主渲染没成功 st=%d bufs=%u", (int)st,
+            SLVLog(@"音频: 放行 —— 宿主渲染没成功 st=%d bufs=%u", (int)st,
                   ioData ? (unsigned)ioData->mNumberBuffers : 0);
         }
         return st;
@@ -220,28 +220,28 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
     // bus 0 是播放方向，绝对不能碰，否则会把对方的声音也改掉。
     if (bus != 1) return st;
 
-    if (!SLCamInjecting()) {
+    if (!SLVCamInjecting()) {
         if (!sLoggedNotInjecting) {
             sLoggedNotInjecting = YES;
-            SLLog(@"音频: 跳过 —— 当前没开启替换");
+            SLVLog(@"音频: 跳过 —— 当前没开启替换");
         }
         return st;
     }
 
     // 宿主音频已经走 AVCapture 了（比如陌陌），这条链路必须让路
-    if (SLCamAVCaptureAudioSeen()) {
+    if (SLVCamAVCaptureAudioSeen()) {
         if (!sLoggedYieldAVCap) {
             sLoggedYieldAVCap = YES;
-            SLLog(@"音频: 让路 —— 宿主音频走 AVCapture，交给那条链路");
+            SLVLog(@"音频: 让路 —— 宿主音频走 AVCapture，交给那条链路");
         }
         return st;
     }
 
-    SLUnitCache *c = SLCacheFor(unit, bus, NULL);
+    SLVUnitCache *c = SLVCacheFor(unit, bus, NULL);
     if (!c) {
         if (!sLoggedCacheFull) {
             sLoggedCacheFull = YES;
-            SLLog(@"音频: 跳过 —— unit 缓存已满（上限 %d）", SL_UNIT_CACHE);
+            SLVLog(@"音频: 跳过 —— unit 缓存已满（上限 %d）", SLV_UNIT_CACHE);
         }
         return st;
     }
@@ -252,17 +252,17 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
     // 不能每 10ms 都去问。
     c->calls++;
     if (!c->hasASBD) {
-        if (c->attempts < SL_ASBD_MAX_TRIES || (c->calls % 3000) == 0) SLTryASBD(c);
+        if (c->attempts < SLV_ASBD_MAX_TRIES || (c->calls % 3000) == 0) SLVTryASBD(c);
     } else {
         // 已经拿到过格式也不能就此锁死：宿主换场景时同一个 unit 的格式会变
-        SLRefreshASBD(c);
+        SLVRefreshASBD(c);
     }
 
     // 拿到格式就说明这条 bus 确实在往外送音频数据，可以干活了。
     // EnableIO 只写进日志：它是旁证，不是判据。
     if (c->hasASBD && !c->logged) {
         c->logged = YES;
-        SLLog(@"音频: unit 就绪 bus=%u EnableIO st=%d val=%u · ASBD st=%d fmt=%u %.0fHz %uch %uB/帧 交错=%@",
+        SLVLog(@"音频: unit 就绪 bus=%u EnableIO st=%d val=%u · ASBD st=%d fmt=%u %.0fHz %uch %uB/帧 交错=%@",
               (unsigned)bus, (int)c->enableSt, (unsigned)c->enableVal,
               (int)c->asbdSt, (unsigned)c->asbd.mFormatID, c->asbd.mSampleRate,
               (unsigned)c->asbd.mChannelsPerFrame, (unsigned)c->asbd.mBytesPerFrame,
@@ -272,7 +272,7 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
     if (!c->hasASBD) {
         if (!sLoggedNoASBD) {
             sLoggedNoASBD = YES;
-            SLLog(@"音频: 跳过 —— 试了 %d 次仍拿不到 bus=%u 的格式（st=%d）",
+            SLVLog(@"音频: 跳过 —— 试了 %d 次仍拿不到 bus=%u 的格式（st=%d）",
                   c->attempts, (unsigned)bus, (int)c->asbdSt);
         }
         return st;
@@ -280,13 +280,13 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
     if (c->asbd.mFormatID != kAudioFormatLinearPCM || c->asbd.mBytesPerFrame == 0) {
         if (!sLoggedNotPCM) {
             sLoggedNotPCM = YES;
-            SLLog(@"音频: 跳过 —— 输入不是线性 PCM（formatID=%u %uB/帧）",
+            SLVLog(@"音频: 跳过 —— 输入不是线性 PCM（formatID=%u %uB/帧）",
                   (unsigned)c->asbd.mFormatID, (unsigned)c->asbd.mBytesPerFrame);
         }
         return st;
     }
 
-    SLCamFeed *feed = [SLCamFeed shared];
+    SLVCamFeed *feed = [SLVCamFeed shared];
 
     for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
         AudioBuffer *b = &ioData->mBuffers[i];
@@ -299,7 +299,7 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
             // 一个字都看不到，只能靠猜。现在第一次撞上就留一行痕。
             if (!sLoggedPassThrough) {
                 sLoggedPassThrough = YES;
-                SLLog(@"音频: 放行真麦克风 —— 素材没给出 PCM（%uB/帧 · %.0fHz %uch %uB/帧）",
+                SLVLog(@"音频: 放行真麦克风 —— 素材没给出 PCM（%uB/帧 · %.0fHz %uch %uB/帧）",
                       (unsigned)b->mDataByteSize, c->asbd.mSampleRate,
                       (unsigned)c->asbd.mChannelsPerFrame, (unsigned)c->asbd.mBytesPerFrame);
             }
@@ -314,7 +314,7 @@ static OSStatus SLCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags 
     // 拍摄页新建的那个）接管时日志上是空的，看起来像没接管。
     if (!c->replacedLogged && gSLReplaceCount > 0) {
         c->replacedLogged = YES;
-        SLLog(@"音频: 已接管 AudioUnit 麦克风输入（bus=%u %.0fHz %uch）",
+        SLVLog(@"音频: 已接管 AudioUnit 麦克风输入（bus=%u %.0fHz %uch）",
               (unsigned)c->bus, c->asbd.mSampleRate, (unsigned)c->asbd.mChannelsPerFrame);
     }
     return st;
@@ -340,14 +340,14 @@ typedef struct {
     BOOL replacedLogged;
     int  replaced;
     int  skipped;           // 没换成（抢不到锁 / 素材没数据）的包数，诊断用
-} SLAQContext;
+} SLVAQContext;
 
 /// 这些上下文要和 AudioQueue 同生共死，不能回收 —— 队列什么时候停、停完还调不调
 /// 回调，都不在我们控制范围内。每次 NewInput 泄漏一百多字节，一个进程也就几次。
-static SLAQContext *gSLAQContexts[8] = {NULL};
+static SLVAQContext *gSLAQContexts[8] = {NULL};
 static int gSLAQContextCount = 0;
 
-static BOOL SLAQFormatUsable(const AudioStreamBasicDescription *fmt) {
+static BOOL SLVAQFormatUsable(const AudioStreamBasicDescription *fmt) {
     return fmt
         && fmt->mFormatID == kAudioFormatLinearPCM
         && fmt->mSampleRate > 0
@@ -356,36 +356,36 @@ static BOOL SLAQFormatUsable(const AudioStreamBasicDescription *fmt) {
         && fmt->mBytesPerFrame < 64;      // 明显不对的值直接放弃，别拿它算字节数
 }
 
-static void SLCamAudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ,
+static void SLVCamAudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ,
                                          AudioQueueBufferRef inBuffer,
                                          const AudioTimeStamp *inStartTime,
                                          UInt32 inNumberPacketDescriptions,
                                          const AudioStreamPacketDescription *inPacketDescs) {
-    SLAQContext *ctx = (SLAQContext *)inUserData;
+    SLVAQContext *ctx = (SLVAQContext *)inUserData;
     if (!ctx) return;
 
     if (!ctx->fired) {
         ctx->fired = YES;
-        SLLog(@"音频: AudioQueue 回调首次触发 %uB", 
+        SLVLog(@"音频: AudioQueue 回调首次触发 %uB", 
               inBuffer ? (unsigned)inBuffer->mAudioDataByteSize : 0);
     }
 
     if (ctx->usable && inBuffer && inBuffer->mAudioData && inBuffer->mAudioDataByteSize > 0
-        && SLCamInjecting() && !SLCamAVCaptureAudioSeen()) {
+        && SLVCamInjecting() && !SLVCamAVCaptureAudioSeen()) {
         // 这个回调跑在宿主的音频线程上，可能就在主线程的 runloop 里。
         // 所以只能走 tryAudioForFormat: —— 抢不到锁就放行这一包真麦克风，
         // 绝不能在这里等锁，否则宿主整条音频链路（乃至界面）都会被拖住。
-        NSData *pcm = [[SLCamFeed shared] tryAudioForFormat:&ctx->asbd
+        NSData *pcm = [[SLVCamFeed shared] tryAudioForFormat:&ctx->asbd
                                                    numBytes:inBuffer->mAudioDataByteSize];
         if (pcm.length == inBuffer->mAudioDataByteSize) {
             memcpy(inBuffer->mAudioData, pcm.bytes, pcm.length);
             ctx->replaced++;
             if (!ctx->replacedLogged) {
                 ctx->replacedLogged = YES;
-                SLLog(@"音频: 已接管 AudioQueue 麦克风输入（%.0fHz %uch）",
+                SLVLog(@"音频: 已接管 AudioQueue 麦克风输入（%.0fHz %uch）",
                       ctx->asbd.mSampleRate, (unsigned)ctx->asbd.mChannelsPerFrame);
             } else if (ctx->replaced % 3000 == 0) {
-                SLLog(@"音频: AudioQueue 心跳 %d 次（未替换 %d）",
+                SLVLog(@"音频: AudioQueue 心跳 %d 次（未替换 %d）",
                       ctx->replaced, ctx->skipped);
             }
         } else if (pcm == nil && ctx->replaced == 0) {
@@ -399,24 +399,24 @@ static void SLCamAudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ,
     }
 }
 
-static OSStatus SLCamAudioQueueNewInput(const AudioStreamBasicDescription *fmt,
+static OSStatus SLVCamAudioQueueNewInput(const AudioStreamBasicDescription *fmt,
                                         AudioQueueInputCallback cb, void *ud,
                                         CFRunLoopRef rl, CFStringRef mode,
                                         UInt32 flags, AudioQueueRef *outAQ) {
     if (!gSLAQOrig) return -1;
 
     // 格式拿不到、或不是线性 PCM（压缩格式没法逐包替换）就原样放行
-    if (!cb || !SLAQFormatUsable(fmt) || gSLAQContextCount >= 8) {
+    if (!cb || !SLVAQFormatUsable(fmt) || gSLAQContextCount >= 8) {
         if (!gSLAQProbeLogged) {
             gSLAQProbeLogged = YES;
-            SLLog(@"音频: AudioQueue 录音格式不可替换（%.0fHz %uch fmt=%u），放行真实麦克风",
+            SLVLog(@"音频: AudioQueue 录音格式不可替换（%.0fHz %uch fmt=%u），放行真实麦克风",
                   fmt ? fmt->mSampleRate : 0, fmt ? (unsigned)fmt->mChannelsPerFrame : 0,
                   fmt ? (unsigned)fmt->mFormatID : 0);
         }
         return gSLAQOrig(fmt, cb, ud, rl, mode, flags, outAQ);
     }
 
-    SLAQContext *ctx = calloc(1, sizeof(SLAQContext));
+    SLVAQContext *ctx = calloc(1, sizeof(SLVAQContext));
     if (!ctx) return gSLAQOrig(fmt, cb, ud, rl, mode, flags, outAQ);
     ctx->origCb = cb;
     ctx->origUd = ud;
@@ -425,7 +425,7 @@ static OSStatus SLCamAudioQueueNewInput(const AudioStreamBasicDescription *fmt,
 
     // 关键一步：交给系统的是我们的回调和上下文，不是宿主的。
     // 宿主原来那对 (cb, ud) 存在 ctx 里，由包装函数在替换完数据后再叫起来。
-    OSStatus st = gSLAQOrig(fmt, SLCamAudioQueueInputCallback, ctx, rl, mode, flags, outAQ);
+    OSStatus st = gSLAQOrig(fmt, SLVCamAudioQueueInputCallback, ctx, rl, mode, flags, outAQ);
 
     // 建队列失败说明宿主自己都用不了，把上下文还回去，别占坑
     if (st != noErr) {
@@ -440,12 +440,12 @@ static OSStatus SLCamAudioQueueNewInput(const AudioStreamBasicDescription *fmt,
     // 打开录像页的主线程上调 AudioQueueNewInput 的，同步做会把 UI 卡住。
     AudioStreamBasicDescription fmtCopy = *fmt;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [[SLCamFeed shared] primeAudioFormat:&fmtCopy];
+        [[SLVCamFeed shared] primeAudioFormat:&fmtCopy];
     });
 
-    SLLog(@"音频: 已接管 AudioQueue 录音（%.0fHz %uch %uB/帧）· 素材音 %@",
+    SLVLog(@"音频: 已接管 AudioQueue 录音（%.0fHz %uch %uB/帧）· 素材音 %@",
           fmt->mSampleRate, (unsigned)fmt->mChannelsPerFrame, (unsigned)fmt->mBytesPerFrame,
-          [[SLCamFeed shared] isReady] ? @"已就绪" : @"待命");
+          [[SLVCamFeed shared] isReady] ? @"已就绪" : @"待命");
     return st;
 }
 
@@ -460,40 +460,40 @@ static OSStatus SLCamAudioQueueNewInput(const AudioStreamBasicDescription *fmt,
 // 用 tmp 目录：每个 App 各一份，重启设备也不影响。
 static NSString *const kSLSymHookGuard = @"shenglin_vcam_symhook.lock";
 
-static NSString *SLSymHookGuardPath(void) {
+static NSString *SLVSymHookGuardPath(void) {
     return [NSTemporaryDirectory() stringByAppendingPathComponent:kSLSymHookGuard];
 }
 
-void SLCamInstallAudioUnitHook(void) {
+void SLVCamInstallAudioUnitHook(void) {
     if (!gSLRegistered) {
         gSLRegistered = YES;
 
-        NSString *guard = SLSymHookGuardPath();
+        NSString *guard = SLVSymHookGuardPath();
         NSFileManager *fm = [NSFileManager defaultManager];
 
         if ([fm fileExistsAtPath:guard]) {
             [fm removeItemAtPath:guard error:NULL];
-            SLLog(@"守护: 上次启动在扫描符号表时崩溃过，本次跳过 C 函数 hook（画面不受影响）");
+            SLVLog(@"守护: 上次启动在扫描符号表时崩溃过，本次跳过 C 函数 hook（画面不受影响）");
             return;
         }
 
         [fm createFileAtPath:guard contents:[NSData data] attributes:nil];
 
-        int hits = SLSymbolHook("AudioUnitRender", (void *)SLCamAudioUnitRender,
+        int hits = SLVSymbolHook("AudioUnitRender", (void *)SLVCamAudioUnitRender,
                                 (void **)&gSLRenderOrig);
         gSLHooked = (hits > 0 && gSLRenderOrig != NULL);
         if (gSLHooked) {
-            SLLog(@"音频: AudioUnitRender 已接管（%d 处符号槽）", hits);
+            SLVLog(@"音频: AudioUnitRender 已接管（%d 处符号槽）", hits);
         } else {
-            SLLog(@"音频: 没找到 AudioUnitRender 的符号槽，AudioUnit 链路暂不可用");
+            SLVLog(@"音频: 没找到 AudioUnitRender 的符号槽，AudioUnit 链路暂不可用");
         }
 
-        SLSymbolHook("AudioQueueNewInput", (void *)SLCamAudioQueueNewInput,
+        SLVSymbolHook("AudioQueueNewInput", (void *)SLVCamAudioQueueNewInput,
                      (void **)&gSLAQOrig);
 
         // 后加载的 framework 自动补扫：QQ 的拍摄模块是启动之后才 dlopen 的，
         // 启动那一遍扫描根本看不到它（日志里「扫过 6 个 App 镜像」就是证据）
-        SLSymbolHookInstallAutoRescan();
+        SLVSymbolHookInstallAutoRescan();
 
         // 走完了，撤哨兵 —— 下次正常启动不该再看到它
         [fm removeItemAtPath:guard error:NULL];
@@ -502,18 +502,18 @@ void SLCamInstallAudioUnitHook(void) {
 
     // 已经装过：只补扫，把后加载的 SDK / 插件进程里新映射的镜像也覆盖到
     if (gSLHooked) {
-        SLSymbolHookRescan();
+        SLVSymbolHookRescan();
         // 会话开始装配输出时，正好是个观察点：此刻 AudioUnitRender 被调过几次。
         // 全程都是 0，就说明宿主的麦克风压根不经过这个函数（调用点在系统框架内部，
         // 或者走了 dlsym 动态解析）—— 指针表 hook 再怎么改也够不着。
         if (sAddOutputLogs < 4) {
             sAddOutputLogs++;
-            SLLog(@"音频: 会话加输出时 AudioUnitRender 累计调用 %d 次 / bus=1 %d 次",
+            SLVLog(@"音频: 会话加输出时 AudioUnitRender 累计调用 %d 次 / bus=1 %d 次",
                   sCalls, sBus1Calls);
         }
     }
 }
 
-BOOL SLCamAudioUnitHooked(void) {
+BOOL SLVCamAudioUnitHooked(void) {
     return gSLHooked;
 }

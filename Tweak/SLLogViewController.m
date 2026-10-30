@@ -2,7 +2,7 @@
 #import "SLLog.h"
 #import "SLGlass.h"
 
-@interface SLLogViewController ()
+@interface SLVLogViewController ()
 @property (nonatomic, strong) UITextView *tv;             // 日志正文（主区）
 @property (nonatomic, strong) UIView *statusCard;         // 钩子状态卡（默认 1 行，可展开）
 @property (nonatomic, strong) UILabel *statusLabel;       // 「已装钩子 N 个」1 行
@@ -13,7 +13,7 @@
 @property (nonatomic, assign) NSInteger hookCount;
 @end
 
-@implementation SLLogViewController
+@implementation SLVLogViewController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -21,13 +21,13 @@
 
     // v0.4.50：跟设置页统一材质。原来这里是实心 systemBackground 的纯白页，
     // 从毛玻璃设置页点进来像跳到了另一个 App；现在铺超薄毛玻璃 + 胶囊标题 + 胶囊按钮。
-    SLInstallGlassBackdrop(self.view);
-    self.navigationItem.titleView = SLPillTitleView(@"运行日志");
-    SLInstallPillBack(self);   // v0.4.53：系统返回键换胶囊，否则这一页顶部只有右边三颗胶囊
+    SLVInstallGlassBackdrop(self.view);
+    self.navigationItem.titleView = SLVPillTitleView(@"运行日志");
+    SLVInstallPillBack(self);   // v0.4.53：系统返回键换胶囊，否则这一页顶部只有右边三颗胶囊
     self.navigationItem.rightBarButtonItems = @[
-        SLPillBarItem(@"刷新", self, @selector(sl_reload)),
-        SLPillBarItem(@"复制", self, @selector(sl_copy)),
-        SLPillBarItem(@"清空", self, @selector(sl_clear))
+        SLVPillBarItem(@"刷新", self, @selector(sl_reload)),
+        SLVPillBarItem(@"复制", self, @selector(sl_copy)),
+        SLVPillBarItem(@"清空", self, @selector(sl_clear))
     ];
 
     // v0.4.69：钩子状态收成 1 行（点开才展开完整列表），把整块屏幕让给日志正文。
@@ -35,7 +35,7 @@
     // 状态卡会抢满整屏、把日志卡挤成底部一条空框 —— 就是「日志本体没了 + 最下面还有个框」的根因。
     self.statusCard = [[UIView alloc] initWithFrame:CGRectZero];
     self.statusCard.translatesAutoresizingMaskIntoConstraints = NO;
-    self.statusCard.backgroundColor = SLGlassCellColor();
+    self.statusCard.backgroundColor = SLVGlassCellColor();
     self.statusCard.layer.cornerRadius = 12.0;
     self.statusCard.layer.cornerCurve = kCACornerCurveContinuous;
     [self.view addSubview:self.statusCard];
@@ -73,7 +73,7 @@
 
     UIView *logCard = [[UIView alloc] initWithFrame:CGRectZero];
     logCard.translatesAutoresizingMaskIntoConstraints = NO;
-    logCard.backgroundColor = SLGlassCellColor();
+    logCard.backgroundColor = SLVGlassCellColor();
     logCard.layer.cornerRadius = 12.0;
     logCard.layer.cornerCurve = kCACornerCurveContinuous;
     [self.view addSubview:logCard];
@@ -134,7 +134,7 @@
 
 - (void)sl_reload {
     NSString *summary = @"没有装上任何钩子（类名/方法签名不匹配，把日志发给开发者）";
-    @try { NSString *s = SLHookStatusSummary(); if (s.length) summary = s; } @catch (NSException *e) { }
+    @try { NSString *s = SLVHookStatusSummary(); if (s.length) summary = s; } @catch (NSException *e) { }
     self.fullSummary = summary;
 
     NSInteger n = 0;
@@ -146,10 +146,10 @@
     self.hookCount = n;
 
     self.statusDetail.text = [NSString stringWithFormat:@"%@\n\n文件：%@",
-                              body.length ? body : @"(无)", [SLLog filePath] ?: @"(不可写)"];
+                              body.length ? body : @"(无)", [SLVLog filePath] ?: @"(不可写)"];
     [self sl_updateStatusLabel];
 
-    self.tv.text = [SLLog tailLines:400] ?: @"(暂无日志)";
+    self.tv.text = [SLVLog tailLines:400] ?: @"(暂无日志)";
     if (self.tv.text.length > 1) {
         [self.tv scrollRangeToVisible:NSMakeRange(self.tv.text.length - 1, 1)];
     }
@@ -158,7 +158,7 @@
 - (void)sl_copy {
     UIPasteboard *pb = [UIPasteboard generalPasteboard];
     pb.string = [NSString stringWithFormat:@"%@\n文件：%@\n---\n%@",
-                 self.fullSummary ?: @"", [SLLog filePath] ?: @"", self.tv.text ?: @""];
+                 self.fullSummary ?: @"", [SLVLog filePath] ?: @"", self.tv.text ?: @""];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"已复制"
                                                                message:@"粘贴给开发者即可定位问题"
                                                         preferredStyle:UIAlertControllerStyleAlert];
@@ -167,7 +167,7 @@
 }
 
 - (void)sl_clear {
-    [SLLog clear];
+    [SLVLog clear];
     [self sl_reload];
 }
 

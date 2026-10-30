@@ -1,9 +1,9 @@
 #import "SLLog.h"
 
-#define SL_LOG_MAX_BYTES  (1024 * 1024)
-#define SL_LOG_KEEP_BYTES (512 * 1024)
+#define SLV_LOG_MAX_BYTES  (1024 * 1024)
+#define SLV_LOG_KEEP_BYTES (512 * 1024)
 
-static NSString *SLLogPath(void) {
+static NSString *SLVLogPath(void) {
     static NSString *p = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -33,7 +33,7 @@ static NSString *SLLogPath(void) {
     return p;
 }
 
-static NSString *SLTimestamp(void) {
+static NSString *SLVTimestamp(void) {
     static NSDateFormatter *fmt = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -44,15 +44,15 @@ static NSString *SLTimestamp(void) {
     return [fmt stringFromDate:[NSDate date]];
 }
 
-void SLLogWrite(NSString *line) {
+void SLVLogWrite(NSString *line) {
     if (!line.length) return;
     static dispatch_queue_t q = NULL;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ q = dispatch_queue_create("com.shenglin.momo.log", DISPATCH_QUEUE_SERIAL); });
 
-    NSString *full = [NSString stringWithFormat:@"%@ %@\n", SLTimestamp(), line];
+    NSString *full = [NSString stringWithFormat:@"%@ %@\n", SLVTimestamp(), line];
     dispatch_async(q, ^{
-        NSString *path = SLLogPath();
+        NSString *path = SLVLogPath();
         if (!path.length) return;
         @try {
             NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
@@ -61,10 +61,10 @@ void SLLogWrite(NSString *line) {
                 [fh writeData:[full dataUsingEncoding:NSUTF8StringEncoding]];
                 unsigned long long end = [fh offsetInFile];
                 [fh closeFile];
-                if (end > SL_LOG_MAX_BYTES) {
+                if (end > SLV_LOG_MAX_BYTES) {
                     NSData *d = [NSData dataWithContentsOfFile:path];
-                    if (d.length > SL_LOG_MAX_BYTES) {
-                        NSData *tail = [d subdataWithRange:NSMakeRange(d.length - SL_LOG_KEEP_BYTES, SL_LOG_KEEP_BYTES)];
+                    if (d.length > SLV_LOG_MAX_BYTES) {
+                        NSData *tail = [d subdataWithRange:NSMakeRange(d.length - SLV_LOG_KEEP_BYTES, SLV_LOG_KEEP_BYTES)];
                         [tail writeToFile:path atomically:YES];
                     }
                 }
@@ -78,14 +78,14 @@ void SLLogWrite(NSString *line) {
     });
 }
 
-@implementation SLLog
+@implementation SLVLog
 
 + (NSString *)filePath {
-    return SLLogPath();
+    return SLVLogPath();
 }
 
 + (NSString *)tailLines:(NSInteger)lines {
-    NSData *d = [NSData dataWithContentsOfFile:SLLogPath()];
+    NSData *d = [NSData dataWithContentsOfFile:SLVLogPath()];
     NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
     NSArray<NSString *> *all = [s componentsSeparatedByString:@"\n"];
     NSInteger n = all.count;
@@ -95,7 +95,7 @@ void SLLogWrite(NSString *line) {
 }
 
 + (void)clear {
-    [@"" writeToFile:SLLogPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [@"" writeToFile:SLVLogPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 @end

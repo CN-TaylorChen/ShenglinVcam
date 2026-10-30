@@ -1,13 +1,13 @@
 #import "SLAlignBox.h"
 
-@interface SLAlignBox ()
+@interface SLVAlignBox ()
 @property (nonatomic, weak) UILabel *label;
 @property (nonatomic, strong) NSLayoutConstraint *leadingConstraint;
 @property (nonatomic, assign) BOOL headerMode;
 @property (nonatomic, assign) CGFloat trailingInset;
 @end
 
-@implementation SLAlignBox
+@implementation SLVAlignBox
 
 // 只读查找，不持有、不调数据源，找不到就返回 nil
 - (UITableView *)sl_tableView {
@@ -42,11 +42,11 @@
 
 @end
 
-static SLAlignBox *SLAlignMakeBox(NSString *text, CGFloat target, CGFloat width, BOOL header) {
+static SLVAlignBox *SLVAlignMakeBox(NSString *text, CGFloat target, CGFloat width, BOOL header) {
     if (!text.length) return nil;
     CGFloat w = width > 0 ? width : [UIScreen mainScreen].bounds.size.width;
 
-    SLAlignBox *box = [[SLAlignBox alloc] initWithFrame:CGRectMake(0, 0, w, header ? 22 : 0)];
+    SLVAlignBox *box = [[SLVAlignBox alloc] initWithFrame:CGRectMake(0, 0, w, header ? 22 : 0)];
     box.targetLeading = target;
     box.headerMode = header;
     box.trailingInset = 16;
@@ -80,10 +80,10 @@ static SLAlignBox *SLAlignMakeBox(NSString *text, CGFloat target, CGFloat width,
     return box;
 }
 
-UIView *SLAlignHeader(NSString *text, CGFloat targetLeading, CGFloat width) {
-    return SLAlignMakeBox(text, targetLeading, width, YES);
+UIView *SLVAlignHeader(NSString *text, CGFloat targetLeading, CGFloat width) {
+    return SLVAlignMakeBox(text, targetLeading, width, YES);
 }
 
-UIView *SLAlignFooter(NSString *text, CGFloat targetLeading, CGFloat width) {
-    return SLAlignMakeBox(text, targetLeading, width, NO);
+UIView *SLVAlignFooter(NSString *text, CGFloat targetLeading, CGFloat width) {
+    return SLVAlignMakeBox(text, targetLeading, width, NO);
 }

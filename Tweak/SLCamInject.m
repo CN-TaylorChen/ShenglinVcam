@@ -1,5 +1,5 @@
 //
-//  SLCamInject.m
+//  SLVCamInject.m
 //  声临 · 虚拟摄像头 —— 注入层实现
 //
 
@@ -19,16 +19,16 @@
 #import <os/lock.h>
 #import <dlfcn.h>
 
-typedef void (*SLProcessSampleBufferFn)(id, SEL, CMSampleBufferRef);
+typedef void (*SLVProcessSampleBufferFn)(id, SEL, CMSampleBufferRef);
 
 // 原始 IMP 用固定数组存，按 Method 指针线性比对。
 //
 // 别用 NSMapTable + NSPointerFunctionsOpaqueMemory 存这个：那套 key 语义是「裸指针」，
 // 每次查询都新建一个 NSValue 对象、地址不同，永远查不到 —— 查不到就会把原始实现整个
 // 跳过，表现为「Hook 装上了、日志也对、但摄像头全黑」。Method 数量个位数，线性扫足够。
-#define SL_MAX_HOOKS 8
-static Method gSLHookMethods[SL_MAX_HOOKS];
-static IMP    gSLHookIMPs[SL_MAX_HOOKS];
+#define SLV_MAX_HOOKS 8
+static Method gSLHookMethods[SLV_MAX_HOOKS];
+static IMP    gSLHookIMPs[SLV_MAX_HOOKS];
 
 static BOOL sSLCamInjecting = NO;
 static BOOL sSLCamHooksInstalled = NO;
@@ -49,7 +49,7 @@ static int  sSLCamOwnFmtExtFailLogged = 0;
 static int  sSLCamOwnFmtRejectedLogged = 0;
 
 /// 四字符码转可读串（'BGRA' / '420f'），日志里比裸数字好认
-static NSString *SLFourCC(OSType v) {
+static NSString *SLVFourCC(OSType v) {
     char c[5] = {
         (char)((v >> 24) & 0xff), (char)((v >> 16) & 0xff),
         (char)((v >> 8) & 0xff),  (char)(v & 0xff), 0
@@ -62,7 +62,7 @@ static NSString *SLFourCC(OSType v) {
 
 /// 音视频输出可能各自重写了 _processSampleBuffer:，必须按 Method 分别保存原始 IMP，
 /// 否则音频会走到视频的原始实现上去（表现为只有画面变、声音还在）。
-static IMP SLCamOriginalIMP(id self, SEL _cmd) {
+static IMP SLVCamOriginalIMP(id self, SEL _cmd) {
     Method m = class_getInstanceMethod([self class], _cmd);
     if (!m) return NULL;
     for (int i = 0; i < sSLCamHookCount; i++) {
@@ -70,7 +70,7 @@ static IMP SLCamOriginalIMP(id self, SEL _cmd) {
     }
     if (!sLoggedMissingOrig) {
         sLoggedMissingOrig = YES;
-        SLLog(@"注入: 找不到 %s 的原始 IMP，将原样放行", sel_getName(_cmd));
+        SLVLog(@"注入: 找不到 %s 的原始 IMP，将原样放行", sel_getName(_cmd));
     }
     return NULL;
 }
@@ -84,7 +84,7 @@ static IMP SLCamOriginalIMP(id self, SEL _cmd) {
 /// 自建 fmt 只跟「子类型 + 宽 + 高 + 帧的色彩矩阵」有关，这四样不变就一直复用。
 /// 把色彩矩阵也算进 key 是因为自建 fmt 的扩展是从帧的附件反推的 —— 换素材后色彩
 /// 矩阵可能变，复用旧 fmt 会让色彩偏一点。
-#define SL_FMT_CACHE 4
+#define SLV_FMT_CACHE 4
 
 typedef struct {
     OSType subType;
@@ -92,20 +92,20 @@ typedef struct {
     int32_t height;
     uintptr_t colorHash;
     CMVideoFormatDescriptionRef fmt;      // 缓存自己持有一份引用
-} SLFmtCacheEntry;
+} SLVFmtCacheEntry;
 
-static SLFmtCacheEntry gSLFmtCache[SL_FMT_CACHE];
+static SLVFmtCacheEntry gSLFmtCache[SLV_FMT_CACHE];
 static int gSLFmtCacheCount = 0;
 static int gSLFmtCacheNext = 0;           // 满了就轮换覆盖
 static os_unfair_lock gSLFmtCacheLock = OS_UNFAIR_LOCK_INIT;
 
 /// 帧的色彩矩阵哈希，用来区分「同一尺寸但色彩标注不同」的帧
-static uintptr_t SLCamFrameColorHash(CVPixelBufferRef frame) {
+static uintptr_t SLVCamFrameColorHash(CVPixelBufferRef frame) {
     CFTypeRef m = CVBufferGetAttachment(frame, kCVImageBufferYCbCrMatrixKey, NULL);
     return m ? (uintptr_t)CFHash(m) : 0;
 }
 
-static CMVideoFormatDescriptionRef SLCamCachedFormat(OSType subType, int32_t w, int32_t h,
+static CMVideoFormatDescriptionRef SLVCamCachedFormat(OSType subType, int32_t w, int32_t h,
                                                      uintptr_t colorHash) {
     CMVideoFormatDescriptionRef hit = NULL;
     os_unfair_lock_lock(&gSLFmtCacheLock);
@@ -120,16 +120,16 @@ static CMVideoFormatDescriptionRef SLCamCachedFormat(OSType subType, int32_t w, 
     return hit;
 }
 
-static void SLCamStoreFormat(OSType subType, int32_t w, int32_t h,
+static void SLVCamStoreFormat(OSType subType, int32_t w, int32_t h,
                              uintptr_t colorHash, CMVideoFormatDescriptionRef fmt) {
     if (!fmt) return;
     os_unfair_lock_lock(&gSLFmtCacheLock);
     int slot;
-    if (gSLFmtCacheCount < SL_FMT_CACHE) {
+    if (gSLFmtCacheCount < SLV_FMT_CACHE) {
         slot = gSLFmtCacheCount++;
     } else {
         slot = gSLFmtCacheNext;
-        gSLFmtCacheNext = (gSLFmtCacheNext + 1) % SL_FMT_CACHE;
+        gSLFmtCacheNext = (gSLFmtCacheNext + 1) % SLV_FMT_CACHE;
         if (gSLFmtCache[slot].fmt) CFRelease(gSLFmtCache[slot].fmt);
     }
     gSLFmtCache[slot].subType = subType;
@@ -150,7 +150,7 @@ static void SLCamStoreFormat(OSType subType, int32_t w, int32_t h,
 /// 0.2.10 就是整包抄了扩展，三个 App 全挂在 -12743。当时日志里真帧是「自洽=Y」，
 /// 而假帧尺寸、子类型都和宿主 fmt 一样却仍判不匹配 —— 差异只在 bytesPerRow，
 /// 这也是 CMVideoFormatDescriptionMatchesImageBuffer 会比的唯一一项。
-static CFDictionaryRef SLCamColorExtensions(CFDictionaryRef hostExt) {
+static CFDictionaryRef SLVCamColorExtensions(CFDictionaryRef hostExt) {
     if (!hostExt) return NULL;
     // 用可变类型接着：CFDictionaryRemoveValue 要的是 CFMutableDictionaryRef，
     // 声明成 CFDictionaryRef 再传进去会丢 const，-Werror 下直接编译失败。
@@ -174,7 +174,7 @@ static CFDictionaryRef SLCamColorExtensions(CFDictionaryRef hostExt) {
 ///
 /// 所以：先用「宿主扩展去掉布局 key」建一个，**建完立刻自检**，和帧自洽才用；
 /// 不自洽就退回帧反推。有了这道自检，任何扩展组合导致的 -12743 都不可能漏出去。
-static CMVideoFormatDescriptionRef SLCamMakeFormatDescription(CMFormatDescriptionRef hostFmt,
+static CMVideoFormatDescriptionRef SLVCamMakeFormatDescription(CMFormatDescriptionRef hostFmt,
                                                               CVPixelBufferRef frame) {
     if (!hostFmt || !frame) return NULL;
 
@@ -183,20 +183,20 @@ static CMVideoFormatDescriptionRef SLCamMakeFormatDescription(CMFormatDescriptio
 
     int32_t w = (int32_t)CVPixelBufferGetWidth(frame);
     int32_t h = (int32_t)CVPixelBufferGetHeight(frame);
-    uintptr_t colorHash = SLCamFrameColorHash(frame);
+    uintptr_t colorHash = SLVCamFrameColorHash(frame);
 
     // 命中缓存就直接返回（返回的是 CFRetain 过的，调用方照常 CFRelease）
-    CMVideoFormatDescriptionRef cached = SLCamCachedFormat(subType, w, h, colorHash);
+    CMVideoFormatDescriptionRef cached = SLVCamCachedFormat(subType, w, h, colorHash);
     if (cached) return cached;
 
-    CFDictionaryRef ext = SLCamColorExtensions(CMFormatDescriptionGetExtensions(hostFmt));
+    CFDictionaryRef ext = SLVCamColorExtensions(CMFormatDescriptionGetExtensions(hostFmt));
     CMVideoFormatDescriptionRef out = NULL;
     OSStatus st = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, subType, w, h, ext, &out);
     if (ext) CFRelease(ext);
 
     if (st == noErr && out) {
         if (CMVideoFormatDescriptionMatchesImageBuffer(out, frame)) {
-            SLCamStoreFormat(subType, w, h, colorHash, out);
+            SLVCamStoreFormat(subType, w, h, colorHash, out);
             return out;
         }
         CFRelease(out);                       // 和帧对不上，宁可不要
@@ -208,9 +208,9 @@ static CMVideoFormatDescriptionRef SLCamMakeFormatDescription(CMFormatDescriptio
         return NULL;
     }
     if (sSLCamOwnFmtExtFailLogged++ == 0) {
-        SLLog(@"注入: 带宿主扩展建 fmt 不自洽 st=%d，已退回帧反推（宿主可能取不到内参）", (int)st);
+        SLVLog(@"注入: 带宿主扩展建 fmt 不自洽 st=%d，已退回帧反推（宿主可能取不到内参）", (int)st);
     }
-    SLCamStoreFormat(subType, w, h, colorHash, out);
+    SLVCamStoreFormat(subType, w, h, colorHash, out);
     return out;
 }
 
@@ -219,7 +219,7 @@ static CMVideoFormatDescriptionRef SLCamMakeFormatDescription(CMFormatDescriptio
 /// CMSampleBufferCreateReadyWithImageBuffer 只传播「像素缓冲区上」的附件，而真帧
 /// sample buffer 自己带的那些（相机内参、时间戳对齐信息等）一条都继承不过来。
 /// 宿主用 CMGetAttachment / CMCopyDictionaryOfAttachments 去取，就会拿到 NULL。
-static void SLCamCopySampleAttachments(CMSampleBufferRef from, CMSampleBufferRef to) {
+static void SLVCamCopySampleAttachments(CMSampleBufferRef from, CMSampleBufferRef to) {
     if (!from || !to) return;
     CFDictionaryRef atts = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, from,
                                                          kCMAttachmentMode_ShouldPropagate);
@@ -234,13 +234,13 @@ static void SLCamCopySampleAttachments(CMSampleBufferRef from, CMSampleBufferRef
     CFDictionaryRef check = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, to,
                                                           kCMAttachmentMode_ShouldPropagate);
     CFIndex got = check ? CFDictionaryGetCount(check) : 0;
-    if (got == 0) SLLog(@"注入: 附件回填后仍为空 —— 宿主可能取不到内参");
+    if (got == 0) SLVLog(@"注入: 附件回填后仍为空 —— 宿主可能取不到内参");
     if (check) CFRelease(check);
 }
 
 /// 首次注入时把两边的 key 列表打出来。
 /// 万一以后还崩在这个位置，这一行就能直接指出宿主缺哪个 key，不用再猜。
-static void SLCamLogAttachmentKeys(CMSampleBufferRef sbuf, CMFormatDescriptionRef fmt) {
+static void SLVCamLogAttachmentKeys(CMSampleBufferRef sbuf, CMFormatDescriptionRef fmt) {
     if (sSLCamAttachLogged++ > 0) return;
 
     CFDictionaryRef atts = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, sbuf,
@@ -249,28 +249,28 @@ static void SLCamLogAttachmentKeys(CMSampleBufferRef sbuf, CMFormatDescriptionRe
     CFDictionaryRef ext = fmt ? CMFormatDescriptionGetExtensions(fmt) : NULL;
     NSArray *extKeys = ext ? [(__bridge NSDictionary *)ext allKeys] : @[];
 
-    SLLog(@"注入: 真帧附件 %lu 项 %@ · 宿主 fmt 扩展 %lu 项 %@",
+    SLVLog(@"注入: 真帧附件 %lu 项 %@ · 宿主 fmt 扩展 %lu 项 %@",
           (unsigned long)attKeys.count, attKeys,
           (unsigned long)extKeys.count, extKeys);
     if (atts) CFRelease(atts);
 }
 
-static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) {
-    IMP orig = SLCamOriginalIMP(self, _cmd);
+static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) {
+    IMP orig = SLVCamOriginalIMP(self, _cmd);
 
-    // 拿不到原始实现只能放弃（SLCamOriginalIMP 里已记日志）。这种情况只会在
+    // 拿不到原始实现只能放弃（SLVCamOriginalIMP 里已记日志）。这种情况只会在
     // hook 表被破坏时出现 —— 正常情况下查表是纯指针比对，不会失手。
     if (!orig) return;
 
-    SLCamFeed *feed = [SLCamFeed shared];
+    SLVCamFeed *feed = [SLVCamFeed shared];
 
     if (!sbuf || !sSLCamInjecting || ![feed isReady]) {
-        ((SLProcessSampleBufferFn)orig)(self, _cmd, sbuf);
+        ((SLVProcessSampleBufferFn)orig)(self, _cmd, sbuf);
         return;
     }
 
     CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sbuf);
-    if (!fmt) { ((SLProcessSampleBufferFn)orig)(self, _cmd, sbuf); return; }
+    if (!fmt) { ((SLVProcessSampleBufferFn)orig)(self, _cmd, sbuf); return; }
 
     CMMediaType mediaType = CMFormatDescriptionGetMediaType(fmt);
     CMSampleBufferRef fake = NULL;
@@ -292,13 +292,13 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
             if (!sLoggedFirstVideo) {
                 sLoggedFirstVideo = YES;
                 CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions((CMVideoFormatDescriptionRef)fmt);
-                SLLog(@"首帧 视频 %zux%zu pf=%u(%@) · fmt %dx%d %@ · 自洽=%@",
-                      (size_t)size.width, (size_t)size.height, (unsigned)pf, SLFourCC(pf),
+                SLVLog(@"首帧 视频 %zux%zu pf=%u(%@) · fmt %dx%d %@ · 自洽=%@",
+                      (size_t)size.width, (size_t)size.height, (unsigned)pf, SLVFourCC(pf),
                       d.width, d.height,
-                      SLFourCC(CMFormatDescriptionGetMediaSubType(fmt)),
+                      SLVFourCC(CMFormatDescriptionGetMediaSubType(fmt)),
                       fmtMatchesReal ? @"Y" : @"N");
                 // 宿主到底从帧上取了哪些 key，一次看清 —— 以后崩在这个位置能直接定位
-                SLCamLogAttachmentKeys(sbuf, fmt);
+                SLVCamLogAttachmentKeys(sbuf, fmt);
             }
 
             CMSampleTimingInfo timing = {0};
@@ -312,14 +312,14 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
             // 光判 CMTIME_IS_INVALID 拦不住。
             if (!CMTIME_IS_VALID(timing.duration) || CMTimeCompare(timing.duration, kCMTimeZero) < 0) {
                 if (sSLCamTimingFixLogged++ == 0) {
-                    SLLog(@"注入: 真帧 duration 非法（value=%lld scale=%d flags=%u），已归一成 1/30",
+                    SLVLog(@"注入: 真帧 duration 非法（value=%lld scale=%d flags=%u），已归一成 1/30",
                           timing.duration.value, timing.duration.timescale, timing.duration.flags);
                 }
                 timing.duration = CMTimeMake(1, 30);
             }
             if (!CMTIME_IS_VALID(timing.decodeTimeStamp)) {
                 if (sSLCamDTSFixLogged++ == 0) {
-                    SLLog(@"注入: 真帧 dts 非法（value=%lld scale=%d flags=%u），已置为 invalid",
+                    SLVLog(@"注入: 真帧 dts 非法（value=%lld scale=%d flags=%u），已置为 invalid",
                           timing.decodeTimeStamp.value, timing.decodeTimeStamp.timescale,
                           timing.decodeTimeStamp.flags);
                 }
@@ -328,8 +328,8 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
             if (!CMTIME_IS_VALID(timing.presentationTimeStamp)) {
                 // 没有有效的 PTS 就没法接进宿主的时间轴，硬塞一个反而会把下游时序搞乱。
                 // 这一帧直接放行真画面，下一帧再说。
-                if (sSLCamBadPTS++ == 0) SLLog(@"注入: 真帧没有有效 PTS，跳过替换");
-                ((SLProcessSampleBufferFn)orig)(self, _cmd, sbuf);
+                if (sSLCamBadPTS++ == 0) SLVLog(@"注入: 真帧没有有效 PTS，跳过替换");
+                ((SLVProcessSampleBufferFn)orig)(self, _cmd, sbuf);
                 return;
             }
 
@@ -341,7 +341,7 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
                 CMVideoFormatDescriptionRef useFmt = (CMVideoFormatDescriptionRef)fmt;
                 CMVideoFormatDescriptionRef ownFmt = NULL;
                 if (!CMVideoFormatDescriptionMatchesImageBuffer((CMVideoFormatDescriptionRef)fmt, frame)) {
-                    ownFmt = SLCamMakeFormatDescription(fmt, frame);
+                    ownFmt = SLVCamMakeFormatDescription(fmt, frame);
                     if (ownFmt) {
                         useFmt = ownFmt;
                         if (sSLCamOwnFmtLogged++ == 0) {
@@ -350,11 +350,11 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
                             // 这一行能直接看出它到底能不能取到内参/色彩矩阵
                             CFDictionaryRef oe = CMFormatDescriptionGetExtensions(ownFmt);
                             NSArray *okeys = oe ? [(__bridge NSDictionary *)oe allKeys] : @[];
-                            SLLog(@"注入: 假帧与宿主 fmt 不匹配，已自建 fmt（帧 %ux%u %@ / fmt %dx%d %@）· 自建扩展 %lu 项 %@",
+                            SLVLog(@"注入: 假帧与宿主 fmt 不匹配，已自建 fmt（帧 %ux%u %@ / fmt %dx%d %@）· 自建扩展 %lu 项 %@",
                                   (unsigned)CVPixelBufferGetWidth(frame),
                                   (unsigned)CVPixelBufferGetHeight(frame),
-                                  SLFourCC(CVPixelBufferGetPixelFormatType(frame)),
-                                  d.width, d.height, SLFourCC(CMFormatDescriptionGetMediaSubType(fmt)),
+                                  SLVFourCC(CVPixelBufferGetPixelFormatType(frame)),
+                                  d.width, d.height, SLVFourCC(CMFormatDescriptionGetMediaSubType(fmt)),
                                   (unsigned long)okeys.count, okeys);
                         }
                     }
@@ -373,7 +373,7 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
                                                                                &timing, &fake);
                         if (st2 == noErr) {
                             if (sSLCamOwnFmtRejectedLogged++ == 0) {
-                                SLLog(@"注入: 自建 fmt 被拒 st=%d，换帧反推 fmt 重试成功", (int)st);
+                                SLVLog(@"注入: 自建 fmt 被拒 st=%d，换帧反推 fmt 重试成功", (int)st);
                             }
                             st = noErr;
                         } else {
@@ -388,23 +388,23 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
                     // 前 3 次 + 之后每 120 帧打一条，既能看到细节又不会把日志刷爆
                     if (sSLCamFailCount <= 3 || sSLCamFailCount % 120 == 0) {
                         CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions((CMVideoFormatDescriptionRef)fmt);
-                        SLLog(@"注入: 打包失败 #%d st=%d · fmt %dx%d %@ · 帧 %ux%u %@ · 自洽=%@ · 兜底fmt=%@",
+                        SLVLog(@"注入: 打包失败 #%d st=%d · fmt %dx%d %@ · 帧 %ux%u %@ · 自洽=%@ · 兜底fmt=%@",
                               sSLCamFailCount, (int)st,
-                              d.width, d.height, SLFourCC(CMFormatDescriptionGetMediaSubType(fmt)),
+                              d.width, d.height, SLVFourCC(CMFormatDescriptionGetMediaSubType(fmt)),
                               (unsigned)CVPixelBufferGetWidth(frame),
                               (unsigned)CVPixelBufferGetHeight(frame),
-                              SLFourCC(CVPixelBufferGetPixelFormatType(frame)),
+                              SLVFourCC(CVPixelBufferGetPixelFormatType(frame)),
                               fmtMatchesReal ? @"Y" : @"N",
                               ownFmt ? @"Y" : @"N");
                     }
                 } else {
                     if (sSLCamFailCount > 0) {
-                        SLLog(@"注入: 打包恢复正常（累计失败 %d 次）", sSLCamFailCount);
+                        SLVLog(@"注入: 打包恢复正常（累计失败 %d 次）", sSLCamFailCount);
                         sSLCamFailCount = 0;
                     }
                     // 真帧的附件必须搬到假帧上：宿主那边 CMGetAttachment /
                     // CMCopyDictionaryOfAttachments 拿不到东西，是不判空就 CFRelease 的
-                    SLCamCopySampleAttachments(sbuf, fake);
+                    SLVCamCopySampleAttachments(sbuf, fake);
                 }
                 if (ownFmt) CFRelease(ownFmt);
                 CVPixelBufferRelease(frame);
@@ -423,7 +423,7 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
 
             if (!sLoggedFirstAudio) {
                 sLoggedFirstAudio = YES;
-                SLLog(@"首帧 音频 %.0fHz %uch %uB/帧 len=%zu",
+                SLVLog(@"首帧 音频 %.0fHz %uch %uB/帧 len=%zu",
                       asbd ? asbd->mSampleRate : 0,
                       asbd ? (unsigned)asbd->mChannelsPerFrame : 0,
                       asbd ? (unsigned)asbd->mBytesPerFrame : 0, len);
@@ -448,12 +448,12 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
                             fake = NULL;
                             sSLCamAudioFailCount++;
                             if (sSLCamAudioFailCount <= 3 || sSLCamAudioFailCount % 300 == 0) {
-                                SLLog(@"注入: 音频打包失败 #%d st=%d · %u 帧 · %zu 字节",
+                                SLVLog(@"注入: 音频打包失败 #%d st=%d · %u 帧 · %zu 字节",
                                       sSLCamAudioFailCount, (int)ast, (unsigned)frames, len);
                             }
                         } else {
                             // 音频帧同样要把宿主的附件带过去，理由和视频一样
-                            SLCamCopySampleAttachments(sbuf, fake);
+                            SLVCamCopySampleAttachments(sbuf, fake);
                         }
                         CFRelease(newBB);
                     }
@@ -463,32 +463,32 @@ static void SLCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) 
     }
 
     if (fake) {
-        ((SLProcessSampleBufferFn)orig)(self, _cmd, fake);
+        ((SLVProcessSampleBufferFn)orig)(self, _cmd, fake);
         CFRelease(fake);
     } else {
-        ((SLProcessSampleBufferFn)orig)(self, _cmd, sbuf);   // 拿不到假帧就放真帧，绝不黑屏
+        ((SLVProcessSampleBufferFn)orig)(self, _cmd, sbuf);   // 拿不到假帧就放真帧，绝不黑屏
     }
 }
 
-static void SLCamHookMethod(Class owner, Method m) {
+static void SLVCamHookMethod(Class owner, Method m) {
     if (!m) return;
-    if (sSLCamHookCount >= SL_MAX_HOOKS) return;
+    if (sSLCamHookCount >= SLV_MAX_HOOKS) return;
 
     for (int i = 0; i < sSLCamHookCount; i++) {
         if (gSLHookMethods[i] == m) return;              // 已经 hook 过
     }
 
     IMP old = method_getImplementation(m);
-    if (old == (IMP)SLCamProcessSampleBuffer) return;
+    if (old == (IMP)SLVCamProcessSampleBuffer) return;
 
     gSLHookMethods[sSLCamHookCount] = m;
     gSLHookIMPs[sSLCamHookCount] = old;
     sSLCamHookCount++;
 
-    SLLog(@"hook -[%s %s] types=%s", class_getName(owner),
+    SLVLog(@"hook -[%s %s] types=%s", class_getName(owner),
           sel_getName(method_getName(m)), method_getTypeEncoding(m));
 
-    method_setImplementation(m, (IMP)SLCamProcessSampleBuffer);
+    method_setImplementation(m, (IMP)SLVCamProcessSampleBuffer);
 }
 
 /// 只挂「void + 一个指针参数」的方法。
@@ -496,7 +496,7 @@ static void SLCamHookMethod(Class owner, Method m) {
 /// 名字带 SampleBuffer 不代表签名就是 (self, _cmd, CMSampleBufferRef)，
 /// 万一挂到带 connection 之类的多参方法上，我们的实现会把后面的参数整个丢掉，
 /// 宿主当场行为异常。宁可漏挂，不可挂错。
-static BOOL SLCamIsSinglePointerArgMethod(Method m) {
+static BOOL SLVCamIsSinglePointerArgMethod(Method m) {
     if (method_getNumberOfArguments(m) != 3) return NO;
 
     char ret[16] = {0};
@@ -510,10 +510,10 @@ static BOOL SLCamIsSinglePointerArgMethod(Method m) {
 
 /// 把某个类（含父类）上「像采样缓冲」的方法名列出来，只记日志不挂。
 /// 音频输出在各系统版本上的私有方法名不一样，靠这个先看清再动手。
-static void SLCamDumpCandidates(const char *className) {
+static void SLVCamDumpCandidates(const char *className) {
     Class cls = objc_getClass(className);
     if (!cls) {
-        SLLog(@"探测: %s 不存在", className);
+        SLVLog(@"探测: %s 不存在", className);
         return;
     }
     NSMutableArray<NSString *> *hits = [NSMutableArray array];
@@ -528,7 +528,7 @@ static void SLCamDumpCandidates(const char *className) {
         }
         free(list);
     }
-    SLLog(@"探测: %s → %@", className,
+    SLVLog(@"探测: %s → %@", className,
           hits.count ? [hits componentsJoinedByString:@", "] : @"(无)");
 }
 
@@ -536,29 +536,29 @@ static void SLCamDumpCandidates(const char *className) {
 
 // App 到底往会话里加了哪些输出？音频是不是走 AVCaptureAudioDataOutput，
 // 直接看这个就知道，比猜私有方法名靠谱。
-typedef void (*SLAddOutputFn)(id, SEL, id);
+typedef void (*SLVAddOutputFn)(id, SEL, id);
 static IMP gSLAddOutputOrig = NULL;
 
-static void SLCamAddOutput(id self, SEL _cmd, id output) {
+static void SLVCamAddOutput(id self, SEL _cmd, id output) {
     if (output) {
-        SLLog(@"会话加输出: %s", class_getName([output class]));
+        SLVLog(@"会话加输出: %s", class_getName([output class]));
     }
     if (gSLAddOutputOrig) {
-        ((SLAddOutputFn)gSLAddOutputOrig)(self, _cmd, output);
+        ((SLVAddOutputFn)gSLAddOutputOrig)(self, _cmd, output);
     }
     // 会话开始装配输出，往往意味着 RTC / 录音 SDK 已经加载完了，
     // 这时候补扫一次符号，把刚才还不存在的镜像覆盖上
-    SLCamInstallAudioUnitHook();
+    SLVCamInstallAudioUnitHook();
 }
 
-static void SLCamHookSessionOutputs(void) {
+static void SLVCamHookSessionOutputs(void) {
     Class cls = objc_getClass("AVCaptureSession");
     if (!cls) return;
     Method m = class_getInstanceMethod(cls, @selector(addOutput:));
     if (!m) return;
     if (gSLAddOutputOrig) return;
     gSLAddOutputOrig = method_getImplementation(m);
-    method_setImplementation(m, (IMP)SLCamAddOutput);
+    method_setImplementation(m, (IMP)SLVCamAddOutput);
 }
 
 #pragma mark - 录制音频链路探测（0.2.15）
@@ -576,7 +576,7 @@ static void (*gSLTapOrig)(id, SEL, NSUInteger, AVAudioFrameCount, AVAudioFormat 
 static BOOL (*gSLRecorderOrig)(id, SEL);
 static void (*gSLMovieStartOrig)(id, SEL, NSURL *, id);
 
-static void SLCamAudioTapProbe(id self, SEL _cmd, NSUInteger bus, AVAudioFrameCount frames,
+static void SLVCamAudioTapProbe(id self, SEL _cmd, NSUInteger bus, AVAudioFrameCount frames,
                                AVAudioFormat *fmt, id block) {
     static BOOL logged = NO;
     if (!logged) {
@@ -584,27 +584,27 @@ static void SLCamAudioTapProbe(id self, SEL _cmd, NSUInteger bus, AVAudioFrameCo
         AudioStreamBasicDescription a;
         memset(&a, 0, sizeof(a));
         if (fmt && fmt.streamDescription) a = *fmt.streamDescription;
-        SLLog(@"音频: 命中 AVAudioEngine tap bus=%lu %.0fHz %uch %uB/帧 · 录制走这条",
+        SLVLog(@"音频: 命中 AVAudioEngine tap bus=%lu %.0fHz %uch %uB/帧 · 录制走这条",
               (unsigned long)bus, a.mSampleRate,
               (unsigned)a.mChannelsPerFrame, (unsigned)a.mBytesPerFrame);
     }
     if (gSLTapOrig) gSLTapOrig(self, _cmd, bus, frames, fmt, block);
 }
 
-static BOOL SLCamRecorderProbe(id self, SEL _cmd) {
+static BOOL SLVCamRecorderProbe(id self, SEL _cmd) {
     static BOOL logged = NO;
     if (!logged) {
         logged = YES;
-        SLLog(@"音频: 命中 AVAudioRecorder -record · 录制走写文件路径");
+        SLVLog(@"音频: 命中 AVAudioRecorder -record · 录制走写文件路径");
     }
     return gSLRecorderOrig ? gSLRecorderOrig(self, _cmd) : NO;
 }
 
-static void SLCamMovieStartProbe(id self, SEL _cmd, NSURL *url, id delegate) {
+static void SLVCamMovieStartProbe(id self, SEL _cmd, NSURL *url, id delegate) {
     static BOOL logged = NO;
     if (!logged) {
         logged = YES;
-        SLLog(@"音频: 命中 AVCaptureMovieFileOutput 录制（%@）· 画面会绕过 VideoDataOutput",
+        SLVLog(@"音频: 命中 AVCaptureMovieFileOutput 录制（%@）· 画面会绕过 VideoDataOutput",
               url.lastPathComponent ?: @"?");
     }
     if (gSLMovieStartOrig) gSLMovieStartOrig(self, _cmd, url, delegate);
@@ -612,14 +612,14 @@ static void SLCamMovieStartProbe(id self, SEL _cmd, NSURL *url, id delegate) {
 
 // AVFAudio 是 iOS 14 起独立出来的框架，宿主不一定会主动加载。
 // objc_getClass 拿不到就 dlopen 一次再取。
-static Class SLCamLoadClass(const char *name, const char *framework) {
+static Class SLVCamLoadClass(const char *name, const char *framework) {
     Class c = objc_getClass(name);
     if (c || !framework) return c;
     if (dlopen(framework, RTLD_LAZY)) return objc_getClass(name);
     return nil;
 }
 
-static void SLCamHookSel(Class cls, SEL sel, IMP imp, IMP *origOut) {
+static void SLVCamHookSel(Class cls, SEL sel, IMP imp, IMP *origOut) {
     if (!cls || !sel) return;
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
@@ -627,24 +627,24 @@ static void SLCamHookSel(Class cls, SEL sel, IMP imp, IMP *origOut) {
     method_setImplementation(m, imp);
 }
 
-static void SLCamInstallRecordingProbes(void) {
+static void SLVCamInstallRecordingProbes(void) {
     static BOOL done = NO;
     if (done) return;
     done = YES;
 
     const char *avf = "/System/Library/Frameworks/AVFAudio.framework/AVFAudio";
-    Class inputNode = SLCamLoadClass("AVAudioInputNode", avf);
-    SLCamHookSel(inputNode, NSSelectorFromString(@"installTapOnBus:bufferSize:format:block:"),
-                 (IMP)SLCamAudioTapProbe, (IMP *)&gSLTapOrig);
+    Class inputNode = SLVCamLoadClass("AVAudioInputNode", avf);
+    SLVCamHookSel(inputNode, NSSelectorFromString(@"installTapOnBus:bufferSize:format:block:"),
+                 (IMP)SLVCamAudioTapProbe, (IMP *)&gSLTapOrig);
 
-    Class rec = SLCamLoadClass("AVAudioRecorder", avf);
-    SLCamHookSel(rec, @selector(record), (IMP)SLCamRecorderProbe, (IMP *)&gSLRecorderOrig);
+    Class rec = SLVCamLoadClass("AVAudioRecorder", avf);
+    SLVCamHookSel(rec, @selector(record), (IMP)SLVCamRecorderProbe, (IMP *)&gSLRecorderOrig);
 
     Class movie = objc_getClass("AVCaptureMovieFileOutput");
-    SLCamHookSel(movie, NSSelectorFromString(@"startRecordingToOutputFileURL:recordingDelegate:"),
-                 (IMP)SLCamMovieStartProbe, (IMP *)&gSLMovieStartOrig);
+    SLVCamHookSel(movie, NSSelectorFromString(@"startRecordingToOutputFileURL:recordingDelegate:"),
+                 (IMP)SLVCamMovieStartProbe, (IMP *)&gSLMovieStartOrig);
 
-    SLLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d",
+    SLVLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d",
           inputNode != nil, rec != nil, movie != nil);
 }
 
@@ -662,7 +662,7 @@ static void SLCamInstallRecordingProbes(void) {
 // 再按 JPEG 的宽高建 format description + block buffer 拼出来。
 static void (*gSLStillOrig)(id, SEL, id, id);
 
-static NSData *SLCamJPEGFromPixelBuffer(CVPixelBufferRef pb, CGFloat quality) {
+static NSData *SLVCamJPEGFromPixelBuffer(CVPixelBufferRef pb, CGFloat quality) {
     if (!pb) return nil;
     CIImage *ci = [CIImage imageWithCVPixelBuffer:pb];
     if (!ci) return nil;
@@ -676,8 +676,8 @@ static NSData *SLCamJPEGFromPixelBuffer(CVPixelBufferRef pb, CGFloat quality) {
     return UIImageJPEGRepresentation(img, quality);
 }
 
-static CMSampleBufferRef SLCamJPEGSampleBuffer(CVPixelBufferRef pb) {
-    NSData *jpeg = SLCamJPEGFromPixelBuffer(pb, 0.92);
+static CMSampleBufferRef SLVCamJPEGSampleBuffer(CVPixelBufferRef pb) {
+    NSData *jpeg = SLVCamJPEGFromPixelBuffer(pb, 0.92);
     if (!jpeg.length) return NULL;
 
     size_t len = jpeg.length;
@@ -713,10 +713,10 @@ static CMSampleBufferRef SLCamJPEGSampleBuffer(CVPixelBufferRef pb) {
     return (st == noErr) ? sbuf : NULL;
 }
 
-static void SLCamCaptureStill(id self, SEL _cmd, id connection,
+static void SLVCamCaptureStill(id self, SEL _cmd, id connection,
                               void (^handler)(CMSampleBufferRef, NSError *)) {
     if (!gSLStillOrig) return;
-    if (!SLCamInjecting() || !SLCamArmed() || ![[SLCamFeed shared] isReady]) {
+    if (!SLVCamInjecting() || !SLVCamArmed() || ![[SLVCamFeed shared] isReady]) {
         // block 本身就是对象，直接当 id 传，不要加 __bridge ——
         // 对 block 类型做 __bridge 转 id 是编译错误（clang 会直接 segfault）。
         gSLStillOrig(self, _cmd, connection, handler);
@@ -728,17 +728,17 @@ static void SLCamCaptureStill(id self, SEL _cmd, id connection,
         // 0.2.16：这里原来用 copyNextFrame，拿的是解码器吐的**原始帧** ——
         // 既没转角度也没镜像，所以预览里画面已经转正了，拍出来还是歪的。
         // 改用拍照专用出帧：按当前旋转/镜像摆好，但不碰预览管线。
-        CVPixelBufferRef pb = [[SLCamFeed shared]
+        CVPixelBufferRef pb = [[SLVCamFeed shared]
             copyOrientedFrameForPixelFormat:kCVPixelFormatType_32BGRA size:CGSizeZero];
-        CMSampleBufferRef fake = pb ? SLCamJPEGSampleBuffer(pb) : NULL;
+        CMSampleBufferRef fake = pb ? SLVCamJPEGSampleBuffer(pb) : NULL;
         if (pb) CVPixelBufferRelease(pb);
         if (fake) {
             static BOOL logged = NO;
             if (!logged) {
                 logged = YES;
-                SLLog(@"注入: 拍照已接管 · 返回素材画面（已按 %ld° / 镜像%@）",
-                      (long)([SLCamFeed shared].rotation % 360),
-                      [SLCamFeed shared].mirrorEnabled ? @"开" : @"关");
+                SLVLog(@"注入: 拍照已接管 · 返回素材画面（已按 %ld° / 镜像%@）",
+                      (long)([SLVCamFeed shared].rotation % 360),
+                      [SLVCamFeed shared].mirrorEnabled ? @"开" : @"关");
             }
             handler(fake, err);
             CFRelease(fake);
@@ -749,18 +749,18 @@ static void SLCamCaptureStill(id self, SEL _cmd, id connection,
     gSLStillOrig(self, _cmd, connection, [wrapped copy]);
 }
 
-static void SLCamInstallStillImageHook(void) {
+static void SLVCamInstallStillImageHook(void) {
     static BOOL done = NO;
     if (done) return;
     done = YES;
     Class cls = objc_getClass("AVCaptureStillImageOutput");
     if (!cls) {
-        SLLog(@"注入: AVCaptureStillImageOutput 不存在，拍照跳过");
+        SLVLog(@"注入: AVCaptureStillImageOutput 不存在，拍照跳过");
         return;
     }
-    SLCamHookSel(cls, NSSelectorFromString(@"captureStillImageAsynchronouslyFromConnection:completionHandler:"),
-                 (IMP)SLCamCaptureStill, (IMP *)&gSLStillOrig);
-    SLLog(@"注入: 拍照链路已布点 still=%d", gSLStillOrig != nil);
+    SLVCamHookSel(cls, NSSelectorFromString(@"captureStillImageAsynchronouslyFromConnection:completionHandler:"),
+                 (IMP)SLVCamCaptureStill, (IMP *)&gSLStillOrig);
+    SLVLog(@"注入: 拍照链路已布点 still=%d", gSLStillOrig != nil);
 }
 
 #pragma mark - 拍照接管之二：AVCapturePhotoOutput（抖音走这条）
@@ -781,44 +781,44 @@ static CVPixelBufferRef (*gSLPhotoPBOrig)(id, SEL);
 
 /// 从素材取一帧、按当前旋转/镜像摆好、转成 JPEG。
 /// 条件不满足返回 nil，调用方原样放行真照片。
-static NSData *SLCamPhotoJPEG(void) {
-    if (!SLCamInjecting() || !SLCamArmed()) return nil;
-    CVPixelBufferRef pb = [[SLCamFeed shared]
+static NSData *SLVCamPhotoJPEG(void) {
+    if (!SLVCamInjecting() || !SLVCamArmed()) return nil;
+    CVPixelBufferRef pb = [[SLVCamFeed shared]
         copyOrientedFrameForPixelFormat:kCVPixelFormatType_32BGRA size:CGSizeZero];
     if (!pb) return nil;
-    NSData *jpeg = SLCamJPEGFromPixelBuffer(pb, 0.92);
+    NSData *jpeg = SLVCamJPEGFromPixelBuffer(pb, 0.92);
     CVPixelBufferRelease(pb);
     return jpeg.length ? jpeg : nil;
 }
 
-static void SLCamPhotoLogOnce(void) {
+static void SLVCamPhotoLogOnce(void) {
     static BOOL logged = NO;
     if (logged) return;
     logged = YES;
-    SLLog(@"注入: 拍照已接管（AVCapturePhotoOutput）· 返回素材画面 %ld° / 镜像%@",
-          (long)([SLCamFeed shared].rotation % 360),
-          [SLCamFeed shared].mirrorEnabled ? @"开" : @"关");
+    SLVLog(@"注入: 拍照已接管（AVCapturePhotoOutput）· 返回素材画面 %ld° / 镜像%@",
+          (long)([SLVCamFeed shared].rotation % 360),
+          [SLVCamFeed shared].mirrorEnabled ? @"开" : @"关");
 }
 
-static NSData *SLCamPhotoFileData(id self, SEL _cmd) {
-    NSData *fake = SLCamPhotoJPEG();
-    if (fake) { SLCamPhotoLogOnce(); return fake; }
+static NSData *SLVCamPhotoFileData(id self, SEL _cmd) {
+    NSData *fake = SLVCamPhotoJPEG();
+    if (fake) { SLVCamPhotoLogOnce(); return fake; }
     return gSLPhotoDataOrig ? gSLPhotoDataOrig(self, _cmd) : nil;
 }
 
-static NSData *SLCamPhotoFileDataCustom(id self, SEL _cmd, id customizer) {
-    NSData *fake = SLCamPhotoJPEG();
-    if (fake) { SLCamPhotoLogOnce(); return fake; }
+static NSData *SLVCamPhotoFileDataCustom(id self, SEL _cmd, id customizer) {
+    NSData *fake = SLVCamPhotoJPEG();
+    if (fake) { SLVCamPhotoLogOnce(); return fake; }
     return gSLPhotoDataCustomOrig ? gSLPhotoDataCustomOrig(self, _cmd, customizer) : nil;
 }
 
 // 只做一次探针：记录宿主到底调不调 capturePhotoWithSettings:delegate:，
 // 以及 delegate 是什么类。下次再出「拍了没换」的日志，一眼就知道走到哪一步了。
-static void SLCamPhotoCapture(id self, SEL _cmd, id settings, id delegate) {
+static void SLVCamPhotoCapture(id self, SEL _cmd, id settings, id delegate) {
     static BOOL logged = NO;
     if (!logged) {
         logged = YES;
-        SLLog(@"注入: 命中 AVCapturePhotoOutput 拍照 · delegate=%@",
+        SLVLog(@"注入: 命中 AVCapturePhotoOutput 拍照 · delegate=%@",
               delegate ? NSStringFromClass([delegate class]) : @"(nil)");
     }
     if (gSLPhotoCaptureOrig) gSLPhotoCaptureOrig(self, _cmd, settings, delegate);
@@ -831,8 +831,8 @@ static void SLCamPhotoCapture(id self, SEL _cmd, id settings, id delegate) {
 //
 // 补哪个方向由照片自己的 EXIF 方向决定：EXIF 说「要顺时针转 90° 才正」（=6），
 // 我们就先逆时针转 90°（=270°），等宿主/系统把它转回来正好抵消。
-static NSInteger SLCamPhotoExtraRotation(id photo, CGSize dstSize) {
-    CGSize vs = [[SLCamFeed shared] latestFrameSize];
+static NSInteger SLVCamPhotoExtraRotation(id photo, CGSize dstSize) {
+    CGSize vs = [[SLVCamFeed shared] latestFrameSize];
     if (vs.width < 1 || vs.height < 1 || dstSize.width < 1 || dstSize.height < 1) return 0;
 
     BOOL videoPortrait = vs.height > vs.width;
@@ -863,30 +863,30 @@ static NSInteger SLCamPhotoExtraRotation(id photo, CGSize dstSize) {
 //   · pixelBuffer 返回的是**借用**引用，调用方不会 CFRelease → 每次拍照泄 8MB；
 //   · 尺寸/格式跟真照片对不上，宿主按 resolvedSettings 算出的宽高会跟 buffer 打架。
 // 所以改成「拿宿主那个 buffer，把素材帧原地画进去」—— 指针、尺寸、格式全是它熟悉的。
-static CVPixelBufferRef SLCamPhotoPixelBuffer(id self, SEL _cmd) {
+static CVPixelBufferRef SLVCamPhotoPixelBuffer(id self, SEL _cmd) {
     CVPixelBufferRef real = gSLPhotoPBOrig ? gSLPhotoPBOrig(self, _cmd) : NULL;
     if (!real) return real;
-    if (!SLCamInjecting() || !SLCamArmed()) return real;
+    if (!SLVCamInjecting() || !SLVCamArmed()) return real;
 
     CGSize sz = CGSizeMake(CVPixelBufferGetWidth(real), CVPixelBufferGetHeight(real));
-    NSInteger extra = SLCamPhotoExtraRotation(self, sz);
-    if (![[SLCamFeed shared] renderIntoPixelBuffer:real extraRotation:extra]) return real;
+    NSInteger extra = SLVCamPhotoExtraRotation(self, sz);
+    if (![[SLVCamFeed shared] renderIntoPixelBuffer:real extraRotation:extra]) return real;
 
     static BOOL logged = NO;
     if (!logged) {
         logged = YES;
-        CGSize vs = [[SLCamFeed shared] latestFrameSize];
-        SLLog(@"注入: 拍照已接管（pixelBuffer 原地改写）· 照片 %zux%zu / 预览 %zux%zu · "
+        CGSize vs = [[SLVCamFeed shared] latestFrameSize];
+        SLVLog(@"注入: 拍照已接管（pixelBuffer 原地改写）· 照片 %zux%zu / 预览 %zux%zu · "
               @"设置 %ld° + 补偿 %ld° / 镜像%@",
               CVPixelBufferGetWidth(real), CVPixelBufferGetHeight(real),
               (size_t)vs.width, (size_t)vs.height,
-              (long)([SLCamFeed shared].rotation % 360), (long)extra,
-              [SLCamFeed shared].mirrorEnabled ? @"开" : @"关");
+              (long)([SLVCamFeed shared].rotation % 360), (long)extra,
+              [SLVCamFeed shared].mirrorEnabled ? @"开" : @"关");
     }
     return real;
 }
 
-static void SLCamInstallPhotoOutputHook(void) {
+static void SLVCamInstallPhotoOutputHook(void) {
     static BOOL done = NO;
     if (done) return;
     done = YES;
@@ -894,26 +894,26 @@ static void SLCamInstallPhotoOutputHook(void) {
     Class photo = objc_getClass("AVCapturePhoto");
     Class output = objc_getClass("AVCapturePhotoOutput");
     if (!photo || !output) {
-        SLLog(@"注入: AVCapturePhoto/PhotoOutput 不存在，拍照跳过 photo=%d output=%d",
+        SLVLog(@"注入: AVCapturePhoto/PhotoOutput 不存在，拍照跳过 photo=%d output=%d",
               photo != nil, output != nil);
         return;
     }
 
-    SLCamHookSel(photo, NSSelectorFromString(@"fileDataRepresentation"),
-                 (IMP)SLCamPhotoFileData, (IMP *)&gSLPhotoDataOrig);
-    SLCamHookSel(photo, NSSelectorFromString(@"fileDataRepresentationWithCustomizer:"),
-                 (IMP)SLCamPhotoFileDataCustom, (IMP *)&gSLPhotoDataCustomOrig);
-    SLCamHookSel(photo, NSSelectorFromString(@"pixelBuffer"),
-                 (IMP)SLCamPhotoPixelBuffer, (IMP *)&gSLPhotoPBOrig);
-    SLCamHookSel(output, NSSelectorFromString(@"capturePhotoWithSettings:delegate:"),
-                 (IMP)SLCamPhotoCapture, (IMP *)&gSLPhotoCaptureOrig);
+    SLVCamHookSel(photo, NSSelectorFromString(@"fileDataRepresentation"),
+                 (IMP)SLVCamPhotoFileData, (IMP *)&gSLPhotoDataOrig);
+    SLVCamHookSel(photo, NSSelectorFromString(@"fileDataRepresentationWithCustomizer:"),
+                 (IMP)SLVCamPhotoFileDataCustom, (IMP *)&gSLPhotoDataCustomOrig);
+    SLVCamHookSel(photo, NSSelectorFromString(@"pixelBuffer"),
+                 (IMP)SLVCamPhotoPixelBuffer, (IMP *)&gSLPhotoPBOrig);
+    SLVCamHookSel(output, NSSelectorFromString(@"capturePhotoWithSettings:delegate:"),
+                 (IMP)SLVCamPhotoCapture, (IMP *)&gSLPhotoCaptureOrig);
 
-    SLLog(@"注入: 拍照链路已布点 photo=%d custom=%d pb=%d capture=%d",
+    SLVLog(@"注入: 拍照链路已布点 photo=%d custom=%d pb=%d capture=%d",
           gSLPhotoDataOrig != nil, gSLPhotoDataCustomOrig != nil,
           gSLPhotoPBOrig != nil, gSLPhotoCaptureOrig != nil);
 }
 
-void SLCamInstallHooks(void) {
+void SLVCamInstallHooks(void) {
     if (sSLCamHooksInstalled) return;
     sSLCamHooksInstalled = YES;
 
@@ -939,66 +939,66 @@ void SLCamInstallHooks(void) {
             for (unsigned i = 0; i < n; i++) {
                 NSString *name = @(sel_getName(method_getName(list[i]))).lowercaseString;
                 if (![name containsString:@"samplebuffer"]) continue;
-                if (!SLCamIsSinglePointerArgMethod(list[i])) {
+                if (!SLVCamIsSinglePointerArgMethod(list[i])) {
                     [skipped addObject:[NSString stringWithFormat:@"-[%s %s]",
                                         class_getName(c), sel_getName(method_getName(list[i]))]];
                     continue;
                 }
-                SLCamHookMethod(c, list[i]);
+                SLVCamHookMethod(c, list[i]);
             }
             free(list);
         }
     }
 
     if (skipped.count) {
-        SLLog(@"注入: 跳过 %lu 个方法（签名不是单指针参数，挂了会丢参）: %@",
+        SLVLog(@"注入: 跳过 %lu 个方法（签名不是单指针参数，挂了会丢参）: %@",
               (unsigned long)skipped.count, [skipped componentsJoinedByString:@", "]);
     }
 
     // 音频在各系统版本上未必走 AVCaptureAudioDataOutput，先把候选方法名和
     // 会话里实际加了哪些输出打出来，下次日志就能定位
-    SLCamDumpCandidates("AVCaptureAudioDataOutput");
-    SLCamDumpCandidates("AVCaptureAudioPreviewOutput");
-    SLCamHookSessionOutputs();
+    SLVCamDumpCandidates("AVCaptureAudioDataOutput");
+    SLVCamDumpCandidates("AVCaptureAudioPreviewOutput");
+    SLVCamHookSessionOutputs();
 
     // 第二条链路：不经过 AVCapture 的麦克风（QQ 这类自建音频栈的 App）
-    SLCamInstallAudioUnitHook();
+    SLVCamInstallAudioUnitHook();
 
     // 第三条：QQ 拍摄页录制走的第四条路 —— 先布点确认是哪条
-    SLCamInstallRecordingProbes();
+    SLVCamInstallRecordingProbes();
 
     // 拍照（AVCaptureStillImageOutput）走的是另一条路，上面那套启发式挂不到
-    SLCamInstallStillImageHook();
+    SLVCamInstallStillImageHook();
 
     // 抖音拍照走 AVCapturePhotoOutput，又是另一条 —— 两条都要挂
-    SLCamInstallPhotoOutputHook();
+    SLVCamInstallPhotoOutputHook();
 
     if (sSLCamHookCount == 0) {
-        SLLog(@"注入: 没找到 _processSampleBuffer: —— 该系统版本可能改了私有 API，"
+        SLVLog(@"注入: 没找到 _processSampleBuffer: —— 该系统版本可能改了私有 API，"
               @"可用日志页确认后换挂点");
     } else {
-        SLLog(@"注入: 共 hook %d 个方法", sSLCamHookCount);
+        SLVLog(@"注入: 共 hook %d 个方法", sSLCamHookCount);
     }
 }
 
-void SLCamSetInjecting(BOOL injecting) {
+void SLVCamSetInjecting(BOOL injecting) {
     if (sSLCamInjecting == injecting) return;
     sSLCamInjecting = injecting;
-    SLLog(@"injecting = %@", injecting ? @"YES" : @"NO");
+    SLVLog(@"injecting = %@", injecting ? @"YES" : @"NO");
 }
 
-BOOL SLCamInjecting(void) {
+BOOL SLVCamInjecting(void) {
     return sSLCamInjecting;
 }
 
-BOOL SLCamHooksInstalled(void) {
+BOOL SLVCamHooksInstalled(void) {
     return sSLCamHooksInstalled;
 }
 
-int SLCamHookCount(void) {
+int SLVCamHookCount(void) {
     return sSLCamHookCount;
 }
 
-BOOL SLCamAVCaptureAudioSeen(void) {
+BOOL SLVCamAVCaptureAudioSeen(void) {
     return sSLCamAVCaptureAudioSeen;
 }

@@ -1,5 +1,5 @@
 //
-//  SLCamFeed.m
+//  SLVCamFeed.m
 //  声临 · 虚拟摄像头 —— 帧源实现
 //
 //  并发模型（重要）：
@@ -40,11 +40,11 @@
 //
 //   生产端高水位 120ms  —— 稳态水位就在这附近，A/V 延迟也靠它压住
 //   消费端只在超过 600ms 时一刀砍回 100ms，其余情况一律不丢
-#define SL_AUDIO_TARGET_SEC 0.10
-#define SL_AUDIO_HIGH_SEC   0.12
-#define SL_AUDIO_HARD_SEC   0.60
+#define SLV_AUDIO_TARGET_SEC 0.10
+#define SLV_AUDIO_HIGH_SEC   0.12
+#define SLV_AUDIO_HARD_SEC   0.60
 
-@interface SLCamFeed () {
+@interface SLVCamFeed () {
     NSLock *_lock;
 
     // ---- 跨线程共享（受 _lock 保护）----
@@ -108,12 +108,12 @@
 
 @end
 
-@implementation SLCamFeed
+@implementation SLVCamFeed
 
 + (instancetype)shared {
-    static SLCamFeed *s = nil;
+    static SLVCamFeed *s = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [[SLCamFeed alloc] init]; });
+    dispatch_once(&once, ^{ s = [[SLVCamFeed alloc] init]; });
     return s;
 }
 
@@ -137,12 +137,12 @@
     [_lock lock];
     _sourcePath = p;
     _naturalSize = CGSizeZero;
-    _isImage = [SLCamFeed sl_isImagePath:p];
+    _isImage = [SLVCamFeed sl_isImagePath:p];
     _stillLoaded = NO;
     [_lock unlock];
     [self sl_restart];
-    SLLog(@"feed source -> %@%@", p.lastPathComponent ?: @"(nil)",
-          [SLCamFeed sl_isImagePath:p] ? @"（图片）" : @"");
+    SLVLog(@"feed source -> %@%@", p.lastPathComponent ?: @"(nil)",
+          [SLVCamFeed sl_isImagePath:p] ? @"（图片）" : @"");
 }
 
 /// 按扩展名判断是不是图片素材
@@ -222,7 +222,7 @@
 
     CIImage *img = [CIImage imageWithContentsOfURL:[NSURL fileURLWithPath:path] options:nil];
     if (!img) {
-        SLLog(@"feed 图片解码失败 %@", path.lastPathComponent);
+        SLVLog(@"feed 图片解码失败 %@", path.lastPathComponent);
         return;
     }
 
@@ -294,7 +294,7 @@
     [_lock unlock];
 
     if (stale) { CVPixelBufferRelease(pb); return; }
-    SLLog(@"feed 管线就绪 图片 %zux%zu（原始 %.0fx%.0f）",
+    SLVLog(@"feed 管线就绪 图片 %zux%zu（原始 %.0fx%.0f）",
           w, h, ext.size.width, ext.size.height);
 }
 
@@ -411,14 +411,14 @@
     NSUInteger rate = _audioBytesPerSecond;
     [_lock unlock];
     if (rate == 0) return YES;      // 目标格式还没确定，先别停
-    return buffered < (NSUInteger)(rate * SL_AUDIO_HIGH_SEC);
+    return buffered < (NSUInteger)(rate * SLV_AUDIO_HIGH_SEC);
 }
 
 /// 解码线程内调用：音频池没到高水位才继续解
 - (BOOL)sl_pumpAudio {
     [_lock lock];
     NSUInteger buffered = _audioPCM.length - _audioReadCursor;
-    NSUInteger limit = (NSUInteger)(_audioBytesPerSecond * SL_AUDIO_HIGH_SEC);
+    NSUInteger limit = (NSUInteger)(_audioBytesPerSecond * SLV_AUDIO_HIGH_SEC);
     [_lock unlock];
     if (limit && buffered >= limit) return NO;
 
@@ -518,7 +518,7 @@
     NSError *err = nil;
     AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&err];
     if (!reader) {
-        SLLog(@"feed reader 创建失败: %@", err.localizedDescription ?: @"?");
+        SLVLog(@"feed reader 创建失败: %@", err.localizedDescription ?: @"?");
         return;
     }
 
@@ -556,7 +556,7 @@
                                  a->mSampleRate, (unsigned)a->mChannelsPerFrame];
             }
         }
-        SLLog(@"feed 素材音轨: %@ · %@ · %@（%@）", audioTrack ? @"有" : @"无",
+        SLVLog(@"feed 素材音轨: %@ · %@ · %@（%@）", audioTrack ? @"有" : @"无",
               codec, detail, path.lastPathComponent);
     }
 
@@ -619,13 +619,13 @@
             } else {
                 // 音轨在，但解不成 float32 / 单声道。表现就是「有音轨却全程静音」，
                 // 必须留一行，否则只能靠猜。
-                SLLog(@"feed 音轨解不成 PCM（编码不支持），这条素材只能静音");
+                SLVLog(@"feed 音轨解不成 PCM（编码不支持），这条素材只能静音");
             }
         }
     }
 
     if (![reader startReading]) {
-        SLLog(@"feed startReading 失败: %@", reader.error.localizedDescription ?: @"?");
+        SLVLog(@"feed startReading 失败: %@", reader.error.localizedDescription ?: @"?");
         return;
     }
     _reader = reader;
@@ -638,7 +638,7 @@
     BOOL keyChanged = ![sLastLoggedKey isEqualToString:key ?: @""];
     if (keyChanged || sLoopRounds % 20 == 0) {
         sLastLoggedKey = key ?: @"";
-        SLLog(@"feed 管线就绪 %@ (video=%@ audio=%@)%@", key ?: @"(nil)",
+        SLVLog(@"feed 管线就绪 %@ (video=%@ audio=%@)%@", key ?: @"(nil)",
               _videoOut ? @"Y" : @"N", _audioOut ? @"Y" : @"N",
               keyChanged ? @"" : [NSString stringWithFormat:@" · 第 %d 轮", sLoopRounds]);
     }
@@ -914,11 +914,11 @@
         AVAudioFormat *df = [[AVAudioFormat alloc] initWithStreamDescription:&_audioDstASBD];
         if (sf && df) {
             _audioConverter = [[AVAudioConverter alloc] initFromFormat:sf toFormat:df];
-            if (!_audioConverter) SLLog(@"音频转换器创建失败，将只换画面");
+            if (!_audioConverter) SLVLog(@"音频转换器创建失败，将只换画面");
         }
     }
     _reconfigRequested = YES;   // 让解码线程把音频轨挂上
-    SLLog(@"audio 目标 %.0fHz %uch %uB/帧 转码=%@", asbd->mSampleRate,
+    SLVLog(@"audio 目标 %.0fHz %uch %uB/帧 转码=%@", asbd->mSampleRate,
           (unsigned)asbd->mChannelsPerFrame, (unsigned)asbd->mBytesPerFrame,
           needConvert ? @"Y" : @"N");
     return YES;
@@ -951,7 +951,7 @@
         // 现在第一次撞上就留一行痕。
         if (!_audioPassLogged) {
             _audioPassLogged = YES;
-            SLLog(@"音频: 放行真麦克风 —— 目标格式还没配置（素材 %.0fHz %uch，宿主未登记）",
+            SLVLog(@"音频: 放行真麦克风 —— 目标格式还没配置（素材 %.0fHz %uch，宿主未登记）",
                   asbd->mSampleRate, (unsigned)asbd->mChannelsPerFrame);
         }
         return nil;
@@ -975,9 +975,9 @@
     // 判据 —— 水位高不等于延迟大，正常稳态水位同样高。所以整条删掉，
     // 不再有任何在稳态下会触发的丢包路径。
     if (_audioBytesPerSecond > 0) {
-        NSUInteger target = (NSUInteger)(_audioBytesPerSecond * SL_AUDIO_TARGET_SEC);
+        NSUInteger target = (NSUInteger)(_audioBytesPerSecond * SLV_AUDIO_TARGET_SEC);
         if (target < numBytes) target = numBytes;
-        NSUInteger hard = (NSUInteger)(_audioBytesPerSecond * SL_AUDIO_HARD_SEC);
+        NSUInteger hard = (NSUInteger)(_audioBytesPerSecond * SLV_AUDIO_HARD_SEC);
 
         if (avail > hard) {
             NSUInteger drop = avail - target;
@@ -986,7 +986,7 @@
             _audioDropped += drop;
             if (!_audioDropLogged) {
                 _audioDropLogged = YES;
-                SLLog(@"音频: 缓冲 %lums 严重偏高（卡顿后遗留），硬切 %lu 字节回 %lums",
+                SLVLog(@"音频: 缓冲 %lums 严重偏高（卡顿后遗留），硬切 %lu 字节回 %lums",
                       (unsigned long)((avail + drop) * 1000 / _audioBytesPerSecond),
                       (unsigned long)drop,
                       (unsigned long)(target * 1000 / _audioBytesPerSecond));
@@ -1008,7 +1008,7 @@
     // 心跳：每 3000 包打一次水位，下次再出问题不用靠推算
     _audioCalls++;
     if (_audioCalls % 3000 == 0 && _audioBytesPerSecond > 0) {
-        SLLog(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包",
+        SLVLog(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包",
               (unsigned long)((_audioPCM.length - _audioReadCursor) * 1000 / _audioBytesPerSecond),
               (unsigned long)_audioDropped, (unsigned long)_audioCalls);
     }
@@ -1027,7 +1027,7 @@
         // 虚拟摄像头的前提是「别把真实环境录进去」，所以这里改成静音。
         if (!hasAudio && !_audioPassLogged) {
             _audioPassLogged = YES;
-            SLLog(@"音频: 素材没有音轨，输出静音（不放行真麦克风）");
+            SLVLog(@"音频: 素材没有音轨，输出静音（不放行真麦克风）");
         }
         // 有音轨但还没解出数据 —— 必须输出静音。
         // 返回 nil 会让注入层放行真麦克风，把环境声原样录进去，

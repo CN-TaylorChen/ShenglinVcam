@@ -1,5 +1,5 @@
 //
-//  SLCamInject.h
+//  SLVCamInject.h
 //  声临 · 虚拟摄像头 —— 注入层
 //
 //  挂点选择说明（和底包最初注释里的建议不同，是有意为之）：
@@ -20,22 +20,22 @@
 NS_ASSUME_NONNULL_BEGIN
 
 /// 安装注入钩子。重复调用安全。
-void SLCamInstallHooks(void);
+void SLVCamInstallHooks(void);
 
 /// 现在是否处在「替换画面」状态（业务开 / 关时调，壳子据此切球色）
-void SLCamSetInjecting(BOOL injecting);
+void SLVCamSetInjecting(BOOL injecting);
 
 /// 当前是否在替换
-BOOL SLCamInjecting(void);
+BOOL SLVCamInjecting(void);
 
-/// 钩子是否已经装过（装过不代表命中，看 SLCamHookCount）
-BOOL SLCamHooksInstalled(void);
+/// 钩子是否已经装过（装过不代表命中，看 SLVCamHookCount）
+BOOL SLVCamHooksInstalled(void);
 
 /// 实际命中的方法个数（0 = 这台系统上没找到 _processSampleBuffer:）
-int SLCamHookCount(void);
+int SLVCamHookCount(void);
 
 /// 宿主的音频是否确实从 AVCapture 走（见过 AVCapture 的音频采样缓冲）。
 /// AudioUnit 那条链路据此让路，避免两条链路同时消费同一个 PCM 池。
-BOOL SLCamAVCaptureAudioSeen(void);
+BOOL SLVCamAVCaptureAudioSeen(void);
 
 NS_ASSUME_NONNULL_END

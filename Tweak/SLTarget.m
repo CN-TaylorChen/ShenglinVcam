@@ -1,5 +1,5 @@
 //
-//  SLTarget.m
+//  SLVTarget.m
 //  声临 · 虚拟摄像头 —— 目标进程判定
 //
 
@@ -7,12 +7,21 @@
 #import "SLUtil.h"
 #import "SLLog.h"
 
-static NSString *const kSLCamTargetsKey = @"SLCamTargets";
+static NSString *const kSLCamTargetsKey = @"SLVCamTargets";
+// 0.3.0 统一加 SLV 前缀前的旧键。只读不写，读到就搬到新键 ——
+// 不然升级后读不到旧白名单，空数组等于「全域生效」，用户配过的名单会被静默重置。
+static NSString *const kSLCamTargetsKeyOld = @"SLCamTargets";
 
-@implementation SLTargetRegistry
+@implementation SLVTargetRegistry
 
 + (NSArray<NSString *> *)targetBundleIDs {
-    NSArray *v = [[NSUserDefaults standardUserDefaults] arrayForKey:kSLCamTargetsKey];
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    NSArray *v = [d arrayForKey:kSLCamTargetsKey];
+    if (![v isKindOfClass:[NSArray class]]) {
+        // 0.3.0 迁移
+        v = [d arrayForKey:kSLCamTargetsKeyOld];
+        if ([v isKindOfClass:[NSArray class]]) [d setObject:v forKey:kSLCamTargetsKey];
+    }
     return [v isKindOfClass:[NSArray class]] ? v : @[];
 }
 

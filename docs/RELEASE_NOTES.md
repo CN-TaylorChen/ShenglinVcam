@@ -1,3 +1,90 @@
+## 0.3.0 —— 和「声临·陌陌」同装时球不出现；标题栏 logo / 当前素材重叠
+
+这一版是三件事捆在一起发的：**改掉和陌陌的符号冲突**、**修设置页两个显示 bug**。
+
+---
+
+### 一、两个 tweak 一起装，只看得见陌陌的球
+
+#### 症状
+
+同一台机器上装了「声临·陌陌」和「声临·虚拟摄像头」，进陌陌只看到一颗球 ——
+长得是陌陌那套四根声波条，Vcam 的叠层球根本没出现。
+
+#### 四层冲突，一层比一层深
+
+| 层 | 冲突点 | 后果 |
+|---|---|---|
+| 1 | 注入范围 | `ShenglinVcam.plist` 写的是 `com.apple.UIKit`（全平台），陌陌进程里两个 dylib 同时加载 |
+| 2 | **tag 撞车** | 两边都 `#define SLBtnTag 20931`，`viewWithTag:` 直接拿到对方的球 |
+| 3 | ObjC 类同名 | 9 个类（`SLAlignBox` / `SLFloatButton` / `SLFloatIconController` / `SLFloatPanelController` / `SLLog` / `SLLogViewController` / `SLPopGestureKeeper` / `SLSearchPill` / `SLSettingsPanel`） |
+| 4 | 偏好键同名 | `SLFloatPos` / `SLFloatPosRel` / `SLFloatIcon` / `SLFloatEffect` |
+
+第 3 层是最阴的：ObjC 类表是**进程全局**的，9 个同名类只有一份生效，
+后注册的那份被静默丢弃，只在控制台留一行 `Class X is implemented in both...`。
+所以光改 tag 没用 —— 球能建出来，但跑的是陌陌那份实现。
+
+#### 为什么「永远是 Vcam 输」
+
+不是 dylib 加载顺序的问题，是**建球时机差了 1.2 秒**：
+
+```objc
+// 陌陌：%ctor → dispatch_async(main) → 0 秒建球
+// Vcam：%ctor → dispatch_after 1.2s
+```
+
+所以这是**确定的**，不是「有时候有有时候没有」。谁先建，`viewWithTag:` 就归谁。
+
+#### 改法
+
+1. **全局标识符统一加 `V`**：`SLXxx` → `SLVXxx`。
+   范围是 9 个 ObjC 类、11 个非 `static` 全局函数
+   （`SLVApplyGlassTable` / `SLVCloseHostingPanel` / `SLVEnsureFloatButton` /
+   `SLVFloatSetState` / `SLVFloatSetStateQuiet` / `SLVInstallPillBack` /
+   `SLVInstallPillBackSized` / `SLVLogWrite` / `SLVRaiseFloatButton` /
+   `SLVRefreshFloatButton` / `SLVStartEntryWatcher`）。
+   另外 40 个函数本来就是 `static`，不导出、不会冲突，一起改名只为读起来一致。
+2. **tag 20931 → 20941**。改名字不够，值必须换。
+3. **默认落点错开**：`size.height * 0.55` → `* 0.72`。两边默认都在 0.55 一带，
+   位置又都没存过时两个球会叠在一起。
+4. **首次创建时避让**：窗口里已经有 tag 20931 的球、且位置几乎重合，
+   我们的往下挪 64pt。只做兜底，用户自己拖过的位置不覆盖。
+5. **偏好键迁移**：新键读不到时读旧键，读到就搬到新键。
+   不迁的话 —— `kSLCamEnabledKey` 改名后 `SLCamEnabled()` 读不到旧值、兜底 `YES`，
+   **用户关过的开关会自己打开**；`SLCamTargets` 读不到 → 空数组 = 全域生效，
+   **白名单被静默重置**。
+
+#### 没动的
+
+- 文件名一律不改（`#import "SLXxx.h"` 还是原名）。
+- 沙盒目录 `Documents/ShenglinVcam/`、日志 `/var/mobile/Documents/ShenglinVcam/slvcam.log`。
+- `Makefile` 的 `_FILES` 清单。
+
+---
+
+### 二、标题栏 logo 乱了
+
+标题栏那个 22pt 图标用的是 `SLVBrandIconImage(44)` —— 那张图**带一圈黑色圆底**，
+是给悬浮球用的。缩到 22pt，圆底 + 两个框叠在一起，就是一坨黑块。
+
+改成无底色的紧凑版 `SLVBrandGlyphImage(side, color)`，线条跟 `labelColor` 走。
+
+顺带修了同一个函数里的一个几何问题：后框整条画出来时，它的左边线（x=42）落在
+前框内部（2..58），两条竖线只隔 7.5 单位 —— 22pt 下糊成 `|||`，像三根柱子。
+现在把后框**裁到前框右边线以右**，只剩右侧露出的那一截，语义回到「前面这张挡着后面那张」。
+小尺寸（< 32pt）描边 8.5→6.5、圆角 17→15，否则前框的洞会被描边吃掉。
+
+### 三、「当前素材」文字重叠
+
+右侧详情是 `"1 个 · 抖音号_3...-10-29 23_56_2"` 这种长字符串，
+`UITableViewCellStyleValue1` 在详情过宽时只保证「放得下才避让」，
+右对齐的标签一旦被压窄，文字会从左边溢出到标题上，两段字叠在一起。
+
+这一行改用 `UITableViewCellStyleSubtitle`：值单独占第二行，怎么长都不会撞。
+行高 62，其余行仍 44。
+
+---
+
 ## 0.2.28 —— 关掉「启用」后球退回默认态
 
 ### 症状

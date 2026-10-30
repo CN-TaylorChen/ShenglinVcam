@@ -9,7 +9,7 @@
 
 #import <UIKit/UIKit.h>
 
-@interface SLAlignBox : UIView
+@interface SLVAlignBox : UIView
 
 /// 目标左基线，单位是「表格坐标系」的 x（即单元格文字的绝对位置）
 @property (nonatomic, assign) CGFloat targetLeading;
@@ -17,7 +17,7 @@
 @end
 
 /// 分组标题（固定 22pt 高，单行）
-UIView *SLAlignHeader(NSString *text, CGFloat targetLeading, CGFloat width);
+UIView *SLVAlignHeader(NSString *text, CGFloat targetLeading, CGFloat width);
 
 /// 分组说明（多行，高度由调用方按文本实算）
-UIView *SLAlignFooter(NSString *text, CGFloat targetLeading, CGFloat width);
+UIView *SLVAlignFooter(NSString *text, CGFloat targetLeading, CGFloat width);

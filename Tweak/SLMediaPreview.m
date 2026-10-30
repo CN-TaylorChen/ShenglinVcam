@@ -1,5 +1,5 @@
 //
-//  SLMediaPreview.m
+//  SLVMediaPreview.m
 //  声临 · 虚拟摄像头 —— 素材预览
 //
 
@@ -14,11 +14,11 @@
 
 #pragma mark - 音轨体检
 
-@implementation SLMediaAudioInfo
+@implementation SLVMediaAudioInfo
 @end
 
 /// 4CC → 可读名。别写 'aac ' 这种多字符字面量 —— 实现定义，换编译器就可能变。
-static NSString *SLFourCCName(FourCharCode fc) {
+static NSString *SLVFourCCName(FourCharCode fc) {
     char s[5] = {
         (char)((fc >> 24) & 0xFF),
         (char)((fc >> 16) & 0xFF),
@@ -42,9 +42,9 @@ static NSString *SLFourCCName(FourCharCode fc) {
     return raw.length ? raw : @"未知";
 }
 
-/// 音轨能不能解成 PCM —— 判据跟 SLCamFeed 建 reader 时保持一致，
+/// 音轨能不能解成 PCM —— 判据跟 SLVCamFeed 建 reader 时保持一致，
 /// 否则会出现「预览说能出声、录制时却静音」这种前后矛盾。
-static BOOL SLTrackDecodesToPCM(AVAsset *asset, AVAssetTrack *track) {
+static BOOL SLVTrackDecodesToPCM(AVAsset *asset, AVAssetTrack *track) {
     if (!asset || !track) return NO;
     NSError *err = nil;
     AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&err];
@@ -61,7 +61,7 @@ static BOOL SLTrackDecodesToPCM(AVAsset *asset, AVAssetTrack *track) {
     return [reader canAddOutput:out];
 }
 
-SLMediaAudioInfo *SLProbeMediaAudio(NSString *path) {
+SLVMediaAudioInfo *SLVProbeMediaAudio(NSString *path) {
     if (!path.length) return nil;
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:path]) return nil;
@@ -71,15 +71,15 @@ SLMediaAudioInfo *SLProbeMediaAudio(NSString *path) {
     NSTimeInterval mtime = [(NSDate *)attrs[NSFileModificationDate] timeIntervalSince1970];
     NSString *key = [NSString stringWithFormat:@"%@|%.0f", path.lastPathComponent, mtime];
 
-    static NSMutableDictionary<NSString *, SLMediaAudioInfo *> *cache = nil;
+    static NSMutableDictionary<NSString *, SLVMediaAudioInfo *> *cache = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ cache = [NSMutableDictionary dictionary]; });
     @synchronized (cache) {
-        SLMediaAudioInfo *hit = cache[key];
+        SLVMediaAudioInfo *hit = cache[key];
         if (hit) return hit;
     }
 
-    SLMediaAudioInfo *info = [[SLMediaAudioInfo alloc] init];
+    SLVMediaAudioInfo *info = [[SLVMediaAudioInfo alloc] init];
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
     AVAssetTrack *at = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
 
@@ -90,12 +90,12 @@ SLMediaAudioInfo *SLProbeMediaAudio(NSString *path) {
         info.detail = @"";
     } else {
         info.hasAudio = YES;
-        info.decodable = SLTrackDecodesToPCM(asset, at);
+        info.decodable = SLVTrackDecodesToPCM(asset, at);
 
         CMFormatDescriptionRef fd =
             (__bridge CMFormatDescriptionRef)at.formatDescriptions.firstObject;
         if (fd) {
-            info.codec = SLFourCCName(CMFormatDescriptionGetMediaSubType(fd));
+            info.codec = SLVFourCCName(CMFormatDescriptionGetMediaSubType(fd));
             const AudioStreamBasicDescription *asbd =
                 CMAudioFormatDescriptionGetStreamBasicDescription(fd);
             if (asbd && asbd->mSampleRate > 0) {
@@ -115,11 +115,11 @@ SLMediaAudioInfo *SLProbeMediaAudio(NSString *path) {
     return info;
 }
 
-NSString *SLMediaAudioSummary(void) {
-    SLMediaItem *it = [SLMediaStore currentItem];
+NSString *SLVMediaAudioSummary(void) {
+    SLVMediaItem *it = [SLVMediaStore currentItem];
     if (!it) return @"未选素材";
     if (it.isImage) return @"图片";
-    SLMediaAudioInfo *info = SLProbeMediaAudio(it.path);
+    SLVMediaAudioInfo *info = SLVProbeMediaAudio(it.path);
     if (!info) return @"读不到";
     if (!info.hasAudio) return @"无声音";
     if (!info.decodable) return @"音轨不可解";
@@ -131,7 +131,7 @@ NSString *SLMediaAudioSummary(void) {
 /// 素材「摆正之后」的显示尺寸。
 /// 直接读 naturalSize 会拿到传感器坐标（竖拍的视频是 1920x1080），
 /// 必须过一遍 preferredTransform 才是眼睛看到的宽高。
-static CGSize SLDisplaySizeOfAsset(AVAsset *asset) {
+static CGSize SLVDisplaySizeOfAsset(AVAsset *asset) {
     if (!asset) return CGSizeZero;
     AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
     if (!vt) return CGSizeZero;
@@ -144,14 +144,14 @@ static CGSize SLDisplaySizeOfAsset(AVAsset *asset) {
     return d;
 }
 
-static NSString *SLTimeText(Float64 sec) {
+static NSString *SLVTimeText(Float64 sec) {
     if (!isfinite(sec) || sec < 0) sec = 0;
     long total = (long)lround(sec);
     return [NSString stringWithFormat:@"%ld:%02ld", total / 60, total % 60];
 }
 
-@interface SLMediaPreviewController ()
-@property (nonatomic, strong) SLMediaItem *item;
+@interface SLVMediaPreviewController ()
+@property (nonatomic, strong) SLVMediaItem *item;
 @property (nonatomic, strong) UIView *stage;
 @property (nonatomic, strong) UIImageView *stillView;
 @property (nonatomic, strong) AVPlayer *player;
@@ -171,16 +171,16 @@ static NSString *SLTimeText(Float64 sec) {
 @property (nonatomic, assign) CGFloat aspect;
 @end
 
-@implementation SLMediaPreviewController
+@implementation SLVMediaPreviewController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor clearColor];
     self.title = @"预览";
-    self.navigationItem.titleView = SLPillTitleView(@"预览");
-    self.navigationItem.rightBarButtonItem = SLPillBarItem(@"完成", self, @selector(sl_close));
+    self.navigationItem.titleView = SLVPillTitleView(@"预览");
+    self.navigationItem.rightBarButtonItem = SLVPillBarItem(@"完成", self, @selector(sl_close));
 
-    self.item = [SLMediaStore currentItem];
+    self.item = [SLVMediaStore currentItem];
 
     self.stage = [[UIView alloc] initWithFrame:CGRectZero];
     self.stage.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.86];
@@ -195,7 +195,7 @@ static NSString *SLTimeText(Float64 sec) {
     [self.stage addSubview:self.stillView];
 
     self.infoCard = [[UIView alloc] initWithFrame:CGRectZero];
-    self.infoCard.backgroundColor = SLGlassCellColor();
+    self.infoCard.backgroundColor = SLVGlassCellColor();
     self.infoCard.layer.cornerRadius = 14.0;
     self.infoCard.layer.cornerCurve = kCACornerCurveContinuous;
     [self.view addSubview:self.infoCard];
@@ -254,7 +254,7 @@ static NSString *SLTimeText(Float64 sec) {
 }
 
 - (void)sl_close {
-    SLCloseHostingPanel(self);
+    SLVCloseHostingPanel(self);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -280,7 +280,7 @@ static NSString *SLTimeText(Float64 sec) {
 #pragma mark 内容
 
 - (void)sl_loadContent {
-    SLMediaItem *it = self.item;
+    SLVMediaItem *it = self.item;
     if (!it.path.length) {
         self.stateLab.text = @"没有素材";
         self.stateLab.textColor = [UIColor secondaryLabelColor];
@@ -310,7 +310,7 @@ static NSString *SLTimeText(Float64 sec) {
     self.player = [AVPlayer playerWithPlayerItem:pitem];
     self.player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
 
-    CGSize disp = SLDisplaySizeOfAsset(asset);
+    CGSize disp = SLVDisplaySizeOfAsset(asset);
     if (disp.height > 1.0) self.aspect = disp.width / disp.height;
 
     self.playerLayer = [AVPlayerLayer playerLayerWithPlayer:self.player];
@@ -337,7 +337,7 @@ static NSString *SLTimeText(Float64 sec) {
                                                object:pitem];
 
     // ---- 音轨结论 ----
-    SLMediaAudioInfo *info = SLProbeMediaAudio(it.path);
+    SLVMediaAudioInfo *info = SLVProbeMediaAudio(it.path);
     if (!info || !info.hasAudio) {
         self.stateLab.text = @"无声音";
         self.stateLab.textColor = [UIColor systemOrangeColor];
@@ -402,7 +402,7 @@ static NSString *SLTimeText(Float64 sec) {
     if (!isfinite(cur) || cur < 0) cur = 0;
     self.slider.value = (float)MIN(1.0, cur / dur);
     self.timeLab.text = [NSString stringWithFormat:@"%@ / %@",
-                         SLTimeText(cur), SLTimeText(dur)];
+                         SLVTimeText(cur), SLVTimeText(dur)];
 }
 
 - (void)sl_sliderDown {
@@ -415,7 +415,7 @@ static NSString *SLTimeText(Float64 sec) {
     if (!isfinite(dur) || dur <= 0) return;
     // 拖动过程中只更新时间字，不 seek —— 手指每挪一下 seek 一次会把解码器拖垮
     self.timeLab.text = [NSString stringWithFormat:@"%@ / %@",
-                         SLTimeText(self.slider.value * dur), SLTimeText(dur)];
+                         SLVTimeText(self.slider.value * dur), SLVTimeText(dur)];
 }
 
 - (void)sl_sliderUp {
@@ -430,7 +430,7 @@ static NSString *SLTimeText(Float64 sec) {
             toleranceBefore:kCMTimeZero
                toleranceAfter:kCMTimeZero
             completionHandler:^(BOOL finished) {
-        SLMediaPreviewController *ss = ws;
+        SLVMediaPreviewController *ss = ws;
         if (finished && ss && ss.playing) [ss.player play];
     }];
 }
@@ -447,10 +447,10 @@ static NSString *SLTimeText(Float64 sec) {
     [s setCategory:AVAudioSessionCategoryPlayback
        withOptions:AVAudioSessionCategoryOptionMixWithOthers
              error:&err];
-    if (err) SLLog(@"预览: 音频类别设置失败 %@", err.localizedDescription ?: @"?");
+    if (err) SLVLog(@"预览: 音频类别设置失败 %@", err.localizedDescription ?: @"?");
     err = nil;
     [s setActive:YES error:&err];
-    if (err) SLLog(@"预览: 音频会话激活失败 %@", err.localizedDescription ?: @"?");
+    if (err) SLVLog(@"预览: 音频会话激活失败 %@", err.localizedDescription ?: @"?");
 }
 
 - (void)sl_deactivateAudio {
