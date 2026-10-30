@@ -659,7 +659,7 @@ static void SLCamInstallRecordingProbes(void) {
 // 接法：把 completionHandler 包一层，收到真 buffer 后不往下传，改传我们自己的
 // 假 JPEG。CMSampleBuffer 是只读的，替换只能新建一个 —— 拿素材当前帧转 JPEG，
 // 再按 JPEG 的宽高建 format description + block buffer 拼出来。
-static void (*gSLStillOrig)(id, SEL, id, void (^)(CMSampleBufferRef, NSError *));
+static void (*gSLStillOrig)(id, SEL, id, id);
 
 static NSData *SLCamJPEGFromPixelBuffer(CVPixelBufferRef pb, CGFloat quality) {
     if (!pb) return nil;
@@ -716,7 +716,9 @@ static void SLCamCaptureStill(id self, SEL _cmd, id connection,
                               void (^handler)(CMSampleBufferRef, NSError *)) {
     if (!gSLStillOrig) return;
     if (!SLCamInjecting() || !SLCamArmed() || ![[SLCamFeed shared] isReady]) {
-        gSLStillOrig(self, _cmd, connection, (__bridge id)handler);
+        // block 本身就是对象，直接当 id 传，不要加 __bridge ——
+        // 对 block 类型做 __bridge 转 id 是编译错误（clang 会直接 segfault）。
+        gSLStillOrig(self, _cmd, connection, handler);
         return;
     }
 
@@ -737,7 +739,7 @@ static void SLCamCaptureStill(id self, SEL _cmd, id connection,
             handler(buf, err);   // 素材这一帧没解出来，宁可给真画面也不给黑图
         }
     };
-    gSLStillOrig(self, _cmd, connection, (__bridge id)[wrapped copy]);
+    gSLStillOrig(self, _cmd, connection, [wrapped copy]);
 }
 
 static void SLCamInstallStillImageHook(void) {
