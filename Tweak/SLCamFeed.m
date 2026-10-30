@@ -25,11 +25,17 @@
 //   · 生产快于消费 → 缓冲一路涨（以前上限是 2 秒）→ 声音越来越滞后 = 不同步
 //   · 生产慢于消费 → 缓冲抽干 → 补零 → 声音断续
 //
-// 所以消费端超过 TARGET 就把多余的丢掉，把延迟恒定在 100ms 左右
-// （低于人对唇音不同步的感知阈值 ~125ms）；生产端补到 HIGH 就停手，
-// 留一点抖动余量，避免解码线程偶尔卡一下就把音频饿死。
+// 所以生产端补到 HIGH 就停手，消费端超过 TARGET 才丢 —— 两者必须贴得很近。
+// 0.2.8 的教训：HIGH 设成 0.35s 而 TARGET 只有 0.10s，于是解码线程每次都把
+// 缓冲填到 350ms，消费端下一次回调就一口气砍掉 250ms，稳态下每 270ms 只播
+// 20ms，听感就是「没声音」。水位控制的前提是生产端不许越过目标太多。
+//
+//   生产端高水位 140ms  ≈ 目标 100ms + 2 个包
+//   消费端丢弃阈值 180ms（正常运行时永远够不着，只是兜底）
+//   超过 600ms 才硬切 —— 那是中途卡过（切素材、重建管线），慢慢追不回来
 #define SL_AUDIO_TARGET_SEC 0.10
-#define SL_AUDIO_HIGH_SEC   0.35
+#define SL_AUDIO_HIGH_SEC   0.14
+#define SL_AUDIO_HARD_SEC   0.60
 
 @interface SLCamFeed () {
     NSLock *_lock;
@@ -47,6 +53,7 @@
     BOOL _assetHasAudio;                 // 素材本身有没有音轨：决定「没数据」时是静音还是放行真麦克风
     NSUInteger _audioDropped;            // 累计丢弃字节（诊断用）
     BOOL _audioDropLogged;
+    NSUInteger _audioCalls;              // 消费端被调用次数（水位心跳用）
     CGSize _naturalSize;
 
     // ---- 解码线程独占 ----
@@ -67,6 +74,7 @@
 - (void)sl_buildReaderForKey:(NSString *)key;
 - (BOOL)sl_pumpAudio;
 - (BOOL)sl_audioBelowHighWater;
+- (NSData *)sl_audioLocked:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes;
 - (NSData *)sl_convertAudio:(NSData *)input;
 - (NSInteger)sl_normalizedRotation;
 - (CVPixelBufferRef)sl_render:(CVPixelBufferRef)src
@@ -184,6 +192,7 @@
             }
 
             BOOL gotAny = NO;
+            BOOL videoEnded = NO;
 
             if (_videoOut) {
                 CMSampleBufferRef sb = [_videoOut copyNextSampleBuffer];
@@ -203,6 +212,8 @@
                     if (_frameInterval > 0) {
                         usleep((useconds_t)(_frameInterval * 1000000.0));
                     }
+                } else {
+                    videoEnded = YES;
                 }
             }
 
@@ -217,7 +228,10 @@
                 }
             }
 
-            if (gotAny) {
+            // 视频读完了就算「这一轮结束」，哪怕音轨还有剩。
+            // 以前只看 gotAny，音轨比视频长一点点时画面会永远停在最后一帧 ——
+            // 从外面看就是「卡死」，而且是随素材概率出现的。
+            if (gotAny && !videoEnded) {
                 _idleRounds = 0;
             } else {
                 // 连续空转才认为是真读完了；音频池满也会空转，别把那种当结尾
@@ -620,7 +634,8 @@
     [_lock unlock];
 }
 
-- (NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes {
+/// 取一包 PCM。调用方必须已持有 _lock。
+- (NSData *)sl_audioLocked:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes configure:(BOOL)configure {
     if (!asbd || asbd->mBytesPerFrame == 0 || numBytes == 0) return nil;
 
     // 关掉「替换音频」= 静音。这里必须返回全零的 PCM，不能返回 nil：
@@ -630,31 +645,47 @@
         return [NSMutableData dataWithLength:numBytes];
     }
 
-    [_lock lock];
-    [self sl_configureAudioLocked:asbd];
+    if (configure) {
+        [self sl_configureAudioLocked:asbd];
+    } else if (!_hasAudioDstASBD) {
+        // 实时线程不建转换器 —— 那是几十毫秒的活，让 primeAudioFormat: 去做
+        return nil;
+    }
 
     NSMutableData *chunk = [NSMutableData dataWithLength:numBytes];
     NSUInteger got = 0;
     NSUInteger avail = _audioPCM.length - _audioReadCursor;
 
-    // 水位控制（0.2.8 修不同步的核心）。
-    // 消费端是硬实时的，生产端是解码线程，速率不可能天然相等：
-    // 堆多了 → 声音越来越滞后；抽干了 → 声音断续。
-    // 超过目标水位就把多余的丢掉，延迟恒定在 ~100ms。
+    // 水位控制。
+    //
+    // 正常运行时这一段一次都不该触发 —— 生产端高水位只有 140ms，填不到
+    // 180ms 以上。真触发了只有两种可能：切素材、重建管线这类中途卡顿，
+    // 缓冲被撑大了。
+    //
+    // 处理原则是「慢慢追，绝不硬砍」：一次最多丢一包，用 2× 速度追平，
+    // 人耳听不出来。0.2.8 那种一次砍掉 250ms 的做法会把语音切成碎片。
     if (_audioBytesPerSecond > 0) {
         NSUInteger target = (NSUInteger)(_audioBytesPerSecond * SL_AUDIO_TARGET_SEC);
         if (target < numBytes) target = numBytes;
-        if (avail > target + numBytes) {
-            NSUInteger drop = avail - target;
+        NSUInteger hard = (NSUInteger)(_audioBytesPerSecond * SL_AUDIO_HARD_SEC);
+
+        NSUInteger drop = 0;
+        if (avail > hard) {
+            // 撑到 0.6 秒以上，靠慢慢追要好几秒才能追回来，只能硬切
+            drop = avail - target;
+        } else if (avail > target + numBytes * 4) {
+            drop = MIN(numBytes, avail - target);
+        }
+        if (drop > 0) {
             _audioReadCursor += drop;
             avail -= drop;
             _audioDropped += drop;
             if (!_audioDropLogged) {
                 _audioDropLogged = YES;
-                SLLog(@"音频: 缓冲超水位，丢弃 %lu 字节拉回 %lums（累计 %lu）",
+                SLLog(@"音频: 缓冲 %lums 偏高，丢弃 %lu 字节拉回 %lums",
+                      (unsigned long)((avail + drop) * 1000 / _audioBytesPerSecond),
                       (unsigned long)drop,
-                      (unsigned long)(target * 1000 / _audioBytesPerSecond),
-                      (unsigned long)_audioDropped);
+                      (unsigned long)(target * 1000 / _audioBytesPerSecond));
             }
         }
     }
@@ -669,8 +700,17 @@
             _audioReadCursor = 0;
         }
     }
+
+    // 心跳：每 3000 包打一次水位，下次再出问题不用靠推算
+    _audioCalls++;
+    if (_audioCalls % 3000 == 0 && _audioBytesPerSecond > 0) {
+        SLLog(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包",
+              (unsigned long)((_audioPCM.length - _audioReadCursor) * 1000 / _audioBytesPerSecond),
+              (unsigned long)_audioDropped, (unsigned long)_audioCalls);
+    }
+
     BOOL hasAudio = _assetHasAudio;
-    [_lock unlock];
+    (void)hasAudio;
 
     if (got == 0) {
         // 素材本来就没音轨 —— 用户预期就是「只换画面、保留原声」，放行真实麦克风
@@ -682,6 +722,23 @@
     }
     if (got < numBytes) memset((uint8_t *)chunk.mutableBytes + got, 0, numBytes - got);  // 不够补静音
     return chunk;
+}
+
+- (NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes {
+    [_lock lock];
+    NSData *d = [self sl_audioLocked:asbd numBytes:numBytes configure:YES];
+    [_lock unlock];
+    return d;
+}
+
+- (NSData *)tryAudioForFormat:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes {
+    // 实时音频线程专用：拿不到锁就放行这一包真麦克风，绝不阻塞宿主。
+    // 锁只在解码线程 append 那一瞬间被持有，正常几乎不会撞上；
+    // 一旦撞上，说明解码线程正在干重活，这时候卡住宿主才是灾难。
+    if (![_lock tryLock]) return nil;
+    NSData *d = [self sl_audioLocked:asbd numBytes:numBytes configure:NO];
+    [_lock unlock];
+    return d;
 }
 
 @end

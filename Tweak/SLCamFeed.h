@@ -62,6 +62,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// 才能让解码线程把音轨挂上 —— 否则开头一两百毫秒只能出静音。
 - (void)primeAudioFormat:(const AudioStreamBasicDescription *)asbd;
 
+/// 实时音频线程专用：和 `audioForFormat:numBytes:` 一样，但**绝不阻塞**。
+/// 拿不到锁、或格式还没登记，就立刻返回 nil（注入层据此放行真麦克风）。
+/// 在宿主的音频回调里只能用它 —— 宁可漏一包，也不能把音频线程卡住。
+- (nullable NSData *)tryAudioForFormat:(const AudioStreamBasicDescription *)asbd
+                              numBytes:(size_t)numBytes;
+
 /// 回到第一帧（切换素材、重新打开相机时调）
 - (void)rewind;
 

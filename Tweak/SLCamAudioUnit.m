@@ -268,8 +268,10 @@ typedef struct {
     void *origUd;
     AudioStreamBasicDescription asbd;
     BOOL usable;            // 格式能替换（线性 PCM 且字段自洽）
+    BOOL fired;             // 回调是否已经来过（诊断用）
     BOOL replacedLogged;
     int  replaced;
+    int  skipped;           // 没换成（抢不到锁 / 素材没数据）的包数，诊断用
 } SLAQContext;
 
 /// 这些上下文要和 AudioQueue 同生共死，不能回收 —— 队列什么时候停、停完还调不调
@@ -294,11 +296,19 @@ static void SLCamAudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ,
     SLAQContext *ctx = (SLAQContext *)inUserData;
     if (!ctx) return;
 
+    if (!ctx->fired) {
+        ctx->fired = YES;
+        SLLog(@"音频: AudioQueue 回调首次触发 %uB", 
+              inBuffer ? (unsigned)inBuffer->mAudioDataByteSize : 0);
+    }
+
     if (ctx->usable && inBuffer && inBuffer->mAudioData && inBuffer->mAudioDataByteSize > 0
         && SLCamInjecting() && !SLCamAVCaptureAudioSeen()) {
-        NSData *pcm = [[SLCamFeed shared] audioForFormat:&ctx->asbd
-                                                numBytes:inBuffer->mAudioDataByteSize];
-        // 长度不等 = 素材没音轨 / 还没解出来，保持真实麦克风，绝不写半截
+        // 这个回调跑在宿主的音频线程上，可能就在主线程的 runloop 里。
+        // 所以只能走 tryAudioForFormat: —— 抢不到锁就放行这一包真麦克风，
+        // 绝不能在这里等锁，否则宿主整条音频链路（乃至界面）都会被拖住。
+        NSData *pcm = [[SLCamFeed shared] tryAudioForFormat:&ctx->asbd
+                                                   numBytes:inBuffer->mAudioDataByteSize];
         if (pcm.length == inBuffer->mAudioDataByteSize) {
             memcpy(inBuffer->mAudioData, pcm.bytes, pcm.length);
             ctx->replaced++;
@@ -307,8 +317,11 @@ static void SLCamAudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ,
                 SLLog(@"音频: 已接管 AudioQueue 麦克风输入（%.0fHz %uch）",
                       ctx->asbd.mSampleRate, (unsigned)ctx->asbd.mChannelsPerFrame);
             } else if (ctx->replaced % 3000 == 0) {
-                SLLog(@"音频: AudioQueue 心跳 %d 次", ctx->replaced);
+                SLLog(@"音频: AudioQueue 心跳 %d 次（未替换 %d）",
+                      ctx->replaced, ctx->skipped);
             }
+        } else if (pcm == nil && ctx->replaced == 0) {
+            ctx->skipped++;
         }
     }
 
@@ -354,8 +367,13 @@ static OSStatus SLCamAudioQueueNewInput(const AudioStreamBasicDescription *fmt,
 
     gSLAQContexts[gSLAQContextCount++] = ctx;
 
-    // 提前登记格式：解码线程要据此把音轨挂上，否则开头一段只能出静音
-    [[SLCamFeed shared] primeAudioFormat:fmt];
+    // 提前登记格式：解码线程要据此把音轨挂上，否则开头一段只能出静音。
+    // 但**不能在宿主线程上同步做** —— 里面要建 AVAudioConverter，而抖音是在
+    // 打开录像页的主线程上调 AudioQueueNewInput 的，同步做会把 UI 卡住。
+    AudioStreamBasicDescription fmtCopy = *fmt;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [[SLCamFeed shared] primeAudioFormat:&fmtCopy];
+    });
 
     SLLog(@"音频: 已接管 AudioQueue 录音（%.0fHz %uch %uB/帧）· 素材音 %@",
           fmt->mSampleRate, (unsigned)fmt->mChannelsPerFrame, (unsigned)fmt->mBytesPerFrame,
