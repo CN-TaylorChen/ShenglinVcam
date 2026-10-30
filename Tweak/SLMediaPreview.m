@@ -10,6 +10,7 @@
 #import "SLUtil.h"
 #import "SLLog.h"
 #import <AVFoundation/AVFoundation.h>
+#include <math.h>
 
 #pragma mark - 音轨体检
 
@@ -127,6 +128,28 @@ NSString *SLMediaAudioSummary(void) {
 
 #pragma mark - 预览页
 
+/// 素材「摆正之后」的显示尺寸。
+/// 直接读 naturalSize 会拿到传感器坐标（竖拍的视频是 1920x1080），
+/// 必须过一遍 preferredTransform 才是眼睛看到的宽高。
+static CGSize SLDisplaySizeOfAsset(AVAsset *asset) {
+    if (!asset) return CGSizeZero;
+    AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+    if (!vt) return CGSizeZero;
+    CGSize s = vt.naturalSize;
+    CGAffineTransform t = vt.preferredTransform;
+    CGSize d = CGSizeApplyAffineTransform(s, t);
+    d.width = fabs(d.width);
+    d.height = fabs(d.height);
+    if (d.width < 1.0 || d.height < 1.0) return s;
+    return d;
+}
+
+static NSString *SLTimeText(Float64 sec) {
+    if (!isfinite(sec) || sec < 0) sec = 0;
+    long total = (long)lround(sec);
+    return [NSString stringWithFormat:@"%ld:%02ld", total / 60, total % 60];
+}
+
 @interface SLMediaPreviewController ()
 @property (nonatomic, strong) SLMediaItem *item;
 @property (nonatomic, strong) UIView *stage;
@@ -138,8 +161,14 @@ NSString *SLMediaAudioSummary(void) {
 @property (nonatomic, strong) UILabel *codecLab;
 @property (nonatomic, strong) UILabel *noteLab;
 @property (nonatomic, strong) UIButton *playBtn;
+@property (nonatomic, strong) UISlider *slider;
+@property (nonatomic, strong) UILabel *timeLab;
+@property (nonatomic, strong) id timeObs;
 @property (nonatomic, assign) BOOL playing;
+@property (nonatomic, assign) BOOL scrubbing;
 @property (nonatomic, assign) BOOL audioActive;
+/// 素材宽 / 高，0 表示还不知道
+@property (nonatomic, assign) CGFloat aspect;
 @end
 
 @implementation SLMediaPreviewController
@@ -196,6 +225,31 @@ NSString *SLMediaAudioSummary(void) {
     [self.playBtn addTarget:self action:@selector(sl_togglePlay) forControlEvents:UIControlEventTouchUpInside];
     [self.stage addSubview:self.playBtn];
 
+    // 进度条：0.2.25 起能拖。以前只有播放/暂停，想确认「后面那段有没有声音」
+    // 只能干等到那儿，或者从头再放一遍。
+    self.slider = [[UISlider alloc] initWithFrame:CGRectZero];
+    self.slider.minimumValue = 0.0;
+    self.slider.maximumValue = 1.0;
+    self.slider.minimumTrackTintColor = [UIColor systemBlueColor];
+    self.slider.maximumTrackTintColor = [[UIColor labelColor] colorWithAlphaComponent:0.16];
+    self.slider.hidden = YES;
+    [self.slider addTarget:self action:@selector(sl_sliderDown)
+          forControlEvents:UIControlEventTouchDown];
+    [self.slider addTarget:self action:@selector(sl_sliderMoved)
+          forControlEvents:UIControlEventValueChanged];
+    [self.slider addTarget:self action:@selector(sl_sliderUp)
+          forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside
+                        | UIControlEventTouchCancel];
+    [self.view addSubview:self.slider];
+
+    self.timeLab = [[UILabel alloc] initWithFrame:CGRectZero];
+    self.timeLab.font = [UIFont monospacedDigitSystemFontOfSize:11.5 weight:UIFontWeightRegular];
+    self.timeLab.textColor = [UIColor secondaryLabelColor];
+    self.timeLab.textAlignment = NSTextAlignmentRight;
+    self.timeLab.text = @"0:00 / 0:00";
+    self.timeLab.hidden = YES;
+    [self.view addSubview:self.timeLab];
+
     [self sl_loadContent];
 }
 
@@ -219,6 +273,8 @@ NSString *SLMediaAudioSummary(void) {
 
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+    // 周期性观察者必须自己摘，player 释放后再调会崩
+    if (_timeObs && _player) [_player removeTimeObserver:_timeObs];
 }
 
 #pragma mark 内容
@@ -237,12 +293,14 @@ NSString *SLMediaAudioSummary(void) {
         self.stillView.hidden = NO;
         UIImage *img = [UIImage imageWithContentsOfFile:it.path];
         self.stillView.image = img;
+        if (img.size.height > 1.0) self.aspect = img.size.width / img.size.height;
         self.stateLab.text = @"图片 · 画面定格";
         self.stateLab.textColor = [UIColor labelColor];
         self.codecLab.text = img ? [NSString stringWithFormat:@"%.0f × %.0f",
                                     img.size.width * img.scale, img.size.height * img.scale]
                                  : @"图片读不出来";
         self.noteLab.text = @"图片素材没有音轨，录制时会全程静音。";
+        [self.view setNeedsLayout];
         return;
     }
 
@@ -252,13 +310,26 @@ NSString *SLMediaAudioSummary(void) {
     self.player = [AVPlayer playerWithPlayerItem:pitem];
     self.player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
 
+    CGSize disp = SLDisplaySizeOfAsset(asset);
+    if (disp.height > 1.0) self.aspect = disp.width / disp.height;
+
     self.playerLayer = [AVPlayerLayer playerLayerWithPlayer:self.player];
     self.playerLayer.videoGravity = AVLayerVideoGravityResizeAspect;
     self.playerLayer.frame = self.stage.bounds;
     [self.stage.layer insertSublayer:self.playerLayer atIndex:0];
 
     self.playBtn.hidden = NO;
+    self.slider.hidden = NO;
+    self.timeLab.hidden = NO;
     [self sl_updatePlayIcon];
+
+    // 每 0.1s 拿一次播放位置。用弱引用，别让 block 把控制器钉住。
+    __weak typeof(self) ws = self;
+    self.timeObs = [self.player addPeriodicTimeObserverForInterval:CMTimeMakeWithSeconds(0.1, NSEC_PER_SEC)
+                                                            queue:dispatch_get_main_queue()
+                                                       usingBlock:^(CMTime time) {
+        [ws sl_syncProgressWithTime:time];
+    }];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(sl_onItemEnd:)
@@ -289,12 +360,14 @@ NSString *SLMediaAudioSummary(void) {
     [self.player play];
     self.playing = YES;
     [self sl_updatePlayIcon];
+    [self.view setNeedsLayout];
 }
 
 - (void)sl_onItemEnd:(NSNotification *)n {
     (void)n;
     // 循环：回到 0 再放，跟录制时的循环行为一致
     [self.player seekToTime:kCMTimeZero toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+    self.slider.value = 0.0;
     if (self.playing) [self.player play];
 }
 
@@ -316,6 +389,50 @@ NSString *SLMediaAudioSummary(void) {
         [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIImageSymbolWeightSemibold];
     [self.playBtn setImage:[UIImage systemImageNamed:name withConfiguration:cfg]
                   forState:UIControlStateNormal];
+}
+
+#pragma mark 进度
+
+- (void)sl_syncProgressWithTime:(CMTime)time {
+    if (self.scrubbing || !self.player) return;
+    AVPlayerItem *item = self.player.currentItem;
+    Float64 dur = CMTimeGetSeconds(item.duration);
+    if (!isfinite(dur) || dur <= 0) return;      // 还没 ready，duration 是 indefinite
+    Float64 cur = CMTimeGetSeconds(time);
+    if (!isfinite(cur) || cur < 0) cur = 0;
+    self.slider.value = (float)MIN(1.0, cur / dur);
+    self.timeLab.text = [NSString stringWithFormat:@"%@ / %@",
+                         SLTimeText(cur), SLTimeText(dur)];
+}
+
+- (void)sl_sliderDown {
+    self.scrubbing = YES;
+}
+
+- (void)sl_sliderMoved {
+    if (!self.player) return;
+    Float64 dur = CMTimeGetSeconds(self.player.currentItem.duration);
+    if (!isfinite(dur) || dur <= 0) return;
+    // 拖动过程中只更新时间字，不 seek —— 手指每挪一下 seek 一次会把解码器拖垮
+    self.timeLab.text = [NSString stringWithFormat:@"%@ / %@",
+                         SLTimeText(self.slider.value * dur), SLTimeText(dur)];
+}
+
+- (void)sl_sliderUp {
+    self.scrubbing = NO;
+    if (!self.player) return;
+    Float64 dur = CMTimeGetSeconds(self.player.currentItem.duration);
+    if (!isfinite(dur) || dur <= 0) return;
+    // 别拖到正好 100%：落在末尾会立刻触发「播完」通知，循环回 0，看起来像没拖成
+    Float64 target = MIN(self.slider.value * dur, MAX(0.0, dur - 0.05));
+    __weak typeof(self) ws = self;
+    [self.player seekToTime:CMTimeMakeWithSeconds(target, 600)
+            toleranceBefore:kCMTimeZero
+               toleranceAfter:kCMTimeZero
+            completionHandler:^(BOOL finished) {
+        SLMediaPreviewController *ss = ws;
+        if (finished && ss && ss.playing) [ss.player play];
+    }];
 }
 
 #pragma mark 音频会话
@@ -361,21 +478,34 @@ NSString *SLMediaAudioSummary(void) {
 
     CGFloat pad = 16.0;
     CGFloat w = b.size.width - pad * 2.0;
-    CGFloat h = round(w * 9.0 / 16.0);
-    CGFloat maxH = b.size.height - top - 150.0;
-    if (h > maxH) h = maxH;
-    if (h < 110.0) h = 110.0;
+    BOOL isVideo = (self.player != nil);
 
-    self.stage.frame = CGRectMake(pad, top + 4.0, w, h);
+    // 0.2.25：画面高度按素材自己的宽高比算。
+    // 以前写死 9:16 的横框（w * 9/16），竖拍的视频在横框里按 aspectFit 一缩，
+    // 宽度只剩一百出头，等于在看一张邮票。
+    CGFloat barH = isVideo ? 26.0 : 0.0;
+    CGFloat cardH = 112.0;
+    CGFloat reserved = 4.0 + (isVideo ? 8.0 + barH : 0.0) + 12.0 + cardH + 12.0;
+    CGFloat maxStageH = b.size.height - top - reserved;
+    if (maxStageH < 140.0) maxStageH = 140.0;
+
+    CGFloat stageH = maxStageH;
+    if (self.aspect > 0.01) stageH = round(w / self.aspect);
+    stageH = MIN(MAX(stageH, 140.0), maxStageH);
+
+    self.stage.frame = CGRectMake(pad, top + 4.0, w, stageH);
     self.playerLayer.frame = self.stage.bounds;
     self.stillView.frame = self.stage.bounds;
-    self.playBtn.frame = CGRectMake(w - 50.0, h - 50.0, 40.0, 40.0);
+    self.playBtn.frame = CGRectMake(w - 50.0, stageH - 50.0, 40.0, 40.0);
 
-    CGFloat cardH = 112.0;
-    CGFloat cy = CGRectGetMaxY(self.stage.frame) + 12.0;
-    if (cy + cardH > b.size.height - 12.0) cy = MAX(top + 4.0, b.size.height - 12.0 - cardH);
-    self.infoCard.frame = CGRectMake(pad, cy, w, cardH);
+    CGFloat y = CGRectGetMaxY(self.stage.frame) + 8.0;
+    if (isVideo) {
+        self.timeLab.frame = CGRectMake(b.size.width - pad - 78.0, y + 3.0, 78.0, 18.0);
+        self.slider.frame = CGRectMake(pad, y + 2.0, MAX(60.0, w - 86.0), 22.0);
+        y += barH + 8.0;
+    }
 
+    self.infoCard.frame = CGRectMake(pad, y, w, cardH);
     CGFloat iw = w - 28.0;
     self.stateLab.frame = CGRectMake(14.0, 12.0, iw, 21.0);
     self.codecLab.frame = CGRectMake(14.0, 36.0, iw, 18.0);
