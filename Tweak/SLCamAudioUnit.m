@@ -491,6 +491,10 @@ void SLCamInstallAudioUnitHook(void) {
         SLSymbolHook("AudioQueueNewInput", (void *)SLCamAudioQueueNewInput,
                      (void **)&gSLAQOrig);
 
+        // 后加载的 framework 自动补扫：QQ 的拍摄模块是启动之后才 dlopen 的，
+        // 启动那一遍扫描根本看不到它（日志里「扫过 6 个 App 镜像」就是证据）
+        SLSymbolHookInstallAutoRescan();
+
         // 走完了，撤哨兵 —— 下次正常启动不该再看到它
         [fm removeItemAtPath:guard error:NULL];
         return;
@@ -503,6 +507,10 @@ void SLCamInstallAudioUnitHook(void) {
         // 全程都是 0，就说明宿主的麦克风压根不经过这个函数（调用点在系统框架内部，
         // 或者走了 dlsym 动态解析）—— 指针表 hook 再怎么改也够不着。
         if (sAddOutputLogs < 4) {
+            // 第一次「会话加输出」时做一次只读审计：把所有非 App 包内的镜像也过一遍，
+            // 看有多少地方引用了目标符号而我们没打补丁。
+            // 这一行能直接回答「录制是不是走了够不着的地方」。
+            if (sAddOutputLogs == 0) SLSymbolHookAudit();
             sAddOutputLogs++;
             SLLog(@"音频: 会话加输出时 AudioUnitRender 累计调用 %d 次 / bus=1 %d 次",
                   sCalls, sBus1Calls);

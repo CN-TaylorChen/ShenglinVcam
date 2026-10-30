@@ -27,4 +27,14 @@ int SLSymbolHook(const char *name, void *replacement, void * _Nullable * _Nullab
 /// 首次扫描时还不存在，需要在「会话开始加输出」这类时机补扫。
 int SLSymbolHookRescan(void);
 
+/// 挂上 dyld 的「镜像加载」回调：之后再有 framework 被 dlopen，自动补扫一次。
+/// 补扫在后台串行队列里做，不在 dyld 回调里做（那里还持着锁）。
+void SLSymbolHookInstallAutoRescan(void);
+
+/// 只读审计：把**非 App 包内**的镜像也过一遍，报出「引用了目标符号但我们没打补丁」
+/// 的有哪些。一个字节都不写，专门用来回答「是不是有镜像被 .app/ 过滤器挡掉了」。
+/// 系统框架（比如 AVFAudio 内部调 AudioUnitRender）会出现在结果里，这本身也是答案：
+/// 出现在那儿就意味着走这条路线的 App 用指针表 hook 永远够不着。
+int SLSymbolHookAudit(void);
+
 NS_ASSUME_NONNULL_END

@@ -1,3 +1,127 @@
+## 0.2.19 —— 查 QQ 录制原声：自动补扫 + 只读审计 + 第二批探针
+
+### 一、先把 0.2.18 的结论钉住
+
+0.2.18 的心跳改对了，QQ 那段日志给出了决定性的一行：
+
+```
+音频: 心跳 调用 1500 / bus=1 累计 979（本轮 +0）
+```
+
+录制期间 `AudioUnitRender` 的总调用数从 1000 涨到 1500（**unit 还活着、还在被渲染**），
+但 `bus=1`（麦克风输入方向）**一次都没增加**。
+
+一句话：**录制的麦克风不经过我们替换过的那个 `AudioUnitRender`。**
+不是「替换了但没生效」，是「根本没走到这里」。
+
+那么只剩两种可能：
+
+| # | 假设 | 判据 |
+|---|---|---|
+| A | 录制的采集模块是启动之后才 `dlopen` 的，它的符号槽没被扫到 | 审计能报出「引用了 `AudioUnitRender` 但没打补丁」 |
+| B | 录制走的是另一条完全不同的路径（`AVAudioEngine` / `AVAudioSinkNode` / 另一个会话） | 审计报 0 处，但探针命中 |
+
+0.2.19 同时覆盖这两条，**全部只读**，不改任何函数指针、不改任何行为。
+
+### 二、为什么之前会漏扫
+
+`SLSymbolHookRescan` 只扫路径里含 `.app/` 的镜像。QQ 的日志一直是：
+
+```
+符号: 扫过 6 个 App 镜像
+```
+
+而抖音是 30 个 —— 说明 QQ 在启动那一刻只加载了 6 个 App 内镜像，
+它的拍摄模块是**点开拍摄页之后**才 `dlopen` 进来的，
+那时启动那一遍扫描早就跑完了，那份 framework 里的 `AudioUnitRender` 引用自然是原样的。
+
+新增 `SLSymbolHookInstallAutoRescan()`：
+
+```objc
+_dyld_register_func_for_add_image(SLCamImageAdded);
+```
+
+之后每个新镜像加载都会触发一次补扫。
+
+**关键细节**：这个回调是在 dyld 持锁的状态下被调用的，里面不能做重活
+（遍历 load command、`mprotect` 都算重活，轻则卡顿重则死锁），
+所以回调体里只有一句 `dispatch_async`，真正的补扫丢到自己的后台串行队列：
+
+```objc
+static void SLCamImageAdded(const struct mach_header *mh, intptr_t slide) {
+    dispatch_async(q, ^{
+        int hits = SLSymbolHookRescan();
+        if (hits > 0) SLLog(@"符号: 新镜像补扫命中 %d 处", hits);
+    });
+}
+```
+
+### 三、只读审计：一个字节都不写
+
+光补扫还不够 —— 万一补扫也命不中，得知道「到底有没有东西漏了」。
+新增 `SLSymbolHookAudit()`：把**非 App 包内**的镜像也过一遍，
+报出「引用了目标符号、但我们没打补丁」的有哪些。
+
+给 `SLScanImage` 加了 `dryRun` 参数，审计模式下命中就 `continue`，不写槽：
+
+```objc
+if (!curAddr || curAddr == sTargets[t].replacement) continue;
+// 审计模式：只数、不写
+if (dryRun) { hits++; continue; }
+```
+
+**这里有一条不能碰的红线**：系统库一律跳过。
+
+```objc
+if (strstr(path, "/System/") || strstr(path, "/usr/lib/")) { systemCount++; continue; }
+```
+
+系统库在 dyld 共享缓存里，`__LINKEDIT` 的 `fileoff` 跟运行时内存布局对不上，
+`SLScanImage` 算出来的指针槽是垃圾地址 —— 即使是只读，读垃圾地址一样会炸。
+0.2.4 那次崩溃就是这么来的。所以审计只扫第三方 framework
+（`/var/containers/Bundle/Application/.../Frameworks/`），系统的一个都不碰。
+
+触发时机：第一次「会话加输出」（也就是拍摄页打开）时做一次，只做一次。
+
+### 四、第二批探针（6 个，只打日志）
+
+第一批探针（`installTapOnBus:` / `AVAudioRecorder record` / `AVCaptureMovieFileOutput`）
+0.2.15–0.2.18 一个都没命中。这次补第二批，覆盖剩下的可能：
+
+| 挂点 | 命中说明什么 |
+|---|---|
+| `AVAudioRecorder recordForDuration:` | 录制走写文件路径，麦克风在 AVFAudio 内部 |
+| `AVAudioRecorder recordAtTime:` | 同上，定时变体 |
+| `AVAudioRecorder recordAtTime:forDuration:` | 同上 |
+| `AVAudioEngine startAndReturnError:` | 麦克风在 `AVAudioEngine` 内部渲染 —— **这是最可能的一条** |
+| `AVAudioSinkNode initWithReceiverBlock:` | 宿主用 sink node 直接拿 PCM，这是个可以接管的口子 |
+| `AVAudioSession setCategory:mode:options:error:` | 当作录制开始/结束的时间戳用 |
+
+最后那个会话探针只在 `category/mode/options` 真的变化时才打一行，
+不会刷屏，但能把「几点几分进的录制模式」标在日志上。
+
+布点完成会打一行确认：
+
+```
+探测: 录制链路已布点 tap=? recorder=? movie=? engine=? sink=? session=?
+```
+
+### 五、这版怎么读日志
+
+拍完一段带声音的录制，按顺序找这三行：
+
+1. `审计: 非 App 包内镜像 N 个（系统 M 个已跳过）· 其中 K 处引用目标符号但没打补丁 → 列表`
+   - **K > 0 且列表里有 QQ 自己的 framework** → 就是漏扫，自动补扫已经修了，下一版验证声音
+   - **K = 0** → 录制根本不走 `AudioUnitRender`，看第 3 行
+2. `符号: 新镜像补扫命中 X 处` —— 有没有在拍摄页打开时补上
+3. `探测: 宿主启动了 AVAudioEngine` / `探测: 宿主用 AVAudioSinkNode 取 PCM` /
+   `探测: 音频会话 → playAndRecord/...`
+
+三条都空、审计也报 0 —— 那说明 QQ 的录制采集在我们完全看不到的地方（很可能是它自己
+独立的音频进程或更低层的 HAL 接口），得换思路，不能再在 `AudioUnitRender` 上加东西。
+
+---
+
 ## 0.2.18 —— 抖音拍照补 90° / 音频心跳加密
 
 ### 一、抖音拍照角度

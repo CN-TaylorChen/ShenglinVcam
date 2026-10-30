@@ -134,7 +134,7 @@ static int SLTargetIndexForName(const char *sname, size_t remain) {
 }
 
 static int SLScanImage(const struct mach_header_64 *hdr, const char *imgName,
-                       int *authSkipped) {
+                       int *authSkipped, BOOL dryRun) {
     // ---- 第一遍：找 __TEXT 的 vmaddr、__LINKEDIT、符号表命令 ----
     const struct segment_command_64 *linkedit = NULL;
     const struct symtab_command *symtab = NULL;
@@ -252,6 +252,9 @@ static int SLScanImage(const struct mach_header_64 *hdr, const char *imgName,
                 // 一个 section 里可能有多个我们要的符号，break 会漏掉后面的槽
                 if (!curAddr || curAddr == sTargets[t].replacement) continue;
 
+                // 审计模式：只数、不写。用来回答「这个镜像引用了目标符号，但我们没打补丁」
+                if (dryRun) { hits++; continue; }
+
                 // 先把原函数地址交出去，再改槽 —— 顺序反了会出现
                 // 「已经走我们的实现，但 gOrig 还是 NULL」的窗口
                 BOOL tookOrig = NO;
@@ -303,7 +306,7 @@ int SLSymbolHookRescan(void) {
         const char *base = slash ? slash + 1 : path;
 
         scanned++;
-        hits += SLScanImage((const struct mach_header_64 *)h, base, &authSkipped);
+        hits += SLScanImage((const struct mach_header_64 *)h, base, &authSkipped, NO);
     }
     // 每次会话加输出都会补扫一次，别把日志刷满：有命中/有认证槽跳过就必记，
     // 什么都没有的只记前三次
@@ -312,6 +315,84 @@ int SLSymbolHookRescan(void) {
               scanned, hits, authSkipped);
     }
     return hits;
+}
+
+int SLSymbolHookAudit(void) {
+    if (sTargetCount == 0) return 0;
+
+    int others = 0;
+    int systemCount = 0;
+    int found = 0;
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header *h = _dyld_get_image_header(i);
+        if (!h || h->magic != MH_MAGIC_64) continue;
+
+        const char *path = _dyld_get_image_name(i);
+        if (!path) continue;
+        if (strstr(path, ".app/")) continue;   // App 包内的正常扫描已经覆盖
+
+        // 系统库一律不碰。它们在 dyld 共享缓存里，fileoff 与运行时布局对不上，
+        // 算出来的指针槽位置是垃圾 —— 0.2.4 一装就崩就是栽在这儿。
+        // 审计是只读的，但读到垃圾地址去比字符串一样会炸，所以整个排除。
+        if (strstr(path, "/System/") || strstr(path, "/usr/lib/")) { systemCount++; continue; }
+
+        others++;
+        int authSkipped = 0;
+        // dryRun = YES：只数槽、一个字节都不写
+        int hits = SLScanImage((const struct mach_header_64 *)h, path, &authSkipped, YES);
+        if (hits > 0) {
+            found += hits;
+            const char *slash = strrchr(path, '/');
+            NSString *base = @(slash ? slash + 1 : path);
+            if (![names containsObject:base]) [names addObject:base];
+        }
+    }
+
+    NSString *list = @"(无)";
+    if (names.count > 12) {
+        list = [[names subarrayWithRange:NSMakeRange(0, 12)] componentsJoinedByString:@", "];
+        list = [list stringByAppendingFormat:@" … 另 %lu 个", (unsigned long)(names.count - 12)];
+    } else if (names.count) {
+        list = [names componentsJoinedByString:@", "];
+    }
+    SLLog(@"审计: 非 App 包内镜像 %d 个（系统 %d 个已跳过）· 其中 %d 处引用目标符号但没打补丁 → %@",
+          others, systemCount, found, list);
+    return found;
+}
+
+#pragma mark - 后加载镜像补扫
+
+// QQ 这类重度模块化的 App，拍摄 / 短视频模块是启动之后才 dlopen 的。
+// 启动那一遍扫描看不到它们，这些镜像里的 AudioUnitRender 调用走的是没被换掉的
+// 指针槽 —— 表现就是「通话能替换、录制是原声」。
+//
+// dyld 的 add-image 回调是在它还持着锁的时候调的，里面不能做重活
+//（遍历 load command、mprotect 都算重活），所以只把活丢给后台串行队列就返回。
+static void SLCamImageAdded(const struct mach_header *mh, intptr_t slide) {
+    (void)mh; (void)slide;
+
+    static dispatch_queue_t q = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.taylorchen.shenglinvcam.symrescan",
+                                  DISPATCH_QUEUE_SERIAL);
+    });
+    if (!q) return;
+
+    dispatch_async(q, ^{
+        int hits = SLSymbolHookRescan();
+        if (hits > 0) SLLog(@"符号: 新镜像补扫命中 %d 处", hits);
+    });
+}
+
+void SLSymbolHookInstallAutoRescan(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    _dyld_register_func_for_add_image(SLCamImageAdded);
+    SLLog(@"符号: 已挂镜像加载回调，后加载的 framework 会自动补扫");
 }
 
 int SLSymbolHook(const char *name, void *replacement, void **original) {
