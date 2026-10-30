@@ -131,6 +131,15 @@ NSString *SLVFloatIconSummary(void) {
 // 底下还压着另一层，正好对上虚拟摄像头的实际行为（送去编码的是素材，不是现场）。
 //
 // 100 单位为画布基准，跟设计稿一一对应，48pt 球和 44pt 标题栏图标是同一张图。
+//
+// 0.3.2：图形整体缩到圆内的 66%。
+// 图形是按 100 单位的**正方形**铺的（y 从 4 到 96，几乎顶满），但底色是个**圆**：
+// y=4 那个高度圆的宽度只有 39 单位，而框有 56 单位宽 —— 框比圆还宽，白框的角就戳到
+// 圆外面去了（标题栏上看着像「白色贴纸没裁好」）。
+// 图形最外点离圆心 63.5 单位，圆半径只有 50，所以最多只能缩到 78% 才刚好贴边；
+// 取 66%，四周留出 8.1% 的黑边，像素对齐抖一下也不会擦到。
+static const CGFloat kSLVBrandGlyphScale = 0.66;
+
 static UIImage *SLVBrandIcon(CGFloat side, UIColor *bg) {
     if (side <= 0) side = 96;
     UIColor *base = bg ?: [UIColor blackColor];
@@ -144,6 +153,11 @@ static UIImage *SLVBrandIcon(CGFloat side, UIColor *bg) {
         CGContextRef c = ctx.CGContext;
         CGContextSetFillColorWithColor(c, base.CGColor);
         CGContextFillEllipseInRect(c, CGRectMake(0, 0, side, side));
+        // 圆心对齐的等比缩小：底色画完之后再改坐标系，圆本身不受影响。
+        // 描边宽度会跟着一起缩 —— 这正是想要的，不然缩完线条会显得过粗。
+        CGFloat k = kSLVBrandGlyphScale;
+        CGContextTranslateCTM(c, side * (1.0 - k) * 0.5, side * (1.0 - k) * 0.5);
+        CGContextScaleCTM(c, k, k);
         CGFloat u = side / 100.0;
         CGFloat lw = lwU * u;
         CGFloat rad = radU * u;

@@ -22,7 +22,7 @@
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.1"
+#define SLVVersion @"0.3.2"
 
 // kSLCamLoopKey / kSLCamMirrorKey 现在由 SLVCamCore.m 统一导出（SLVCamBridge.h 里 extern），
 // 帧源要读同样的键，不能再各定义一份 static。
@@ -176,7 +176,17 @@ static UIView *SLVMakeFooter(NSString *text, CGFloat x, CGFloat width) {
     CGFloat titleX = CGRectGetMinX(self.textLabel.frame);
     CGFloat titleW = [self.textLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, h)].width;
     CGFloat left = titleX + titleW + 10.0;
-    CGFloat right = CGRectGetWidth(self.contentView.bounds) - 6.0;
+
+    // 右侧箭头到底占不占 contentView 的宽度，各 iOS 版本表现不一样：
+    // 让了位（contentView 比 cell 窄）→ 在 contentView 里留 14pt 就够；
+    // 没让位（contentView 是满宽的）→ 箭头是盖在 contentView 上层画的，
+    // 得从 cell 右边直接留出箭头本身的位置（约 24pt）+ 14pt 净空。
+    // 0.3.1 只减了 6pt，结果文字一直排到箭头底下，最后一个字被啃掉一半。
+    CGFloat cellW = CGRectGetWidth(self.bounds);
+    CGFloat cvW   = CGRectGetWidth(self.contentView.bounds);
+    CGFloat reserve = (cellW - cvW > 1.0) ? 14.0 : 38.0;
+    CGFloat right = cvW - reserve;
+
     CGFloat w = right - left;
     self.valueView.hidden = (w < 40.0);
     if (!self.valueView.hidden) self.valueView.frame = CGRectMake(left, 0.0, w, h);
@@ -217,8 +227,8 @@ static UIView *SLVMakeFooter(NSString *text, CGFloat x, CGFloat width) {
     UIView *box = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 100, H)];
 
     // 0.3.0 一度改成无底色的紧凑版，结果球和标题栏长得不一样，而且 24pt 明显偏大。
-    // 0.3.1 退回带黑底圆的那张（0.2.28 的样子），尺寸也退回 22pt；
-    // 只保留「后框裁切」这一处修正 —— 否则小尺寸下两个框会糊成 |||。
+    // 0.3.1 退回带黑底圆的那张（0.2.28 的样子），尺寸也退回 22pt。
+    // 0.3.2 再把圆里的图形缩到 66% —— 原来白框的角会戳到圆外面（见 SLVBrandIcon 里的说明）。
     CGFloat iconSide = 22.0;
     UIImageView *icon = [[UIImageView alloc] initWithImage:SLVBrandIconImage(iconSide)];
     icon.frame = CGRectMake(0, (H - iconSide) / 2.0, iconSide, iconSide);
