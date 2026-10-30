@@ -12,6 +12,7 @@
 #import "SLGlass.h"
 #import "SLUtil.h"
 #import "SLCamBridge.h"
+#import "SLLog.h"
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
