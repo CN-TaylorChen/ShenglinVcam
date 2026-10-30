@@ -7,8 +7,10 @@
 //  那几个函数。业务侧只看到三件事：开关（SLCamEnabled）、胶囊上的名字
 //  （SLCamCurrentName）、点箭头弹什么（SLCamHandleArrowTap）。
 //
-//  外观部分原样保留：四态配色、光环呼吸、四杠逐根动画、自定义图标律动、名字滚动、
+//  外观部分沿用底包：状态配色、光环呼吸、自定义图标律动、名字滚动、
 //  拖动跟手 + 越线翻面 + 松手贴边、球位比例存储、窗口迁移。
+//  0.2.26 把球上的图形换成了「叠层」（两个错开的框），动画也从四态收到两态 ——
+//  Vcam 只有空闲和装填两种形态，陌陌那套录音/合成的节奏在这里永远不会触发。
 //
 
 #import "SLFloatingBall.h"
@@ -96,7 +98,7 @@ static NSString *SLFloatIconValue(void) {
 
 // v0.4.80：没有「关闭」这一档了。只要图标是自定义图片就走律动，
 // 真正决定动不动的是 sl_updateIconMotion 里的「当前有没有图」——
-// 默认四杠形态本来就是自己那套逐根动画，不走这里。
+// 默认叠层图标本来就是自己那套动画，不走这里。
 static NSInteger SLFloatEffectValue(void) {
     return 1;
 }
@@ -109,8 +111,15 @@ NSString *SLFloatIconSummary(void) {
     return base;
 }
 
-// 品牌图形：黑底圆 + 六根圆角条。100 单位为画布基准，跟设计稿一一对应，
-// 线条宽度、间距、条高都按比例缩放，48pt 球和 20pt 标题栏图标是同一张图。
+// 品牌图形：黑底圆 + 两个错开的圆角框。
+//
+// 0.2.26 换掉了原来那套竖条。竖条是「声临·陌陌」的音频波形语义，装在虚拟摄像头上
+// 说不通，而且两个 tweak 同时装时图标长得一样、球分不出谁是谁。
+//
+// 现在的语义是「叠层」：前面一张画面完整，后面一张从右侧透出来 —— 你看到的这一层
+// 底下还压着另一层，正好对上虚拟摄像头的实际行为（送去编码的是素材，不是现场）。
+//
+// 100 单位为画布基准，跟设计稿一一对应，48pt 球和 44pt 标题栏图标是同一张图。
 static UIImage *SLBrandIcon(CGFloat side, UIColor *bg) {
     if (side <= 0) side = 96;
     UIColor *base = bg ?: [UIColor blackColor];
@@ -122,16 +131,20 @@ static UIImage *SLBrandIcon(CGFloat side, UIColor *bg) {
         CGContextSetFillColorWithColor(c, base.CGColor);
         CGContextFillEllipseInRect(c, CGRectMake(0, 0, side, side));
         CGFloat u = side / 100.0;
-        CGFloat xs[6] = {20, 30, 40, 54, 64, 74};
-        CGFloat hs[6] = {16, 26, 20, 22, 32, 24};
-        CGFloat as[6] = {0.30, 0.30, 0.30, 1.0, 1.0, 1.0};
-        for (int i = 0; i < 6; i++) {
-            CGFloat w = 6.0 * u;
-            CGFloat h = hs[i] * u;
-            CGRect bar = CGRectMake(xs[i] * u, (side - h) / 2.0, w, h);
-            [[UIColor colorWithWhite:1.0 alpha:as[i]] setFill];
-            [[UIBezierPath bezierPathWithRoundedRect:bar cornerRadius:w / 2.0] fill];
-        }
+        CGFloat lw = 8.5 * u;
+        CGFloat rad = 17.0 * u;
+        // 后框先画，前框压在上面：重叠处的后框线被前框的白边吃掉一半，
+        // 看起来才像「前面那张挡着后面那张」，而不是两条线互相穿过。
+        [[UIColor colorWithWhite:1.0 alpha:0.5] setStroke];
+        UIBezierPath *back = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(42.0 * u, 4.0 * u, 56.0 * u, 92.0 * u)
+                                                          cornerRadius:rad];
+        back.lineWidth = lw;
+        [back stroke];
+        [[UIColor whiteColor] setStroke];
+        UIBezierPath *front = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(2.0 * u, 4.0 * u, 56.0 * u, 92.0 * u)
+                                                           cornerRadius:rad];
+        front.lineWidth = lw;
+        [front stroke];
     }];
 }
 
@@ -143,9 +156,9 @@ UIImage *SLBrandIconImageTinted(CGFloat side, UIColor *bg) {
     return SLBrandIcon(side, bg);
 }
 
-// v0.4.36：小尺寸专用的四根条。
-// 六根在 48pt 的球里挤成一片，前三根 30% 不透明度几乎看不见（看着像残缺的均衡器）。
-// 这一版只留四根、条加粗到 10 单位：左边两根淡（被替换的原声），右边两根实心（合成声）。
+// 小尺寸版本，几何跟 SLBrandIcon 完全一致，只是把底色去掉、线条换成传进来的颜色。
+// 球上真正显示的是 _frameCell 那套可独立动画的视图，这张图只在
+// 「模板图占位」和「20pt 标题栏」这类静态场合用得到。
 static UIImage *SLBrandGlyphCompact(CGFloat side, UIColor *color) {
     if (side <= 0) side = 44;
     UIColor *c = color ?: [UIColor labelColor];
@@ -155,17 +168,18 @@ static UIImage *SLBrandGlyphCompact(CGFloat side, UIColor *color) {
     return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         (void)ctx;
         CGFloat u = side / 100.0;
-        CGFloat xs[4] = {12, 34, 56, 78};   // 12..88，整体居中
-        // v0.4.47：条高改 短长长短（原 短长短长）。左两淡=原声，右两实=合成声，分组不变。
-        CGFloat hs[4] = {24, 46, 40, 28};
-        CGFloat as[4] = {0.30, 0.30, 1.0, 1.0};
-        for (int i = 0; i < 4; i++) {
-            CGFloat w = 10.0 * u;
-            CGFloat h = hs[i] * u;
-            CGRect bar = CGRectMake(xs[i] * u, (side - h) / 2.0, w, h);
-            [[c colorWithAlphaComponent:as[i]] setFill];
-            [[UIBezierPath bezierPathWithRoundedRect:bar cornerRadius:w / 2.0] fill];
-        }
+        CGFloat lw = 8.5 * u;
+        CGFloat rad = 17.0 * u;
+        [[c colorWithAlphaComponent:0.5] setStroke];
+        UIBezierPath *back = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(42.0 * u, 4.0 * u, 56.0 * u, 92.0 * u)
+                                                          cornerRadius:rad];
+        back.lineWidth = lw;
+        [back stroke];
+        [c setStroke];
+        UIBezierPath *front = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(2.0 * u, 4.0 * u, 56.0 * u, 92.0 * u)
+                                                           cornerRadius:rad];
+        front.lineWidth = lw;
+        [front stroke];
     }];
 }
 
@@ -260,9 +274,9 @@ static UIImage *SLTransparentImage(void) {
 @property (nonatomic, assign) SLFloatState slState;
 - (void)sl_loadIcon;
 - (void)sl_applyState:(SLFloatState)state;
-/// v0.4.49：四杠逐根动画（A 均衡器 / C 呼吸，绕中心缩放）
-- (void)sl_layoutBars;
-- (void)sl_updateBarMotion;
+/// 0.2.26：叠层图标的两态动画（空闲单框呼吸 / 装填双框错拍）
+- (void)sl_layoutFrames;
+- (void)sl_updateFrameMotion;
 /// v0.4.74：自定义图片的图标动效（四态律动）
 - (void)sl_updateIconMotion;
 /// v0.4.45：回到前台重挂呼吸光晕（后台期间动画会被系统整条移除）
@@ -275,9 +289,10 @@ static UIImage *SLTransparentImage(void) {
     CAShapeLayer *_glassMask;
     UIView *_tint;
     UIImageView *_glyph;
-    // v0.4.49：四杠改成 4 个可独立动画的条视图（原来是一张静态图，无法逐根错相位跳动）
-    UIView *_bars;
-    UIView *_barCell[4];
+    // 0.2.26：叠层图标。两个框各自独立动画 —— 空闲只有前面那个，装填时后面那个浮出来。
+    // 原来是 4 根竖条（陌陌的音频波形语义），Vcam 用不上，而且两态只需要两个部件。
+    UIView *_frames;
+    UIView *_frameCell[2];
     UIImageView *_thumb;
     // v0.4.76：白勾边。原来挂在 _glassHost 的 border 上（在照片下面，被吃掉半截），
     // 现在单独一层放在最顶上，底下是玻璃还是照片都画完整一圈。
@@ -346,16 +361,18 @@ static UIImage *SLTransparentImage(void) {
         _glyph.userInteractionEnabled = NO;
         [self addSubview:_glyph];
 
-        // v0.4.49：四杠容器。放在 _glyph 之上、_thumb 之下，
+        // 0.2.26：叠层图标容器。放在 _glyph 之上、_thumb 之下，
         // 位置/显隐跟随 _glyph；用自定义头像时整组隐藏。
-        _bars = [[UIView alloc] initWithFrame:CGRectZero];
-        _bars.userInteractionEnabled = NO;
-        [self addSubview:_bars];
-        for (int i = 0; i < 4; i++) {
-            UIView *bar = [[UIView alloc] initWithFrame:CGRectZero];
-            bar.userInteractionEnabled = NO;
-            [_bars addSubview:bar];
-            _barCell[i] = bar;
+        // 加的顺序要紧：先加后框（在下），再加前框 —— 前框的白边压住后框的左边线，
+        // 看起来才是「前面那张挡着后面那张」，而不是两条线互相穿过。
+        _frames = [[UIView alloc] initWithFrame:CGRectZero];
+        _frames.userInteractionEnabled = NO;
+        [self addSubview:_frames];
+        for (int i = 1; i >= 0; i--) {
+            UIView *cell = [[UIView alloc] initWithFrame:CGRectZero];
+            cell.userInteractionEnabled = NO;
+            [_frames addSubview:cell];
+            _frameCell[i] = cell;
         }
 
         _thumb = [[UIImageView alloc] initWithFrame:CGRectZero];
@@ -444,107 +461,117 @@ static UIImage *SLTransparentImage(void) {
         _glyph.image = [SLBrandGlyphCompact(44, [UIColor blackColor]) imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
         _glyph.tintColor = [UIColor labelColor];
         _glyph.hidden = NO;
-        _glyph.alpha = 0.0;   // v0.4.49：静态图不显示，实际由 _bars 逐根绘制 + 动画
+        _glyph.alpha = 0.0;   // v0.4.49：静态图不显示，实际由 _frames 逐根绘制 + 动画
     }
     [self setNeedsLayout];
-    // v0.4.74：换图标后要按新形态重挂（换成自定义图片才动，换回四杠就清干净）
+    // v0.4.74：换图标后要按新形态重挂（换成自定义图片才动，换回叠层就清干净）
     [self sl_updateIconMotion];
 }
 
-// v0.4.49：把四根条摆到 _bars 里。几何沿用 SLBrandGlyphCompact：
-// 单位 u = 宽度/100，xs 定位置、hs 定高度（短长长短），左两淡=原声、右两实=合成声。
-// 用 bounds + center 摆放，锚点天然在正中，缩放就是「绕中心」，不会贴底。
-- (void)sl_layoutBars {
-    CGFloat side = CGRectGetWidth(_bars.bounds);
-    if (side <= 0.0) return;
-    CGFloat u = side / 100.0;
-    static const CGFloat xs[4] = {12, 34, 56, 78};
-    static const CGFloat hs[4] = {24, 46, 40, 28};
-    static const CGFloat as[4] = {0.30, 0.30, 1.0, 1.0};
-    UIColor *c = _glyph.tintColor ?: [UIColor labelColor];
-    for (int i = 0; i < 4; i++) {
-        CGFloat w = 10.0 * u;
-        CGFloat hh = hs[i] * u;
-        UIView *bar = _barCell[i];
-        bar.bounds = CGRectMake(0, 0, w, hh);
-        bar.center = CGPointMake((xs[i] * u) + w / 2.0, side / 2.0);
-        bar.layer.cornerRadius = w / 2.0;
-        bar.layer.cornerCurve = kCACornerCurveContinuous;
-        bar.backgroundColor = [c colorWithAlphaComponent:as[i]];
-    }
+// 描边色是 CALayer 属性，UIView 动画块管不到它 —— 直接赋值会硬切，
+// 状态从灰跳到绿时那一下「啪」很显眼。这里手动补一个过渡。
+// 颜色没变就直接返回：layoutSubviews 会频繁调过来，不能每次都起一遍动画。
+static void SLSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInterval dur) {
+    l.borderWidth = width;
+    CGColorRef old = l.borderColor;
+    CGColorRef now = c.CGColor;
+    if (old && CGColorEqualToColor(old, now)) return;
+    l.borderColor = now;
+    if (dur <= 0.0 || !old || !now) return;
+    CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"borderColor"];
+    a.fromValue = (__bridge id)old;
+    a.toValue = (__bridge id)now;
+    a.duration = dur;
+    a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+    [l addAnimation:a forKey:@"borderColor"];
 }
 
-// v0.4.50：四个状态四套节奏，不再两两共用。
-//   空闲  → 同步呼吸（一轮 2.4s / 0.86，几乎不动，不抢注意力）
-//   录音  → 交叉急抖（一轮 0.64s / 0.30，1·3·2·4 错拍，像电平表）
-//   合成  → 波从左向右推（一轮 1.2s / 0.55，0→3 递进，有「正在生成」的方向感）
-//   就绪  → 上冲 + 二次回弹（1.1s，唯一超过原高到 1.15，像举起来等你按发送）
-// 只动 transform.scale.y，锚点在中心：几何、点击区域、胶囊形状都不变。
-- (void)sl_updateBarMotion {
-    if (!_bars) return;
-    if (_bars.hidden) {
-        for (int i = 0; i < 4; i++) [_barCell[i].layer removeAnimationForKey:@"slBar"];
-        return;
-    }
+// 0.2.26：把两个框摆到 _frames 里。几何沿用 SLBrandGlyphCompact 的 100 单位基准：
+// 框 56×92、圆角 17、描边 8.5。用 bounds + center 摆放，锚点天然在正中，
+// 缩放就是「绕中心」，不会偏。
+//
+// 两态的位置差就是动势本身：
+//   空闲 → 前框居中（x=22），后框藏起来，只有一个框才不显得偏
+//   装填 → 前框让到左边（x=2），后框从右侧（x=42）浮出来
+// 不用再叠一层缩放去表达「展开」，位置变化已经把话说完了。
+- (void)sl_layoutFrames {
+    CGFloat side = CGRectGetWidth(_frames.bounds);
+    if (side <= 0.0) return;
+    CGFloat u = side / 100.0;
+    CGFloat w = 56.0 * u;
+    CGFloat h = 92.0 * u;
+    CGFloat lw = 8.5 * u;
+    CGFloat rad = 17.0 * u;
+    BOOL ready = (self.slState == SLFloatStateReady);
+    UIColor *c = _glyph.tintColor ?: [UIColor labelColor];
 
-    static const CGFloat kStagNone[4] = {0.00, 0.00, 0.00, 0.00};
-    static const CGFloat kStagRec[4]  = {0.00, 0.26, 0.13, 0.39};   // 1·3·2·4 交叉
-    static const CGFloat kStagSyn[4]  = {0.00, 0.15, 0.30, 0.45};   // 左 → 右递进
-    static const CGFloat kStagRdy[4]  = {0.00, 0.04, 0.08, 0.12};   // 几乎同相
+    CGFloat frontX = ready ? 2.0 * u : 22.0 * u;
 
-    SLFloatState st = self.slState;
-    const CGFloat *stagger = kStagNone;
-    CGFloat half = 1.2;      // 空闲一轮 2.4s
-    CGFloat lo = 0.86;
-    BOOL keyframe = NO;
-    if (st == SLFloatStateRecording) {
-        half = 0.32; lo = 0.30; stagger = kStagRec;         // 一轮 0.64s
-    } else if (st == SLFloatStateSynthesizing) {
-        half = 0.60; lo = 0.55; stagger = kStagSyn;         // 一轮 1.2s
-    } else if (st == SLFloatStateReady) {
-        keyframe = YES; stagger = kStagRdy;                 // 1.1s 双跳
-    }
+    UIView *front = _frameCell[0];
+    front.bounds = CGRectMake(0, 0, w, h);
+    front.center = CGPointMake(frontX + w / 2.0, side / 2.0);
+    front.layer.cornerRadius = rad;
+    front.layer.cornerCurve = kCACornerCurveContinuous;
+    SLSetFrameBorder(front.layer, c, lw, 0.26);
 
-    CFTimeInterval now = CACurrentMediaTime();
-    for (int i = 0; i < 4; i++) {
-        CALayer *l = _barCell[i].layer;
-        [l removeAnimationForKey:@"slBar"];
-        [l removeAnimationForKey:@"slNeutral"];   // v0.4.57：清掉上一轮就绪的缓回动画，避免跨状态残留
-        if (keyframe) {
-            // 就绪：先 0.16s 把四杠从上一状态的幅度缓回 1.0（fromValue 省略＝从当前
-            // 展示值起跳），抹掉「波/抖」直接跳成双跳的硬切；随后再起双跳 keyframe
-            // （beginTime 延后 0.16s，此刻 slNeutral 已结束，两段不会打架）。
-            CABasicAnimation *neutral = [CABasicAnimation animationWithKeyPath:@"transform.scale.y"];
-            neutral.toValue = @1.0;
-            neutral.duration = 0.16;
-            neutral.beginTime = now + stagger[i];
-            neutral.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-            neutral.fillMode = kCAFillModeBoth;
-            neutral.removedOnCompletion = NO;
-            [l addAnimation:neutral forKey:@"slNeutral"];
-            // 就绪：上冲到 1.15 → 回落 → 再冲一次 → 轻微停在 1.02 → 归位。
-            // 用 keyframe 才有「双跳」的手感，autoreverses 只会变成单次来回。
-            CAKeyframeAnimation *k = [CAKeyframeAnimation animationWithKeyPath:@"transform.scale.y"];
-            k.values = @[@1.0, @1.15, @1.0, @1.15, @1.02, @1.0];
-            k.keyTimes = @[@0.0, @0.18, @0.38, @0.56, @0.78, @1.0];
-            k.duration = 1.1;
-            k.repeatCount = HUGE_VALF;
-            k.fillMode = kCAFillModeBoth;
-            k.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-            k.beginTime = now + stagger[i] + 0.16;
-            [l addAnimation:k forKey:@"slBar"];
-        } else {
-            CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"transform.scale.y"];
-            a.fromValue = @(lo);
-            a.toValue = @(1.0);
-            a.duration = half;
-            a.autoreverses = YES;
-            a.repeatCount = HUGE_VALF;
-            a.fillMode = kCAFillModeBoth;
-            a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-            a.beginTime = now + stagger[i];
-            [l addAnimation:a forKey:@"slBar"];
-        }
+    UIView *back = _frameCell[1];
+    back.bounds = CGRectMake(0, 0, w, h);
+    back.center = CGPointMake(42.0 * u + w / 2.0, side / 2.0);
+    back.layer.cornerRadius = rad;
+    back.layer.cornerCurve = kCACornerCurveContinuous;
+    SLSetFrameBorder(back.layer, [c colorWithAlphaComponent:0.5], lw, 0.26);
+    back.hidden = !ready;
+}
+
+// 0.2.26：两态两套节奏。
+//
+// Vcam 只有「空闲」和「装填」两种形态，陌陌那四套（录音交叉抖 / 合成波推 / 就绪双跳）
+// 在这里永远不会触发 —— 那三张错拍表和双跳关键帧已经删掉，不留死代码。
+//
+//   空闲 → 整组慢呼吸（一轮 2.4s / 0.94）：活着，但不抢注意力
+//   装填 → 前框轻呼吸（1.2s / 0.95），后框明暗交替（1.0 → 0.4）：
+//          前面那张稳着，后面那张若隐若现，正好是「底下还压着一层」的意思
+//
+// 只动 transform.scale 和 opacity，几何、点击区域、胶囊形状都不变。
+- (void)sl_updateFrameMotion {
+    if (!_frames) return;
+    [_frames.layer removeAnimationForKey:@"slFrameWrap"];
+    for (int i = 0; i < 2; i++) [_frameCell[i].layer removeAnimationForKey:@"slFrame"];
+    if (_frames.hidden) return;
+
+    CAMediaTimingFunction *ease =
+        [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+
+    if (self.slState == SLFloatStateReady) {
+        CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+        a.fromValue = @0.95;
+        a.toValue = @1.0;
+        a.duration = 0.6;            // 一轮 1.2s
+        a.autoreverses = YES;
+        a.repeatCount = HUGE_VALF;
+        a.fillMode = kCAFillModeBoth;
+        a.timingFunction = ease;
+        [_frameCell[0].layer addAnimation:a forKey:@"slFrame"];
+
+        CABasicAnimation *f = [CABasicAnimation animationWithKeyPath:@"opacity"];
+        f.fromValue = @1.0;
+        f.toValue = @0.4;
+        f.duration = 0.6;
+        f.autoreverses = YES;
+        f.repeatCount = HUGE_VALF;
+        f.fillMode = kCAFillModeBoth;
+        f.timingFunction = ease;
+        [_frameCell[1].layer addAnimation:f forKey:@"slFrame"];
+    } else {
+        CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+        a.fromValue = @0.94;
+        a.toValue = @1.0;
+        a.duration = 1.2;            // 一轮 2.4s，跟原来四杠空闲同频
+        a.autoreverses = YES;
+        a.repeatCount = HUGE_VALF;
+        a.fillMode = kCAFillModeBoth;
+        a.timingFunction = ease;
+        [_frames.layer addAnimation:a forKey:@"slFrameWrap"];
     }
 }
 
@@ -554,13 +581,13 @@ static UIImage *SLTransparentImage(void) {
 // 再叠一圈不同频的环会拍频，空闲约 16.8 秒才同相一次、录音每 2.3 秒错一拍，看着像抖。
 // 所以这里只让「图标自己」动，而且周期全部对齐光晕的 half，绝不另一套节奏。
 - (void)sl_updateIconMotion {
-    // 只对自定义图片生效。默认四杠图形本来就有四套逐根动画，再叠一层会打架。
+    // 只对自定义图片生效。默认叠层图形本来就有自己那套动画，再叠一层会打架。
     UIView *target = nil;
     if (!_thumb.hidden) target = _thumb;
 
     NSInteger fx = SLFloatEffectValue();
 
-    // 先无条件清干净：换图标、关动效、切回四杠形态都走这一条
+    // 先无条件清干净：换图标、关动效、切回叠层形态都走这一条
     [_thumb.layer removeAnimationForKey:@"slIconMotion"];
 
     if (!target || fx <= 0) return;
@@ -628,7 +655,7 @@ static UIImage *SLTransparentImage(void) {
     // 原来状态色一来就把色晕让掉（0.36 → 0），剩下 74% 是超薄毛玻璃自己的白，
     // 在浅色聊天背景上就是一片灰白玻璃 —— 从图色跳到白、再跳到状态色，中间硬断一截，
     // 就是「其他形态的背景会变成白色」的来源。
-    // 现在：有图 → 底色恒定，状态只靠字形 / 文字 / 箭头 / 外圈光环（有图时四杠本来就隐藏）；
+    // 现在：有图 → 底色恒定，状态只靠字形 / 文字 / 箭头 / 外圈光环（有图时叠层本来就隐藏）；
     // 没图（默认 logo）→ 仍然铺 26% 状态色，否则四态根本没有底色谱可用。
     BOOL hasArt = (_thumb != nil && _thumb.hidden == NO);
     BOOL useTint = (accent != nil) && !hasArt;
@@ -644,12 +671,15 @@ static UIImage *SLTransparentImage(void) {
         self->_tint.alpha = useTint ? 1.0 : 0.0;
         // v0.4.77：色晕不再让位（见上），整块胶囊从头到尾是同一个底，没有「白一下」的过渡。
         self->_glyph.tintColor = accent ?: [UIColor labelColor];
-        // 四杠跟着换色：几何不变，只有背景色随动画块交叉淡入淡出（as[i] 透明度恒定）
-        [self sl_layoutBars];
+        // 两个框跟着换色：几何不变，只有描边色随动画块交叉淡入淡出
+        [self sl_layoutFrames];
     } completion:nil];
-    [self sl_updateBarMotion];
-    // v0.4.74：图标动效也跟着状态换节奏。注意不能塞进 sl_updateBarMotion ——
-    // 自定义图片时 _bars 是 hidden，那个方法一开始就 return 了，根本走不到这一句。
+    [self sl_updateFrameMotion];
+    // 装填时后框「多出来那一块」的渐显不在这里做 —— 后框的 opacity 已经交给
+    // sl_updateFrameMotion 的循环动画了，再叠一个 UIView alpha 动画会抢同一个属性，
+    // 两个动画互相覆盖，结果是不定时地闪。父层 _frames 下面有 0.18s 淡入，跟着走就够。
+    // v0.4.74：图标动效也跟着状态换节奏。注意不能塞进 sl_updateFrameMotion ——
+    // 自定义图片时 _frames 是 hidden，那个方法一开始就 return 了，根本走不到这一句。
     [self sl_updateIconMotion];
     // v0.4.57：合成完成→就绪，整颗胶囊轻轻「落定」一下（缩放回弹）。
     // v0.4.60：只在「没有试听面板」时才弹 —— 面板自己有 0.94→1.0 的弹入，
@@ -658,14 +688,14 @@ static UIImage *SLTransparentImage(void) {
         [self sl_playCompletionSettle];
     }
     // v0.4.50：四套节奏的幅度差得远（0.30 / 0.55 / 0.86 / 1.15），硬切会「跳一下」。
-    // 状态真变了就让四杠做一次 0.18s 淡入，把新节奏揉进去，不至于突兀。
-    if (prev != state && _bars && !_bars.hidden) {
+    // 状态真变了就让图标做一次 0.18s 淡入，把新节奏揉进去，不至于突兀。
+    if (prev != state && _frames && !_frames.hidden) {
         CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
         fade.fromValue = @(0.45);
         fade.toValue = @(1.0);
         fade.duration = 0.18;
         fade.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-        [_bars.layer addAnimation:fade forKey:@"slFade"];
+        [_frames.layer addAnimation:fade forKey:@"slFade"];
     }
     _readyDot.hidden = (state != SLFloatStateReady);
 
@@ -726,8 +756,8 @@ static UIImage *SLTransparentImage(void) {
     [self setNeedsLayout];
     [self layoutIfNeeded];
     [self sl_startBreath:self.slState];
-    // v0.4.49：四杠循环动画同样会被系统在后台移除，回前台一并重挂
-    [self sl_updateBarMotion];
+    // 叠层循环动画同样会被系统在后台移除，回前台一并重挂
+    [self sl_updateFrameMotion];
     // v0.4.74：图标缩放 / 扫光同样是常驻 CA 动画，一样会被摘掉
     [self sl_updateIconMotion];
 }
@@ -904,9 +934,9 @@ static void SLShowMediaPreview(void);
 
     _glyph.frame = CGRectMake((w - 22.0) / 2.0, (h - 22.0) / 2.0, 22.0, 22.0);
     _glyph.hidden = (_thumb.hidden == NO);
-    _bars.frame = _glyph.frame;
-    _bars.hidden = _glyph.hidden;
-    [self sl_layoutBars];
+    _frames.frame = _glyph.frame;
+    _frames.hidden = _glyph.hidden;
+    [self sl_layoutFrames];
 
     _thumb.frame = b;
 
