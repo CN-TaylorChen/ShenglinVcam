@@ -52,4 +52,9 @@ extern NSString *const kSLCamRotateKey;
 /// 是否用素材音频替换麦克风，BOOL，默认 YES；NO = 静音输出
 extern NSString *const kSLCamAudioKey;
 
+/// 陌陌「实拍时刻」是否按中间正方形裁切（不放大），BOOL，默认 NO。
+/// NO = 铺满整帧（0.3.10 的老行为）；YES = 只裁一刀，方图 1:1 落进方块。
+/// 只对陌陌进程有意义，别的 App 判断不过去。
+extern NSString *const kSLCamSquareCropKey;
+
 NS_ASSUME_NONNULL_END

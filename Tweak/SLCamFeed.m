@@ -322,17 +322,20 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
                        toWidth:(size_t)w
                         height:(size_t)h
                         mirror:(BOOL)mirror
-                      rotation:(NSInteger)rotation;
+                      rotation:(NSInteger)rotation
+                    squareCrop:(BOOL)squareCrop;
 - (CVPixelBufferRef)sl_render:(CVPixelBufferRef)src
                       toWidth:(size_t)w
                        height:(size_t)h
                        format:(OSType)pf
                        mirror:(BOOL)mirror
-                     rotation:(NSInteger)rotation CF_RETURNS_RETAINED;
+                     rotation:(NSInteger)rotation
+                   squareCrop:(BOOL)squareCrop CF_RETURNS_RETAINED;
 - (BOOL)sl_writeSource:(CVPixelBufferRef)src
                   into:(CVPixelBufferRef)dst
                 mirror:(BOOL)mirror
-              rotation:(NSInteger)rotation;
+              rotation:(NSInteger)rotation
+            squareCrop:(BOOL)squareCrop;
 
 @end
 
@@ -485,7 +488,9 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     size_t w = 0, h = 0;
     if (key.length) {
         NSArray<NSString *> *parts = [key componentsSeparatedByString:@":"];
-        if (parts.count == 2) {
+        // 0.3.12 起 key 多了一段 ":q0/1"（正方形裁切状态），所以不能只认 2 段。
+        // 只看前两段：像素格式、宽高。后面的是给解码管线做失效判断用的。
+        if (parts.count >= 2) {
             OSType kpf = (OSType)(uint32_t)[parts[0] intValue];
             NSArray<NSString *> *wh = [parts[1] componentsSeparatedByString:@"x"];
             if (wh.count == 2 && kpf) {
@@ -505,7 +510,8 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
 
     // 缩放交给公共那套「铺满 + 居中裁切」，跟视频走完全一样的数学；
     // 旋转 / 镜像**不在这里做** —— 那是每帧按设置实时变的，由下游负责。
-    CIImage *scaled = [self sl_image:img toWidth:w height:h mirror:NO rotation:0];
+    // squareCrop:YES —— 这是注入用的预览帧，陌陌开关打开时要按正方形裁。
+    CIImage *scaled = [self sl_image:img toWidth:w height:h mirror:NO rotation:0 squareCrop:YES];
     if (!scaled) return;
 
     // 0.3.6：用 CPU 渲染，并给帧补上色彩附件。
@@ -963,7 +969,11 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     // 跟原来一样，把「宿主想要的格式」记下来，解码线程据此重建 reader。
     // 这一步不能省：视频只有按宿主格式解出来才能走下面的零拷贝直出，
     // 否则每帧都要 CPU 过一遍 CI 做格式转换，30fps 根本扛不住。
-    NSString *key = [NSString stringWithFormat:@"%u:%zux%zu", (unsigned)hpf, hw, hh];
+    // 0.3.12：key 里带上「正方形裁切」状态。拨开关时 key 一变，解码管线就会
+    // 按新的缩放数学重建 —— 否则图片会一直用旧缓存，拨了开关看不到变化。
+    NSString *key = [NSString stringWithFormat:@"%u:%zux%zu:q%d",
+                     (unsigned)hpf, hw, hh,
+                     (self.squareCropEnabled && SLVCamIsMomoProcess()) ? 1 : 0];
     [_lock lock];
     BOOL changed = ![_pipelineKey isEqualToString:key];
     if (changed) { _pipelineKey = key; _reconfigRequested = YES; }
@@ -992,7 +1002,7 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     if (!isImage) {
         // 视频开了旋转 / 镜像：直接写进宿主的 buffer，
         // 省掉「先渲到自建 buffer、再搬一趟」的整趟开销
-        BOOL ok = [self sl_writeSource:src into:host mirror:mirror rotation:rot];
+        BOOL ok = [self sl_writeSource:src into:host mirror:mirror rotation:rot squareCrop:YES];
         CVPixelBufferRelease(src);
         return ok ? (CVPixelBufferRef)CVPixelBufferRetain(host) : NULL;
     }
@@ -1007,8 +1017,9 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
         return ok ? (CVPixelBufferRef)CVPixelBufferRetain(host) : NULL;
     }
 
-    NSString *hostKey = [NSString stringWithFormat:@"%u:%zux%zu:m%d:r%ld",
-                         (unsigned)hpf, hw, hh, mirror ? 1 : 0, (long)rot];
+    NSString *hostKey = [NSString stringWithFormat:@"%u:%zux%zu:m%d:r%ld:q%d",
+                         (unsigned)hpf, hw, hh, mirror ? 1 : 0, (long)rot,
+                         (self.squareCropEnabled && SLVCamIsMomoProcess()) ? 1 : 0];
     CVPixelBufferRef cached = NULL;
     [_lock lock];
     if (_hostStill && [_hostStillKey isEqualToString:hostKey]) {
@@ -1017,7 +1028,7 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     [_lock unlock];
 
     if (!cached) {
-        cached = [self sl_render:src toWidth:hw height:hh format:hpf mirror:mirror rotation:rot];
+        cached = [self sl_render:src toWidth:hw height:hh format:hpf mirror:mirror rotation:rot squareCrop:YES];
         if (!cached) { CVPixelBufferRelease(src); return NULL; }
         [_lock lock];
         if (_hostStill) CVPixelBufferRelease(_hostStill);
@@ -1083,7 +1094,8 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
                                     height:h
                                     format:pixelFormat
                                     mirror:mirror
-                                  rotation:rot];
+                                  rotation:rot
+                                squareCrop:NO];   // 拍照不走实拍时刻裁切
     CVPixelBufferRelease(pb);
     return out;
 }
@@ -1093,7 +1105,8 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
                        height:(size_t)h
                        format:(OSType)pf
                        mirror:(BOOL)mirror
-                     rotation:(NSInteger)rotation {
+                     rotation:(NSInteger)rotation
+                   squareCrop:(BOOL)squareCrop {
     size_t sw = CVPixelBufferGetWidth(src);
     size_t sh = CVPixelBufferGetHeight(src);
     if (sw < 1 || sh < 1 || w < 1 || h < 1) return NULL;
@@ -1102,7 +1115,8 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
                           toWidth:w
                            height:h
                            mirror:mirror
-                         rotation:rotation];
+                         rotation:rotation
+                       squareCrop:squareCrop];
     if (!img) return NULL;
 
     // 0.3.5：先渲染成 BGRA，再按目标格式转。
@@ -1161,32 +1175,30 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     return dst;
 }
 
-/// 陌陌（国内版 com.immomo.momo / com.wemomo.momoappdemo1）的「实拍时刻」
-/// 窗口只显示整帧中间那块，上下各约 47% 被裁在窗口外。我们按整帧铺满，
-/// 等于让素材先被放大一遍、再被它裁一遍 —— 方图放大 1.78 倍，全身直接出画。
-///
-/// 0.3.11：这个进程里把 aspect-fill 的参考框从「整帧」收成「中间那个正方形」，
-/// 只裁一刀。9:16 素材算出来的倍数仍是 1.0，行为完全不变；其它 App 走原逻辑。
-static BOOL SLVSquareCropWindow(void) {
-    static BOOL square = NO;
+/// 当前进程是不是陌陌。设置页用它决定要不要显示「实拍时刻不放大」那一行。
+BOOL SLVCamIsMomoProcess(void) {
+    static BOOL momo = NO;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        square = [bid isEqualToString:@"com.immomo.momo"]              // 国内版
-              || [bid isEqualToString:@"com.wemomo.momoappdemo1"];     // 海外 / 测试包
-        if (square) SLVLog(@"feed 陌陌实拍时刻（%@）：按中间正方形裁切，不放大", bid);
+        momo = [bid isEqualToString:@"com.immomo.momo"]              // 国内版
+            || [bid isEqualToString:@"com.wemomo.momoappdemo1"];     // 海外 / 测试包
     });
-    return square;
+    return momo;
 }
 
 /// 旋转 + 铺满裁切 + 镜像，全部在 CI 坐标系里做完，返回摆好姿势的图。
 /// `sl_render:`（自己建 buffer）和 `renderIntoPixelBuffer:`（改写宿主 buffer）
 /// 共用这一份数学 —— 两处各写一遍迟早会不一致。
+///
+/// `squareCrop` 只有「注入预览帧」这条路才传 YES。拍照**必须传 NO**：
+/// 前置摄像头出的是 3024×4032 这种竖图，按正方形裁会把照片上下切掉一大块。
 - (CIImage *)sl_image:(CIImage *)img
               toWidth:(size_t)w
                height:(size_t)h
                mirror:(BOOL)mirror
-             rotation:(NSInteger)rotation {
+             rotation:(NSInteger)rotation
+           squareCrop:(BOOL)squareCrop {
     if (!img) return nil;
 
     // 1) 旋转。CI 是 y 轴向上的坐标系，视觉上的「顺时针」要取负角度。
@@ -1202,13 +1214,20 @@ static BOOL SLVSquareCropWindow(void) {
     CGRect re = img.extent;
     if (re.size.width < 1 || re.size.height < 1) return nil;
 
-    // 0.3.11：陌陌的实拍时刻只看得见整帧中间那个正方形，按整帧铺满会让素材
-    // 白放一遍再被它裁一遍。参考框收成正方形，只裁一刀 —— 方图正好 1:1 落进去，
-    // 上下多出来的部分落在窗口外（看不见）。只在「buffer 比正方形高」时收，
-    // 横过来的 buffer 保持原样，免得把参考框撑到比 buffer 还高。
+    // 0.3.12：陌陌的实拍时刻只看得见整帧中间那个正方形，按整帧铺满会让素材
+    // 白放一遍再被它裁一遍。开关打开时把参考框收成正方形，只裁一刀 —— 方图正好
+    // 1:1 落进去。只在「buffer 比正方形高」时收，横过来的 buffer 保持原样，
+    // 免得把参考框撑到比 buffer 还高。
     CGFloat rw = (CGFloat)w;
     CGFloat rh = (CGFloat)h;
-    if (SLVSquareCropWindow() && rh > rw) rh = rw;
+    if (squareCrop && self.squareCropEnabled && SLVCamIsMomoProcess()) {
+        static BOOL loggedOnce = NO;
+        if (!loggedOnce) {
+            loggedOnce = YES;
+            SLVLog(@"feed 陌陌实拍时刻：按中间正方形裁切，不放大");
+        }
+        if (rh > rw) rh = rw;
+    }
 
     CGFloat s = MAX(rw / re.size.width, rh / re.size.height);
     img = [img imageByApplyingTransform:CGAffineTransformMakeScale(s, s)];
@@ -1234,7 +1253,8 @@ static BOOL SLVSquareCropWindow(void) {
 - (BOOL)sl_writeSource:(CVPixelBufferRef)src
                   into:(CVPixelBufferRef)dst
                 mirror:(BOOL)mirror
-              rotation:(NSInteger)rotation {
+              rotation:(NSInteger)rotation
+            squareCrop:(BOOL)squareCrop {
     if (!src || !dst) return NO;
     size_t w = CVPixelBufferGetWidth(dst);
     size_t h = CVPixelBufferGetHeight(dst);
@@ -1253,7 +1273,8 @@ static BOOL SLVSquareCropWindow(void) {
                           toWidth:w
                            height:h
                            mirror:mirror
-                         rotation:rotation];
+                         rotation:rotation
+                       squareCrop:squareCrop];
     if (!img) return NO;
 
     BOOL isNV12 = (dpf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
@@ -1309,7 +1330,7 @@ static BOOL SLVSquareCropWindow(void) {
     if (rot < 0) rot += 360;
     if (rot != 90 && rot != 180 && rot != 270) rot = 0;
 
-    BOOL ok = [self sl_writeSource:src into:dst mirror:self.mirrorEnabled rotation:rot];
+    BOOL ok = [self sl_writeSource:src into:dst mirror:self.mirrorEnabled rotation:rot squareCrop:NO];
     CVPixelBufferRelease(src);
     return ok;
 }

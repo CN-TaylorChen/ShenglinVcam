@@ -39,6 +39,20 @@ NS_ASSUME_NONNULL_BEGIN
 /// 放行麦克风会把环境声录进去。
 @property (nonatomic, assign) BOOL audioReplaceEnabled;
 
+/// 陌陌「实拍时刻」专用：素材不放大，按中间正方形裁切（默认 NO）。
+///
+/// 陌陌的实拍时刻窗口只显示 9:16 帧中间那块，按整帧铺满等于让素材先被放大一遍、
+/// 再被它裁一遍 —— 方图放大 1.78 倍，人直接出画。
+/// 打开这个开关后按正方形裁切，只裁一刀，方图 1:1 落进去。
+///
+/// 默认关：关着就是 0.3.10 的行为（铺满整帧），因为不放大就必然上下留空。
+/// 只对陌陌进程有意义，别的 App 判断不过去。
+@property (nonatomic, assign) BOOL squareCropEnabled;
+
+/// 当前进程是不是陌陌（国内版 com.immomo.momo / com.wemomo.momoappdemo1）。
+/// 设置页用它决定要不要显示「实拍时刻不放大」那一行。
+BOOL SLVCamIsMomoProcess(void);
+
 /// 取下一帧（原始尺寸）。返回 +1 的 buffer，调用方负责 CFRelease；没有可用帧返回 NULL。
 - (nullable CVPixelBufferRef)copyNextFrame CF_RETURNS_RETAINED;
 

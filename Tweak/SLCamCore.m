@@ -24,6 +24,7 @@ NSString *const kSLCamLoopKey    = @"SLVCamLoop";
 NSString *const kSLCamMirrorKey  = @"SLVCamMirror";
 NSString *const kSLCamRotateKey  = @"SLVCamRotate";
 NSString *const kSLCamAudioKey   = @"SLVCamAudio";
+NSString *const kSLCamSquareCropKey = @"SLVCamSquareCrop";
 
 NSString *const SLVCamConfigChangedNotification = @"SLVCamConfigChangedNotification";
 
@@ -86,6 +87,8 @@ void SLVCamReloadAll(void) {
     feed.mirrorEnabled       = SLVCamReadBool(kSLCamMirrorKey, NO);
     feed.rotation            = SLVCamReadInt(kSLCamRotateKey, 0);
     feed.audioReplaceEnabled = SLVCamReadBool(kSLCamAudioKey, YES);
+    // 陌陌实拍时刻：默认关 = 铺满整帧（老行为）。开了才按正方形裁切、不放大。
+    feed.squareCropEnabled   = SLVCamReadBool(kSLCamSquareCropKey, NO);
 
     // 只有路径真的变了才重启解码。切个镜像/旋转开关不该把画面跳回第一帧 ——
     // 那在直播/通话里非常出戏。

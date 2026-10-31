@@ -17,11 +17,12 @@
 #import "SLMediaListController.h"
 #import "SLMediaStore.h"
 #import "SLCamBridge.h"
+#import "SLCamFeed.h"          // 0.3.12：SLVCamIsMomoProcess()，决定要不要显示「实拍时刻不放大」
 #import "SLUtil.h"
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.11"
+#define SLVVersion @"0.3.12"
 
 // 每个开关的 tag。原来只有「循环 / 镜像 / 音频」三个设了 tag（0/1/2），
 // 「启用」那个没设，默认就是 0 —— 跟「循环播放」撞在一起。以前没人按 tag 区分，
@@ -31,6 +32,7 @@ typedef NS_ENUM(NSInteger, SLVSwitchTag) {
     SLVSwitchTagLoop    = 11,
     SLVSwitchTagMirror  = 12,
     SLVSwitchTagAudio   = 13,
+    SLVSwitchTagSquareCrop = 14,   // 0.3.12：陌陌实拍时刻不放大（只在陌陌里显示）
 };
 
 // 定义在下面的「存储」段里，这里先用一下
@@ -263,6 +265,7 @@ static UIView *SLVMakeHeader(NSString *text, CGFloat x, CGFloat width) {
                 case SLVSwitchTagLoop:    v = SLVBoolForKey(kSLCamLoopKey, YES); break;
                 case SLVSwitchTagMirror:  v = SLVBoolForKey(kSLCamMirrorKey, NO); break;
                 case SLVSwitchTagAudio:   v = SLVBoolForKey(kSLCamAudioKey, YES); break;
+                case SLVSwitchTagSquareCrop: v = SLVBoolForKey(kSLCamSquareCropKey, NO); break;
                 default: continue;
             }
             // 值没变就别动，否则会把用户刚拨完的那一下又「弹」一次
@@ -395,7 +398,9 @@ static NSString *SLVRotationSummary(void) {
     (void)tv;
     if (section == 0) return 2;   // 启用 + 悬浮球图标
     if (section == 1) return 1;   // 当前素材（预览已挪进素材页，见 0.3.3）
-    if (section == 2) return 3;   // 循环 + 镜像 + 旋转
+    // 0.3.12：「实拍时刻不放大」只对陌陌有意义，别的 App 不显示这一行 ——
+    // 显示一个拨了没反应的开关比不显示更让人困惑。
+    if (section == 2) return SLVCamIsMomoProcess() ? 4 : 3;   // 循环 + 镜像 + 旋转 (+ 实拍时刻)
     if (section == 3) return 1;   // 音频
     return 1;                     // 运行日志
 }
@@ -474,6 +479,14 @@ static NSString *SLVRotationSummary(void) {
             cell.textLabel.text = @"画面旋转";
             cell.detailTextLabel.text = SLVRotationSummary();
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        } else if (ip.row == 3) {
+            // 0.3.12：只有陌陌才走到这一行（行数在 numberOfRowsInSection 里判断）。
+            // 开 = 正方形裁切、不放大；关 = 铺满整帧（0.3.10 的老行为）。
+            cell.textLabel.text = @"实拍时刻不放大";
+            sw = [[UISwitch alloc] init];
+            sw.on = SLVBoolForKey(kSLCamSquareCropKey, NO);
+            sw.tag = SLVSwitchTagSquareCrop;
+            [sw addTarget:self action:@selector(sl_optionChanged:) forControlEvents:UIControlEventValueChanged];
         } else {
             BOOL loop = (ip.row == 0);
             cell.textLabel.text = loop ? @"循环播放" : @"镜像画面";
@@ -551,11 +564,17 @@ static NSString *SLVRotationSummary(void) {
 }
 
 - (void)sl_optionChanged:(UISwitch *)sw {
-    // tag 见文件头的 SLVSwitchTag：10 启用 / 11 循环 / 12 镜像 / 13 音频
+    // tag 见文件头的 SLVSwitchTag：10 启用 / 11 循环 / 12 镜像 / 13 音频 / 14 实拍时刻
     if (sw.tag == SLVSwitchTagAudio) {
         SLVSetBool(kSLCamAudioKey, sw.on);
         SLVCamReloadAll();
         SLVToast(sw.on ? @"声音：开" : @"声音：关");
+        return;
+    }
+    if (sw.tag == SLVSwitchTagSquareCrop) {
+        SLVSetBool(kSLCamSquareCropKey, sw.on);
+        SLVCamReloadAll();
+        SLVToast(sw.on ? @"实拍时刻：不放大" : @"实拍时刻：铺满整帧");
         return;
     }
     SLVSetBool(sw.tag == SLVSwitchTagLoop ? kSLCamLoopKey : kSLCamMirrorKey, sw.on);
