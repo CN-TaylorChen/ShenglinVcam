@@ -1266,32 +1266,15 @@ static void SLVPresentSettingsWhenFree(UIViewController *host, NSInteger attempt
         return;
     }
 
-    // 0.3.7：点已经选中的那行 = 问要不要取消替换。
+    // 0.3.8：点已选中的那行 = 直接取消替换（不再弹二次确认）。
     //
-    // 0.3.3 把「取消」整个挪进了左滑菜单，结果没人找得到 —— 左滑是隐藏操作，
-    // 界面上又没有任何提示（说明文字还按你的要求全删了）。
-    // 现在恢复点行，但**不直接取消**：0.3.3 之前的教训是「点了想预览，
-    // 结果把替换取消了」，所以这里弹一个二次确认，两个意图都能表达。
-    UIAlertController *ac =
-        [UIAlertController alertControllerWithTitle:@"取消替换？"
-                                            message:it.displayName
-                                     preferredStyle:UIAlertControllerStyleAlert];
-    __weak typeof(self) ws = self;
-    [ac addAction:[UIAlertAction actionWithTitle:@"继续预览" style:UIAlertActionStyleCancel
-                                        handler:^(UIAlertAction *a) {
-        (void)a;
-        [ws.stage sl_replay];       // 就在原地从头再放一遍
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消替换" style:UIAlertActionStyleDestructive
-                                        handler:^(UIAlertAction *a) {
-        (void)a;
-        [SLVMediaStore setCurrentItem:nil];
-        SLVCamReloadAll();
-        [ws sl_reload];
-        [ws sl_refreshStage];
-        SLVToast(@"已取消");
-    }]];
-    [self presentViewController:ac animated:YES completion:nil];
+    // 0.3.3 把它挪进左滑菜单，没人找得到；0.3.7 恢复成弹窗，又嫌多一步。
+    // 现在就是一步到位：点一下取消，再点别的行就换回来，成本很低。
+    [SLVMediaStore setCurrentItem:nil];
+    SLVCamReloadAll();
+    [self sl_reload];
+    [self sl_refreshStage];
+    SLVToast(@"已取消替换");
 }
 
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tv

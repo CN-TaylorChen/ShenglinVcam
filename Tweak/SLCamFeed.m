@@ -101,6 +101,71 @@ static BOOL SLVBlitBGRAtoNV12(CVPixelBufferRef src, CVPixelBufferRef dst) {
     return ok;
 }
 
+/// 自建 CVPixelBuffer 的属性。
+///
+/// 0.3.8：把 MetalCompatibility 显式打开。
+///
+/// 之前只给了 IOSurfaceProperties，想着「有 IOSurface 就够了」。但宿主（抖音）
+/// 拿帧的方式是 CVMetalTextureCacheCreateTextureFromImage —— buffer 没标
+/// Metal 兼容，纹理就建不出来，采样到的是空纹理，整片画成绿色。
+/// 这跟「我们往 buffer 里写的字节对不对」完全是两件事：日志里中心像素
+/// B=139 G=146 R=149 是正常的中性灰，说明 CPU 这边写对了，是宿主读不出来。
+///
+/// 视频帧一直正常，因为它是解码器分配的，这些标记天生就带全了。
+static NSDictionary *SLVPixelBufferAttrs(void) {
+    return @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+        (id)kCVPixelBufferMetalCompatibilityKey : @YES,
+        (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES,
+    };
+}
+
+/// 两个**同格式同尺寸**的 buffer 之间按行搬字节。
+///
+/// 跨度和尺寸都对齐的情况下就是一次 memcpy；宿主的 buffer 往往按 64/128 字节
+/// 对齐，比 w*4 宽，那就一行一行搬。多出来的只是对齐填充，搬不搬无所谓。
+static BOOL SLVBlitSameFormat(CVPixelBufferRef src, CVPixelBufferRef dst) {
+    if (!src || !dst) return NO;
+
+    size_t w = CVPixelBufferGetWidth(dst);
+    size_t h = CVPixelBufferGetHeight(dst);
+    if (w < 1 || h < 1) return NO;
+    if (CVPixelBufferGetWidth(src) != w || CVPixelBufferGetHeight(src) != h) return NO;
+    if (CVPixelBufferGetPixelFormatType(src) != CVPixelBufferGetPixelFormatType(dst)) return NO;
+
+    BOOL planar = CVPixelBufferIsPlanar(dst);
+    size_t planes = planar ? CVPixelBufferGetPlaneCount(dst) : 1;
+    if (planar && CVPixelBufferGetPlaneCount(src) != planes) return NO;
+
+    if (CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return NO;
+    if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) {
+        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+        return NO;
+    }
+
+    BOOL ok = YES;
+    for (size_t i = 0; i < planes && ok; i++) {
+        uint8_t *s = planar ? CVPixelBufferGetBaseAddressOfPlane(src, i) : CVPixelBufferGetBaseAddress(src);
+        uint8_t *d = planar ? CVPixelBufferGetBaseAddressOfPlane(dst, i) : CVPixelBufferGetBaseAddress(dst);
+        size_t srb = planar ? CVPixelBufferGetBytesPerRowOfPlane(src, i) : CVPixelBufferGetBytesPerRow(src);
+        size_t drb = planar ? CVPixelBufferGetBytesPerRowOfPlane(dst, i) : CVPixelBufferGetBytesPerRow(dst);
+        size_t ph = planar ? CVPixelBufferGetHeightOfPlane(dst, i) : h;
+
+        size_t row = MIN(srb, drb);
+        if (!s || !d || row == 0 || ph == 0) { ok = NO; break; }
+
+        if (srb == drb) {
+            memcpy(d, s, row * ph);
+        } else {
+            for (size_t y = 0; y < ph; y++) memcpy(d + y * drb, s + y * srb, row);
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    return ok;
+}
+
 /// 给自建的 BGRA 帧补上色彩附件。
 ///
 /// 日志里能直接看出差别：解码器给的视频帧带 9 项扩展，我们自建的图片帧只有 2 项
@@ -157,7 +222,7 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     size_t h = CVPixelBufferGetHeight(src) & ~(size_t)1;
     if (w < 2 || h < 2) return NULL;
 
-    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+    NSDictionary *attrs = SLVPixelBufferAttrs();
     CVPixelBufferRef dst = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, dstFmt,
                             (__bridge CFDictionaryRef)attrs, &dst) != kCVReturnSuccess) return NULL;
@@ -235,6 +300,12 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     BOOL _isImage;
     BOOL _stillLoaded;
     NSString *_stillKey;                 // 这张静态图是按哪个 "格式:宽x高" 渲染的
+
+    // ---- 注入专用缓存（0.3.8）----
+    // 图片是静态的，但宿主每帧给的 buffer 都是新的，所以每帧都要往里搬一次。
+    // 旋转 / 镜像 / 尺寸转换只做一次，结果按 key 缓存，之后每帧纯 memcpy。
+    CVPixelBufferRef _hostStill;
+    NSString *_hostStillKey;             // "格式:宽x高:m镜像:r角度"
 }
 
 - (void)sl_restart;
@@ -258,6 +329,10 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
                        format:(OSType)pf
                        mirror:(BOOL)mirror
                      rotation:(NSInteger)rotation CF_RETURNS_RETAINED;
+- (BOOL)sl_writeSource:(CVPixelBufferRef)src
+                  into:(CVPixelBufferRef)dst
+                mirror:(BOOL)mirror
+              rotation:(NSInteger)rotation;
 
 @end
 
@@ -348,6 +423,9 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     _stillLoaded = NO;
     _stillKey = nil;
     if (_latestVideo) { CVPixelBufferRelease(_latestVideo); _latestVideo = NULL; }
+    // 注入缓存也是按旧素材渲的，换素材必须一起扔掉
+    if (_hostStill) { CVPixelBufferRelease(_hostStill); _hostStill = NULL; }
+    _hostStillKey = nil;
     [_audioPCM setLength:0];
     _audioReadCursor = 0;
     _running = (_sourcePath.length > 0);
@@ -439,7 +517,7 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     // 视频帧是解码器分配的，自带 Metal 兼容 + 完整色彩附件，一直正常；
     // 图片帧是我们造的（只有 IOSurfaceProperties），渲出来就不对。
     // 图片只渲一次，直接走 CPU 最稳，顺便把色彩附件补齐。
-    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+    NSDictionary *attrs = SLVPixelBufferAttrs();
     CVPixelBufferRef bgra = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
                             (__bridge CFDictionaryRef)attrs, &bgra) != kCVReturnSuccess) {
@@ -894,6 +972,106 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     return out;
 }
 
+// 注入专用（0.3.8）：把宿主**自己的**真帧 buffer 交进来，返回一帧能直接交给宿主的画面。
+//
+// 为什么不再自己造 buffer —— 三轮日志把这个方向堵死了：
+//   0.3.5 以为是 NV12 色度平面渲错 → 日志 pf=1111970369(BGRA)，宿主根本不要 YUV
+//   0.3.6 以为是 Metal 版 CIContext 坏 → 改 CPU 渲染，中心像素 B=139 G=146 R=149，正常
+//   0.3.7 以为是 bytesPerRow 不一致 → 日志三个跨度全是 4352，一模一样
+// 子类型一样、尺寸一样、跨度一样，CMVideoFormatDescriptionMatchesImageBuffer 却仍然
+// 判不匹配、画面也仍然是绿的 —— 那差别就只剩「buffer 是谁造的」。
+// 真帧是摄像头采集出来的 IOSurface，我们 CVPixelBufferCreate 出来的是另一种内存排布，
+// 宿主按自己的方式去读就串了色（绿）。
+//
+// 所以现在改成原地改写宿主的 buffer：指针、格式、IOSurface 属性全是宿主熟悉的那个，
+// MatchesImageBuffer 天然为真，自建 fmt 那套兜底彻底用不上。
+//
+// 返回 +1 的 buffer（调用方负责 CFRelease）：
+//   · 等于 host 的 retain 版 → 内容已改写，直接用
+//   · 其它 buffer → 素材帧本身就是对的，零拷贝直出
+//   · NULL → 这一帧放行真画面
+- (CVPixelBufferRef)copyFrameForHostBuffer:(CVPixelBufferRef)host {
+    if (!host) return NULL;
+    size_t hw = CVPixelBufferGetWidth(host);
+    size_t hh = CVPixelBufferGetHeight(host);
+    if (hw < 1 || hh < 1) return NULL;
+    OSType hpf = CVPixelBufferGetPixelFormatType(host);
+
+    NSInteger rot = [self sl_normalizedRotation];
+    BOOL mirror = self.mirrorEnabled;
+
+    // 跟原来一样，把「宿主想要的格式」记下来，解码线程据此重建 reader。
+    // 这一步不能省：视频只有按宿主格式解出来才能走下面的零拷贝直出，
+    // 否则每帧都要 CPU 过一遍 CI 做格式转换，30fps 根本扛不住。
+    NSString *key = [NSString stringWithFormat:@"%u:%zux%zu", (unsigned)hpf, hw, hh];
+    [_lock lock];
+    BOOL changed = ![_pipelineKey isEqualToString:key];
+    if (changed) { _pipelineKey = key; _reconfigRequested = YES; }
+    BOOL hasFrame = (_latestVideo != NULL);
+    [_lock unlock];
+
+    // 目标格式刚变、手里还没有任何帧：放行这一帧真画面，让解码线程按新格式重建
+    if (changed && !hasFrame) return NULL;
+
+    [_lock lock];
+    BOOL isImage = _isImage;
+    CVPixelBufferRef src = _latestVideo ? (CVPixelBufferRef)CVPixelBufferRetain(_latestVideo) : NULL;
+    [_lock unlock];
+    if (!src) return NULL;
+
+    size_t sw = CVPixelBufferGetWidth(src);
+    size_t sh = CVPixelBufferGetHeight(src);
+    OSType spf = CVPixelBufferGetPixelFormatType(src);
+
+    // 素材帧本来就跟宿主要的一模一样 → 零拷贝直出。
+    // 视频不旋转不镜像走的就是这条，它一直正常，别为了「统一」把它拖慢。
+    if (!isImage && !mirror && rot == 0 && sw == hw && sh == hh && spf == hpf) {
+        return src;                      // 已 retain
+    }
+
+    if (!isImage) {
+        // 视频开了旋转 / 镜像：直接写进宿主的 buffer，
+        // 省掉「先渲到自建 buffer、再搬一趟」的整趟开销
+        BOOL ok = [self sl_writeSource:src into:host mirror:mirror rotation:rot];
+        CVPixelBufferRelease(src);
+        return ok ? (CVPixelBufferRef)CVPixelBufferRetain(host) : NULL;
+    }
+
+    // ---- 图片 ----
+    // 静态图不该每帧过 CI：按「宿主格式 / 尺寸 + 镜像 + 旋转」渲一次缓存起来，
+    // 之后每帧只是一次 memcpy。1080x1920 的 BGRA 搬一次约 1~2ms，30fps 扛得住；
+    // 每帧现场过 CI 是 20ms 起，那才会掉帧。
+    if (!mirror && rot == 0 && spf == hpf && sw == hw && sh == hh) {
+        BOOL ok = SLVBlitSameFormat(src, host);
+        CVPixelBufferRelease(src);
+        return ok ? (CVPixelBufferRef)CVPixelBufferRetain(host) : NULL;
+    }
+
+    NSString *hostKey = [NSString stringWithFormat:@"%u:%zux%zu:m%d:r%ld",
+                         (unsigned)hpf, hw, hh, mirror ? 1 : 0, (long)rot];
+    CVPixelBufferRef cached = NULL;
+    [_lock lock];
+    if (_hostStill && [_hostStillKey isEqualToString:hostKey]) {
+        cached = (CVPixelBufferRef)CVPixelBufferRetain(_hostStill);
+    }
+    [_lock unlock];
+
+    if (!cached) {
+        cached = [self sl_render:src toWidth:hw height:hh format:hpf mirror:mirror rotation:rot];
+        if (!cached) { CVPixelBufferRelease(src); return NULL; }
+        [_lock lock];
+        if (_hostStill) CVPixelBufferRelease(_hostStill);
+        _hostStill = (CVPixelBufferRef)CVPixelBufferRetain(cached);
+        _hostStillKey = [hostKey copy];
+        [_lock unlock];
+    }
+    CVPixelBufferRelease(src);
+
+    BOOL ok = SLVBlitSameFormat(cached, host);
+    CVPixelBufferRelease(cached);
+    return ok ? (CVPixelBufferRef)CVPixelBufferRetain(host) : NULL;
+}
+
 /// 角度只认 0/90/180/270，其余一律当 0（脏数据不该让画面整个歪掉）
 - (NSInteger)sl_normalizedRotation {
     NSInteger r = self.rotation % 360;
@@ -975,7 +1153,7 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     // 不旋转不镜像的视频走解码器直出，所以一直正常。
     //
     // BGRA 是 CI 最可靠的输出格式，转 NV12 交给 vImage（平面偏移和 stride 它自己算）。
-    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+    NSDictionary *attrs = SLVPixelBufferAttrs();
     CVPixelBufferRef bgra = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
                             (__bridge CFDictionaryRef)attrs, &bgra) != kCVReturnSuccess) return NULL;
@@ -1062,45 +1240,40 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     return img;
 }
 
-/// 把当前素材帧画进**调用方给的** buffer，原地改写内容，不换指针、不改所有权。
+/// 把一帧素材写进**已经存在**的 dst（原地改写内容），尺寸 / 格式一律以 dst 为准。
 ///
-/// 为什么要这个方法：`-[AVCapturePhoto pixelBuffer]` 返回的 buffer 归 AVCapturePhoto
-/// 自己所有，调用方拿到的是借用引用。如果我们返回自己 new 出来的 buffer，
-/// 一是调用方不会 CFRelease（每次拍照泄 8MB），二是尺寸/格式跟真照片对不上，
-/// 宿主按 resolvedSettings 算出来的宽高会跟 buffer 打架。
-/// 原地画进去两个问题都不存在：指针、尺寸、格式全是宿主熟悉的那个。
-- (BOOL)renderIntoPixelBuffer:(CVPixelBufferRef)dst extraRotation:(NSInteger)extraRotation {
-    if (!dst) return NO;
+/// `sl_render:` 是自己建 buffer 再返回，这个是往别人的 buffer 里画 —— 注入层必须走
+/// 这条：宿主的 buffer 只能改内容，不能换指针（换了它就按自己的方式读，读出来是绿的）。
+- (BOOL)sl_writeSource:(CVPixelBufferRef)src
+                  into:(CVPixelBufferRef)dst
+                mirror:(BOOL)mirror
+              rotation:(NSInteger)rotation {
+    if (!src || !dst) return NO;
     size_t w = CVPixelBufferGetWidth(dst);
     size_t h = CVPixelBufferGetHeight(dst);
     if (w < 1 || h < 1) return NO;
 
-    [_lock lock];
-    CVPixelBufferRef src = _latestVideo ? (CVPixelBufferRef)CVPixelBufferRetain(_latestVideo) : NULL;
-    [_lock unlock];
-    if (!src) return NO;
+    OSType dpf = CVPixelBufferGetPixelFormatType(dst);
+    OSType spf = CVPixelBufferGetPixelFormatType(src);
 
-    // 用户设的旋转 + 拍照补偿角，归一成 0/90/180/270
-    NSInteger rot = ([self sl_normalizedRotation] + extraRotation) % 360;
-    if (rot < 0) rot += 360;
-    if (rot != 90 && rot != 180 && rot != 270) rot = 0;
+    // 尺寸、格式都对、又不用转不用镜 → 纯搬字节，比过一遍 CI 快一个数量级
+    if (rotation == 0 && !mirror && spf == dpf
+        && CVPixelBufferGetWidth(src) == w && CVPixelBufferGetHeight(src) == h) {
+        return SLVBlitSameFormat(src, dst);
+    }
 
     CIImage *img = [self sl_image:[CIImage imageWithCVPixelBuffer:src]
                           toWidth:w
                            height:h
-                           mirror:self.mirrorEnabled
-                         rotation:rot];
-    CVPixelBufferRelease(src);
+                           mirror:mirror
+                         rotation:rotation];
     if (!img) return NO;
 
-    // 0.3.5：跟 sl_render: 一样的道理 —— 不能直接往宿主的 NV12 buffer 上 render，
-    // 色度平面会写错，拍出来的照片就是绿轮廓。先渲 BGRA，再让 vImage 写平面。
-    OSType dpf = CVPixelBufferGetPixelFormatType(dst);
     BOOL isNV12 = (dpf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
                    dpf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
 
     if (!isNV12) {
-        // BGRA（或其它单平面格式）：CI 直接写就行
+        // BGRA（或其它单平面格式）：CI 直接写进 dst 就行
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         [_ciContext render:img
            toCVPixelBuffer:dst
@@ -1110,7 +1283,8 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
         return YES;
     }
 
-    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+    // NV12：CI 往双平面上写色度会错（白底 + 亮绿轮廓），先渲 BGRA 再让 vImage 写平面
+    NSDictionary *attrs = SLVPixelBufferAttrs();
     CVPixelBufferRef bgra = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
                             (__bridge CFDictionaryRef)attrs, &bgra) != kCVReturnSuccess) return NO;
@@ -1124,6 +1298,32 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
 
     BOOL ok = SLVBlitBGRAtoNV12(bgra, dst);
     CVPixelBufferRelease(bgra);
+    return ok;
+}
+
+/// 把当前素材帧画进**调用方给的** buffer，原地改写内容，不换指针、不改所有权。
+///
+/// 为什么要这个方法：`-[AVCapturePhoto pixelBuffer]` 返回的 buffer 归 AVCapturePhoto
+/// 自己所有，调用方拿到的是借用引用。如果我们返回自己 new 出来的 buffer，
+/// 一是调用方不会 CFRelease（每次拍照泄 8MB），二是尺寸/格式跟真照片对不上，
+/// 宿主按 resolvedSettings 算出来的宽高会跟 buffer 打架。
+/// 原地画进去两个问题都不存在：指针、尺寸、格式全是宿主熟悉的那个。
+- (BOOL)renderIntoPixelBuffer:(CVPixelBufferRef)dst extraRotation:(NSInteger)extraRotation {
+    if (!dst) return NO;
+    if (CVPixelBufferGetWidth(dst) < 1 || CVPixelBufferGetHeight(dst) < 1) return NO;
+
+    [_lock lock];
+    CVPixelBufferRef src = _latestVideo ? (CVPixelBufferRef)CVPixelBufferRetain(_latestVideo) : NULL;
+    [_lock unlock];
+    if (!src) return NO;
+
+    // 用户设的旋转 + 拍照补偿角，归一成 0/90/180/270
+    NSInteger rot = ([self sl_normalizedRotation] + extraRotation) % 360;
+    if (rot < 0) rot += 360;
+    if (rot != 90 && rot != 180 && rot != 270) rot = 0;
+
+    BOOL ok = [self sl_writeSource:src into:dst mirror:self.mirrorEnabled rotation:rot];
+    CVPixelBufferRelease(src);
     return ok;
 }
 

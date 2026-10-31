@@ -47,8 +47,26 @@ NS_ASSUME_NONNULL_BEGIN
 /// 第一次被调用（或宿主换了相机 / 分辨率导致格式变化）时会记下目标格式并重建
 /// 解码管线，**这一帧返回 NULL**，注入层据此放行真帧。宁可漏一两帧真画面，
 /// 也不要在采集线程上阻塞等解码 —— 那是黑屏和掉帧的根源。
+///
+/// 注意：这是**预览**用的，它自己造 buffer。注入层不要用它，用下面那个。
 - (nullable CVPixelBufferRef)copyFrameForPixelFormat:(OSType)pixelFormat
                                                 size:(CGSize)size
+    CF_RETURNS_RETAINED;
+
+/// 注入专用（0.3.8）：把宿主**自己的**真帧 buffer 交进来，返回一帧可以直接交给宿主的画面。
+///
+/// 关键点是**不再自己造 buffer**。三轮日志已经证明：子类型、尺寸、行跨度全都一致，
+/// 宿主那边照样是绿的 —— 差别只剩「buffer 是谁造的」。真帧是摄像头采集的 IOSurface，
+/// 我们 `CVPixelBufferCreate` 出来的是另一种内存排布，宿主按自己的方式读就串了色。
+///
+/// 所以这里原地改写宿主给的这个 buffer：指针、格式、IOSurface 属性全是它熟悉的，
+/// `CMVideoFormatDescriptionMatchesImageBuffer` 天然为真，自建 fmt 那套兜底用不上。
+///
+/// 返回 +1，调用方负责 CFRelease：
+///   · 返回值 == host 的 retain 版 → 内容已改写，直接拿去打包
+///   · 返回其它 buffer → 素材帧本身就是对的，零拷贝直出（视频不旋转不镜像走这条）
+///   · NULL → 这一帧放行真画面
+- (nullable CVPixelBufferRef)copyFrameForHostBuffer:(CVPixelBufferRef)host
     CF_RETURNS_RETAINED;
 
 /// 拍照专用：按当前「旋转 / 镜像」设置摆好，但**不重建解码管线**地取一帧。

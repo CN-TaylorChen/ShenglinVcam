@@ -333,11 +333,20 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
                 return;
             }
 
-            CVPixelBufferRef frame = [feed copyFrameForPixelFormat:pf size:size];
+            // 0.3.8：不再要「自己造的假帧」，而是把宿主这一帧**原地改写**。
+            //
+            // 前三轮都在猜「我们造的 buffer 缺了哪个属性」，三次全被日志推翻
+            // （要的不是 YUV、中心像素正常、行跨度也一致）。真正的问题不是缺属性，
+            // 是「buffer 是谁造的」本身：宿主把 IOSurface 拿去建 Metal 纹理，
+            // 我们 CVPixelBufferCreate 出来的那种排布它读不出正确内容，画出来就是绿的。
+            // 现在直接写进宿主自己的 buffer，指针 / 格式 / 属性全是它熟悉的那个。
+            CVPixelBufferRef frame = [feed copyFrameForHostBuffer:img];
             if (frame) {
                 // 优先沿用宿主的 fmt（下游的编码器/写入器都按它配置，换了会出岔子）。
                 // 只有当假帧确实与它不匹配时，才退而求其次自建一个 —— 自建的那个
                 // 必须把宿主的 extensions 带过去，否则宿主读扩展拿到 NULL 会崩。
+                //
+                // 0.3.8 起这段基本走不到了：frame 通常就是 img 本身，天然匹配。
                 CMVideoFormatDescriptionRef useFmt = (CMVideoFormatDescriptionRef)fmt;
                 CMVideoFormatDescriptionRef ownFmt = NULL;
                 if (!CMVideoFormatDescriptionMatchesImageBuffer((CMVideoFormatDescriptionRef)fmt, frame)) {
