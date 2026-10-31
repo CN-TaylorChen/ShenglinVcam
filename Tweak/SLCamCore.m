@@ -25,6 +25,8 @@ NSString *const kSLCamMirrorKey  = @"SLVCamMirror";
 NSString *const kSLCamRotateKey  = @"SLVCamRotate";
 NSString *const kSLCamAudioKey   = @"SLVCamAudio";
 
+NSString *const SLVCamConfigChangedNotification = @"SLVCamConfigChangedNotification";
+
 // 0.3.0 统一加 SLV 前缀前的旧键。只读不写，读到就搬到新键。
 static NSString *const kSLCamEnabledKeyOld = @"SLCamEnabled";
 
@@ -96,4 +98,15 @@ void SLVCamReloadAll(void) {
     // 只有「总开关开着 + 有素材文件」才真正替换；否则注入层原样放行真摄像头
     SLVCamSetInjecting(SLVCamEnabled() && it.path.length > 0);
     SLVRefreshFloatButton();
+
+    // 0.3.3：通知所有打开着的配置界面把控件值同步过来。
+    // 长按悬浮球改开关走的是另一条路径（SLVFanCommit），它只写 NSUserDefaults，
+    // 设置页的 cell 是创建时读一次值 —— 不发通知的话设置页会一直显示旧状态。
+    // 这里统一在 SLVCamReloadAll 里发，所有改配置的入口就都覆盖到了。
+    void (^notify)(void) = ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:SLVCamConfigChangedNotification
+                                                            object:nil];
+    };
+    if ([NSThread isMainThread]) notify();
+    else dispatch_async(dispatch_get_main_queue(), notify);
 }

@@ -16,13 +16,25 @@
 #import "SLAlignBox.h"
 #import "SLMediaListController.h"
 #import "SLMediaStore.h"
-#import "SLMediaPreview.h"
 #import "SLCamBridge.h"
 #import "SLUtil.h"
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.2"
+#define SLVVersion @"0.3.3"
+
+// 每个开关的 tag。原来只有「循环 / 镜像 / 音频」三个设了 tag（0/1/2），
+// 「启用」那个没设，默认就是 0 —— 跟「循环播放」撞在一起。以前没人按 tag 区分，
+// 所以没出事；0.3.3 要在通知里按 tag 回填值，必须先把这个坑填上。
+typedef NS_ENUM(NSInteger, SLVSwitchTag) {
+    SLVSwitchTagEnabled = 10,
+    SLVSwitchTagLoop    = 11,
+    SLVSwitchTagMirror  = 12,
+    SLVSwitchTagAudio   = 13,
+};
+
+// 定义在下面的「存储」段里，这里先用一下
+static BOOL SLVBoolForKey(NSString *key, BOOL def);
 
 // kSLCamLoopKey / kSLCamMirrorKey 现在由 SLVCamCore.m 统一导出（SLVCamBridge.h 里 extern），
 // 帧源要读同样的键，不能再各定义一份 static。
@@ -214,6 +226,53 @@ static UIView *SLVMakeFooter(NSString *text, CGFloat x, CGFloat width) {
     SLVApplyGlassTable(self.tableView);
     self.tableView.estimatedSectionFooterHeight = 28;
     self.tableView.estimatedSectionHeaderHeight = 26;
+
+    // 0.3.3：设置页开着的时候，用户还能长按悬浮球改开关（扇上的那几个）。
+    // 那条路径只写 NSUserDefaults，不碰这里 —— 收不到通知的话开关会一直显示旧值。
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(sl_configChanged:)
+                                                 name:SLVCamConfigChangedNotification
+                                               object:nil];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)sl_configChanged:(NSNotification *)n {
+    (void)n;
+    if (!self.isViewLoaded || self.view.window == nil) return;
+    [self sl_syncVisibleControls];
+}
+
+// 只同步可见 cell 里的值，不调 reloadData ——
+// reloadData 会重建 cell，把用户正在拨的那颗开关的动画打断。
+- (void)sl_syncVisibleControls {
+    for (UITableViewCell *cell in self.tableView.visibleCells) {
+        NSIndexPath *ip = [self.tableView indexPathForCell:cell];
+        if (!ip) continue;
+
+        UISwitch *sw = [cell.accessoryView isKindOfClass:[UISwitch class]]
+                     ? (UISwitch *)cell.accessoryView : nil;
+        if (sw) {
+            BOOL v = sw.on;
+            switch (sw.tag) {
+                case SLVSwitchTagEnabled: v = SLVCamEnabled(); break;
+                case SLVSwitchTagLoop:    v = SLVBoolForKey(kSLCamLoopKey, YES); break;
+                case SLVSwitchTagMirror:  v = SLVBoolForKey(kSLCamMirrorKey, NO); break;
+                case SLVSwitchTagAudio:   v = SLVBoolForKey(kSLCamAudioKey, YES); break;
+                default: continue;
+            }
+            // 值没变就别动，否则会把用户刚拨完的那一下又「弹」一次
+            if (sw.on != v) [sw setOn:v animated:YES];
+            continue;
+        }
+
+        // 「当前素材」那行的跑马灯也要跟着变 —— 换素材不会重建 cell
+        if (ip.section == 1 && ip.row == 0 && [cell isKindOfClass:[SLVScrollValueCell class]]) {
+            ((SLVScrollValueCell *)cell).valueView.text = SLVCamStatusSummary();
+        }
+    }
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -323,7 +382,7 @@ static NSString *SLVRotationSummary(void) {
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
     (void)tv;
     if (section == 0) return 2;   // 启用 + 悬浮球图标
-    if (section == 1) return 2;   // 当前素材 + 预览素材
+    if (section == 1) return 1;   // 当前素材（预览已挪进素材页，见 0.3.3）
     if (section == 2) return 3;   // 循环 + 镜像 + 旋转
     if (section == 3) return 1;   // 音频
     return 1;                     // 运行日志
@@ -345,7 +404,7 @@ static NSString *SLVRotationSummary(void) {
 
 - (NSString *)sl_footerForSection:(NSInteger)section {
     if (section == 0) return @"关掉后胶囊不再展开，长按球仍可进设置。";
-    if (section == 1) return @"导入后自动选中。视频循环播放，图片定格不动。";
+    if (section == 1) return @"导入后自动选中。视频循环播放，图片定格不动。点进素材页可以直接预览和切换。";
     if (section == 2) return @"旋转按顺时针计算，画面会铺满取景框、多出来的部分居中裁掉。";
     if (section == 3) return @"关掉后麦克风会被静音，不会录入环境声。素材没有音轨时同样生效。";
     return nil;
@@ -403,6 +462,7 @@ static NSString *SLVRotationSummary(void) {
             cell.textLabel.text = @"启用虚拟摄像头";
             sw = [[UISwitch alloc] init];
             sw.on = SLVCamEnabled();
+            sw.tag = SLVSwitchTagEnabled;
             [sw addTarget:self action:@selector(sl_enabledChanged:) forControlEvents:UIControlEventValueChanged];
         } else {
             cell.textLabel.text = @"悬浮球图标";
@@ -410,19 +470,12 @@ static NSString *SLVRotationSummary(void) {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         }
     } else if (ip.section == 1) {
-        if (ip.row == 0) {
-            cell.textLabel.text = @"当前素材";
-            // 不走 detailTextLabel：它的右对齐在长文本下会从左边溢出压到标题上。
-            ((SLVScrollValueCell *)cell).valueView.text = SLVCamStatusSummary();
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else {
-            // 预览素材：右侧直接给结论，不用点进去才知道有没有声音。
-            // 添加素材不在这里再放一份 —— 素材页的「＋」已经是入口了，两处重复。
-            cell.textLabel.text = @"预览素材";
-            cell.textLabel.textColor = [UIColor systemBlueColor];
-            cell.detailTextLabel.text = SLVMediaAudioSummary();
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        }
+        // 0.3.3：「预览素材」这一行撤了 —— 预览搬进素材页顶部，点任意一行就能换片。
+        // 留在这里的话点进去还是那个只能看当前素材的旧页面，两个入口两套行为。
+        cell.textLabel.text = @"当前素材";
+        // 不走 detailTextLabel：它的右对齐在长文本下会从左边溢出压到标题上。
+        ((SLVScrollValueCell *)cell).valueView.text = SLVCamStatusSummary();
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     } else if (ip.section == 2) {
         if (ip.row == 2) {
             cell.textLabel.text = @"画面旋转";
@@ -433,14 +486,14 @@ static NSString *SLVRotationSummary(void) {
             cell.textLabel.text = loop ? @"循环播放" : @"镜像画面";
             sw = [[UISwitch alloc] init];
             sw.on = SLVBoolForKey(loop ? kSLCamLoopKey : kSLCamMirrorKey, loop);
-            sw.tag = ip.row;
+            sw.tag = loop ? SLVSwitchTagLoop : SLVSwitchTagMirror;
             [sw addTarget:self action:@selector(sl_optionChanged:) forControlEvents:UIControlEventValueChanged];
         }
     } else if (ip.section == 3) {
         cell.textLabel.text = @"替换音频";
         sw = [[UISwitch alloc] init];
         sw.on = SLVBoolForKey(kSLCamAudioKey, YES);
-        sw.tag = 2;
+        sw.tag = SLVSwitchTagAudio;
         [sw addTarget:self action:@selector(sl_optionChanged:) forControlEvents:UIControlEventValueChanged];
     } else {
         cell.textLabel.text = @"运行日志";
@@ -456,11 +509,7 @@ static NSString *SLVRotationSummary(void) {
     if (ip.section == 0 && ip.row == 1) {
         [self.navigationController pushViewController:[[SLVFloatIconController alloc] init] animated:YES];
     } else if (ip.section == 1) {
-        if (ip.row == 0) {
-            [self.navigationController pushViewController:[[SLVMediaListController alloc] init] animated:YES];
-        } else {
-            [self.navigationController pushViewController:[[SLVMediaPreviewController alloc] init] animated:YES];
-        }
+        [self.navigationController pushViewController:[[SLVMediaListController alloc] init] animated:YES];
     } else if (ip.section == 2 && ip.row == 2) {
         [self sl_pickRotation];
     } else if (ip.section == 4) {
@@ -507,14 +556,14 @@ static NSString *SLVRotationSummary(void) {
 }
 
 - (void)sl_optionChanged:(UISwitch *)sw {
-    // tag：0 = 循环播放，1 = 镜像，2 = 替换音频
-    if (sw.tag == 2) {
+    // tag 见文件头的 SLVSwitchTag：10 启用 / 11 循环 / 12 镜像 / 13 音频
+    if (sw.tag == SLVSwitchTagAudio) {
         SLVSetBool(kSLCamAudioKey, sw.on);
         SLVCamReloadAll();
         SLVToast(sw.on ? @"声音：开" : @"声音：关");
         return;
     }
-    SLVSetBool(sw.tag == 0 ? kSLCamLoopKey : kSLCamMirrorKey, sw.on);
+    SLVSetBool(sw.tag == SLVSwitchTagLoop ? kSLCamLoopKey : kSLCamMirrorKey, sw.on);
     SLVCamReloadAll();   // 让帧源立刻读到新值，不用等重启
 }
 

@@ -32,6 +32,13 @@ void SLVCamHandleArrowTap(UIView *anchor);
 /// 设置改动后统一刷新（壳 + 业务自己缓存的东西）。
 void SLVCamReloadAll(void);
 
+/// 配置变了（开关 / 旋转 / 素材切换）就发这个通知，SLVCamReloadAll 里统一 post。
+///
+/// 设置页开着的时候，用户还能长按悬浮球改开关 —— 那条路径只写 NSUserDefaults，
+/// 设置页的 cell 是创建时读一次值，不会自己刷新，看起来就是「开关不同步」。
+/// 监听这个通知，把可见 cell 里的开关值同步回来即可。
+extern NSString *const SLVCamConfigChangedNotification;
+
 /// 开关的存储键（设置页与业务共用，别各存一份）
 extern NSString *const kSLCamEnabledKey;
 
