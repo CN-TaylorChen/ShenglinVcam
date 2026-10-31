@@ -1161,6 +1161,23 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     return dst;
 }
 
+/// 陌陌（com.wemomo.momoappdemo1）的「实拍时刻」窗口只显示整帧中间那块，
+/// 上下各约 47% 被裁在窗口外。我们按整帧铺满，等于让素材先被放大一遍、
+/// 再被它裁一遍 —— 方图放大 1.78 倍，全身直接出画。
+///
+/// 0.3.11：这个进程里把 aspect-fill 的参考框从「整帧」收成「中间那个正方形」，
+/// 只裁一刀。9:16 素材算出来的倍数仍是 1.0，行为完全不变；其它 App 走原逻辑。
+static BOOL SLVSquareCropWindow(void) {
+    static BOOL square = NO;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+        square = [bid isEqualToString:@"com.wemomo.momoappdemo1"];
+        if (square) SLVLog(@"feed 陌陌实拍时刻：按中间正方形裁切，不放大");
+    });
+    return square;
+}
+
 /// 旋转 + 铺满裁切 + 镜像，全部在 CI 坐标系里做完，返回摆好姿势的图。
 /// `sl_render:`（自己建 buffer）和 `renderIntoPixelBuffer:`（改写宿主 buffer）
 /// 共用这一份数学 —— 两处各写一遍迟早会不一致。
@@ -1183,7 +1200,16 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     //    竖屏素材塞进横屏预览时尤其明显。
     CGRect re = img.extent;
     if (re.size.width < 1 || re.size.height < 1) return nil;
-    CGFloat s = MAX((CGFloat)w / re.size.width, (CGFloat)h / re.size.height);
+
+    // 0.3.11：陌陌的实拍时刻只看得见整帧中间那个正方形，按整帧铺满会让素材
+    // 白放一遍再被它裁一遍。参考框收成正方形，只裁一刀 —— 方图正好 1:1 落进去，
+    // 上下多出来的部分落在窗口外（看不见）。只在「buffer 比正方形高」时收，
+    // 横过来的 buffer 保持原样，免得把参考框撑到比 buffer 还高。
+    CGFloat rw = (CGFloat)w;
+    CGFloat rh = (CGFloat)h;
+    if (SLVSquareCropWindow() && rh > rw) rh = rw;
+
+    CGFloat s = MAX(rw / re.size.width, rh / re.size.height);
     img = [img imageByApplyingTransform:CGAffineTransformMakeScale(s, s)];
 
     CGRect se = img.extent;
