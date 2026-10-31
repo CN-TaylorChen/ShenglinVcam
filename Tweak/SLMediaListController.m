@@ -14,6 +14,10 @@
 //    · 相册入口合并成一个：图片和视频同屏，一次能选一批
 //    · 提示语砍短，只留结论
 //
+//  0.3.4：
+//    · 顶部预览台高度改成按素材宽高比算（竖视频不再被压成邮票）
+//    · 点画面进独立预览页全屏看
+//
 
 #import "SLMediaListController.h"
 #import "SLMediaStore.h"
@@ -613,14 +617,46 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
 //
 // 默认静音，要出声点右上角那颗喇叭。静音播放完全不碰 AVAudioSession ——
 // 宿主的会话类别不是我们说了算（抖音/QQ 常用 Ambient），动了它就会互相抢声音。
+//
+// 0.3.4：舞台高度不再写死，改成按素材宽高比算 + 点画面进全屏。
+// 只做前者的话，竖视频最多也就 158 宽（280 高的框里 aspectFit），细节还是看不清；
+// 只做后者的话，列表里连「这是横的还是竖的」都看不出来。两个一起才完整。
 
 static const CGFloat kSLStagePad  = 16.0;
-static const CGFloat kSLStageBoxH = 156.0;
+static const CGFloat kSLStageTop  = 8.0;
+static const CGFloat kSLStageGap  = 4.0;
 static const CGFloat kSLStageBarH = 26.0;
 
-/// 预览台整高：上留白 + 舞台 + 间距 + 进度条
-static CGFloat SLVStageHeight(void) {
-    return 8.0 + kSLStageBoxH + 4.0 + kSLStageBarH;
+// 舞台高度按素材宽高比算。
+//
+// 0.3.3 写死 156 高：竖拍 9:16 的素材在 358 宽的横框里按 aspectFit 一缩，
+// 画面只剩 88×156 —— 两边各 135pt 黑边，等于在看一张邮票（跟预览页 0.2.25
+// 修过的是同一个坑，搬预览台时漏掉了）。
+// 上下限：最矮 156（横视频 / 超宽素材），最高 280（再高就把列表挤没了）。
+static const CGFloat kSLStageMinH = 156.0;
+static const CGFloat kSLStageMaxH = 280.0;
+
+/// 表头该有多高。boxW 是舞台可用宽度（表宽减左右 16），aspect 是素材的宽/高。
+static CGFloat SLVStageHeightFor(CGFloat boxW, CGFloat aspect) {
+    CGFloat h = kSLStageMaxH;
+    if (aspect > 0.01 && boxW > 0.0) h = boxW / aspect;
+    if (h < kSLStageMinH) h = kSLStageMinH;
+    if (h > kSLStageMaxH) h = kSLStageMaxH;
+    return kSLStageTop + h + kSLStageGap + kSLStageBarH;
+}
+
+/// 视频「摆正之后」的宽高比。直接读 naturalSize 拿到的是传感器坐标
+/// （竖拍是 1920x1080），必须过一遍 preferredTransform 才是眼睛看到的宽高。
+static CGFloat SLVAspectOfAsset(AVAsset *asset) {
+    if (!asset) return 0.0;
+    AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+    if (!vt) return 0.0;
+    CGSize s = vt.naturalSize;
+    CGSize d = CGSizeApplyAffineTransform(s, vt.preferredTransform);
+    d.width = fabs(d.width);
+    d.height = fabs(d.height);
+    if (d.width < 1.0 || d.height < 1.0) return 0.0;
+    return d.width / d.height;
 }
 
 static NSString *SLVStageTime(Float64 sec) {
@@ -629,9 +665,15 @@ static NSString *SLVStageTime(Float64 sec) {
     return [NSString stringWithFormat:@"%ld:%02ld", t / 60, t % 60];
 }
 
-@interface SLVListPreviewHeader : UIView
+@interface SLVListPreviewHeader : UIView <UIGestureRecognizerDelegate>
 /// 现在挂的是哪个素材（文件名），空串表示空台。切素材靠它判要不要重建播放器
 @property (nonatomic, copy) NSString *fileKey;
+/// 当前素材的宽 / 高，0 表示未知（按最矮的横框处理）
+@property (nonatomic, assign) CGFloat aspect;
+/// 宽高比变了 → 控制器据此调整表头高度
+@property (nonatomic, copy) void (^slOnAspectChange)(CGFloat aspect);
+/// 点了舞台（不是按钮）→ 进全屏预览
+@property (nonatomic, copy) void (^slOnTapStage)(void);
 - (void)sl_showItem:(SLVMediaItem *)it autoplay:(BOOL)play;
 - (void)sl_replay;
 - (void)sl_pause;
@@ -734,7 +776,32 @@ static NSString *SLVStageTime(Float64 sec) {
 
     [self sl_updateMuteIcon];
     [self sl_updatePlayIcon];
+
+    // 点画面进全屏。手势挂在 _box 上，但按钮得先拿到 touch ——
+    // 见 gestureRecognizer:shouldReceiveTouch:，碰到 UIControl 一律不接。
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                                        action:@selector(sl_stageTapped)];
+    tap.delegate = self;
+    tap.cancelsTouchesInView = NO;
+    [_box addGestureRecognizer:tap];
+
     return self;
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)t {
+    (void)g;
+    // 触摸落在播放 / 喇叭按钮（或它们内部的 label）上时不要抢
+    UIView *v = t.view;
+    while (v && v != _box) {
+        if ([v isKindOfClass:[UIControl class]]) return NO;
+        v = v.superview;
+    }
+    return YES;
+}
+
+- (void)sl_stageTapped {
+    if (!self.fileKey.length) return;       // 空台不响应
+    if (self.slOnTapStage) self.slOnTapStage();
 }
 
 - (void)dealloc {
@@ -750,19 +817,38 @@ static NSString *SLVStageTime(Float64 sec) {
     if (w <= 0.0) return;
 
     CGFloat bw = w - kSLStagePad * 2.0;
-    _box.frame = CGRectMake(kSLStagePad, 8.0, bw, kSLStageBoxH);
+
+    // 舞台高度 = 表头总高 - 上边距 - 间距 - 进度条，反推出来。
+    // SLVStageHeightFor 里已经 clamp 过，这里拿到的一定落在 156…280 之间。
+    CGFloat boxH = SLVStageHeightFor(bw, self.aspect) - kSLStageTop - kSLStageGap - kSLStageBarH;
+    if (boxH < 1.0) boxH = kSLStageMinH;
+
+    _box.frame = CGRectMake(kSLStagePad, kSLStageTop, bw, boxH);
     _layer.frame = _box.bounds;
     _still.frame = _box.bounds;
-    _emptyLab.frame = CGRectMake(0.0, (kSLStageBoxH - 20.0) / 2.0, bw, 20.0);
+    _emptyLab.frame = CGRectMake(0.0, (boxH - 20.0) / 2.0, bw, 20.0);
 
     _hintLab.frame = CGRectMake(12.0, 9.0, 140.0, 18.0);
-    _nameLab.frame = CGRectMake(12.0, kSLStageBoxH - 27.0, bw - 70.0, 18.0);
-    _playBtn.frame = CGRectMake(bw - 50.0, kSLStageBoxH - 50.0, 40.0, 40.0);
+    _nameLab.frame = CGRectMake(12.0, boxH - 27.0, bw - 70.0, 18.0);
+    _playBtn.frame = CGRectMake(bw - 50.0, boxH - 50.0, 40.0, 40.0);
     _muteBtn.frame = CGRectMake(bw - 43.0, 9.0, 34.0, 34.0);
 
-    CGFloat barY = 8.0 + kSLStageBoxH + 4.0;
+    CGFloat barY = kSLStageTop + boxH + kSLStageGap;
     _timeLab.frame = CGRectMake(w - kSLStagePad - 78.0, barY + 3.0, 78.0, 20.0);
     _slider.frame = CGRectMake(kSLStagePad, barY + 2.0, MAX(60.0, bw - 86.0), kSLStageBarH - 4.0);
+}
+
+/// 换素材之后记下新的宽高比。变了才通知控制器重设表头高度 ——
+/// 控制器那边会重新赋值 tableHeaderView 触发重新量高，不判变化的话
+/// 每次点同一行都会白走一遍布局。
+- (void)sl_setAspect:(CGFloat)aspect {
+    if (aspect < 0.01) aspect = 0.0;
+    CGFloat old = self.aspect;
+    self.aspect = aspect;
+    if (fabs(aspect - old) < 0.01) return;
+
+    [self setNeedsLayout];
+    if (self.slOnAspectChange) self.slOnAspectChange(aspect);
 }
 
 #pragma mark 内容
@@ -792,6 +878,7 @@ static NSString *SLVStageTime(Float64 sec) {
         _hintLab.text = nil;
         _nameLab.text = nil;
         [self sl_showControls:NO];
+        [self sl_setAspect:0.0];        // 空台回到最矮的横框
         return;
     }
 
@@ -800,11 +887,15 @@ static NSString *SLVStageTime(Float64 sec) {
 
     if (it.isImage) {
         _isVideo = NO;
-        _still.image = [UIImage imageWithContentsOfFile:it.path];
+        UIImage *img = [UIImage imageWithContentsOfFile:it.path];
+        _still.image = img;
         _still.hidden = NO;
         _hintLab.text = @"图片 · 定格";
         _hintLab.textColor = [UIColor systemBlueColor];
         [self sl_showControls:NO];
+        // 图片的宽高比直接取 image.size，不用过 transform
+        CGSize isz = img.size;
+        [self sl_setAspect:(isz.width > 0.0 && isz.height > 0.0) ? (isz.width / isz.height) : 0.0];
         return;
     }
 
@@ -812,6 +903,11 @@ static NSString *SLVStageTime(Float64 sec) {
     _still.hidden = YES;
 
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:it.path] options:nil];
+
+    // 先算宽高比再建播放器：AVURLAsset 同步读轨道信息就够，不用等 item ready。
+    // 这个值决定了表头多高，晚一步算就会先按旧高度铺一次、再跳一下。
+    [self sl_setAspect:SLVAspectOfAsset(asset)];
+
     AVPlayerItem *pitem = [AVPlayerItem playerItemWithAsset:asset];
     _player = [AVPlayer playerWithPlayerItem:pitem];
     _player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
@@ -978,6 +1074,8 @@ static NSString *SLVStageTime(Float64 sec) {
 @interface SLVMediaListController ()
 @property (nonatomic, strong) NSArray<SLVMediaItem *> *items;
 @property (nonatomic, strong) SLVListPreviewHeader *stage;
+/// 定义在下面「布局表头」那一段，viewDidLoad 的 block 里也要用，先声明一下
+- (void)sl_layoutStageAnimated:(BOOL)animated;
 @end
 
 // 素材页和设置页住的是同一个浮窗容器，不能「在浮窗里再叠一个浮窗」——
@@ -1034,8 +1132,27 @@ static void SLVPresentSettingsWhenFree(UIViewController *host, NSInteger attempt
     // 预览台挂在表头。宽度先用屏幕宽兜底 —— viewDidLoad 里 tableView 还没被布局，
     // 拿 bounds 可能是 0；真正的宽度在 viewDidLayoutSubviews 里补正。
     CGFloat w0 = UIScreen.mainScreen.bounds.size.width;
-    self.stage = [[SLVListPreviewHeader alloc] initWithFrame:CGRectMake(0, 0, w0, SLVStageHeight())];
+    self.stage = [[SLVListPreviewHeader alloc] initWithFrame:CGRectMake(0, 0, w0,
+                                                     SLVStageHeightFor(w0 - kSLStagePad * 2.0, 0.0))];
     self.tableView.tableHeaderView = self.stage;
+
+    // 换素材 → 宽高比变了 → 表头得跟着换高度。
+    // 舞台本身只改了 aspect，真正的「表头多高」是控制器说了算（只有它能重设 tableHeaderView）。
+    __weak typeof(self) ws = self;
+    self.stage.slOnAspectChange = ^(CGFloat aspect) {
+        (void)aspect;
+        // 这个回调可能发生在 sl_showItem 里、也就是表格正在布局的时候。
+        // 立刻重设 tableHeaderView 会跟当前这轮布局打架（严重时死循环），所以推到下一轮。
+        dispatch_async(dispatch_get_main_queue(), ^{ [ws sl_layoutStageAnimated:YES]; });
+    };
+
+    // 点画面 → 进独立预览页全屏看。
+    // 那边读的也是 [SLVMediaStore currentItem]，跟舞台放的是同一个素材，不会对不上。
+    self.stage.slOnTapStage = ^{
+        SLVMediaListController *ss = ws;
+        if (!ss) return;
+        [ss.navigationController pushViewController:[[SLVMediaPreviewController alloc] init] animated:YES];
+    };
 
     [self sl_reload];
 }
@@ -1054,11 +1171,40 @@ static void SLVPresentSettingsWhenFree(UIViewController *host, NSInteger attempt
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
+    // 宽度变了（横竖屏 / 分屏）也要重算，所以这里不看 aspect 有没有变，交给下面判 frame
+    [self sl_layoutStageAnimated:NO];
+}
+
+/// 按「当前宽度 + 当前素材宽高比」重设表头。
+///
+/// 高度变了必须重新赋值一次 tableHeaderView —— 只改 frame 表格不会重新量高度，
+/// 结果是内容压在一起或者底下空一大片。
+/// 换高度会让列表往下跳（切横视频 201 → 切竖视频 280，跳 79pt），
+/// 所以切换素材那条路径带 0.2s 动画，让它滑过去而不是「啪」一下。
+- (void)sl_layoutStageAnimated:(BOOL)animated {
     CGFloat w = CGRectGetWidth(self.tableView.bounds);
-    if (w > 0.0 && fabs(CGRectGetWidth(self.stage.frame) - w) > 0.5) {
-        self.stage.frame = CGRectMake(0, 0, w, SLVStageHeight());
-        // tableHeaderView 必须重新赋值一次，表格才会重新量它的高度
+    if (w <= 0.0) w = UIScreen.mainScreen.bounds.size.width;
+    if (w <= 0.0) return;
+
+    CGFloat h = SLVStageHeightFor(w - kSLStagePad * 2.0, self.stage.aspect);
+    CGRect want = CGRectMake(0, 0, w, h);
+    // 已经对了就别动 —— 这里每次布局都会进，不判的话会自己触发自己
+    if (fabs(CGRectGetWidth(self.stage.frame) - w) < 0.5 &&
+        fabs(CGRectGetHeight(self.stage.frame) - h) < 0.5) return;
+
+    void (^apply)(void) = ^{
+        self.stage.frame = want;
         self.tableView.tableHeaderView = self.stage;
+    };
+
+    if (animated) {
+        [UIView animateWithDuration:0.2
+                              delay:0.0
+                            options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionCurveEaseInOut
+                         animations:apply
+                         completion:nil];
+    } else {
+        apply();
     }
 }
 

@@ -21,7 +21,7 @@
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.3"
+#define SLVVersion @"0.3.4"
 
 // 每个开关的 tag。原来只有「循环 / 镜像 / 音频」三个设了 tag（0/1/2），
 // 「启用」那个没设，默认就是 0 —— 跟「循环播放」撞在一起。以前没人按 tag 区分，
@@ -35,6 +35,7 @@ typedef NS_ENUM(NSInteger, SLVSwitchTag) {
 
 // 定义在下面的「存储」段里，这里先用一下
 static BOOL SLVBoolForKey(NSString *key, BOOL def);
+static NSString *SLVRotationSummary(void);
 
 // kSLCamLoopKey / kSLCamMirrorKey 现在由 SLVCamCore.m 统一导出（SLVCamBridge.h 里 extern），
 // 帧源要读同样的键，不能再各定义一份 static。
@@ -247,11 +248,16 @@ static UIView *SLVMakeFooter(NSString *text, CGFloat x, CGFloat width) {
 
 // 只同步可见 cell 里的值，不调 reloadData ——
 // reloadData 会重建 cell，把用户正在拨的那颗开关的动画打断。
+//
+// 0.3.4：原来只遍历「带 UISwitch 的 cell」，非开关的行整段跳过 ——
+// 于是扇上改旋转、换图标之后，「画面旋转」「悬浮球图标」这两行的摘要一直停在旧值。
+// 现在改成按 indexPath 逐行分派，开关行只改 on，其余行回填右侧文字。
 - (void)sl_syncVisibleControls {
     for (UITableViewCell *cell in self.tableView.visibleCells) {
         NSIndexPath *ip = [self.tableView indexPathForCell:cell];
         if (!ip) continue;
 
+        // ---- 开关行：只改 on，不动 cell 结构 ----
         UISwitch *sw = [cell.accessoryView isKindOfClass:[UISwitch class]]
                      ? (UISwitch *)cell.accessoryView : nil;
         if (sw) {
@@ -268,9 +274,19 @@ static UIView *SLVMakeFooter(NSString *text, CGFloat x, CGFloat width) {
             continue;
         }
 
-        // 「当前素材」那行的跑马灯也要跟着变 —— 换素材不会重建 cell
-        if (ip.section == 1 && ip.row == 0 && [cell isKindOfClass:[SLVScrollValueCell class]]) {
-            ((SLVScrollValueCell *)cell).valueView.text = SLVCamStatusSummary();
+        // ---- 非开关行：逐行回填右侧摘要 ----
+        if (ip.section == 0 && ip.row == 1) {
+            cell.detailTextLabel.text = SLVFloatIconSummary();
+        } else if (ip.section == 1 && ip.row == 0) {
+            // 走的是自绘跑马灯，不是 detailTextLabel
+            if ([cell isKindOfClass:[SLVScrollValueCell class]]) {
+                ((SLVScrollValueCell *)cell).valueView.text = SLVCamStatusSummary();
+            }
+        } else if (ip.section == 2 && ip.row == 2) {
+            // 扇上的「旋转」写的是同一个键，这里必须跟着变
+            cell.detailTextLabel.text = SLVRotationSummary();
+        } else if (ip.section == 4) {
+            cell.detailTextLabel.text = SLVHookStatusSummary();
         }
     }
 }

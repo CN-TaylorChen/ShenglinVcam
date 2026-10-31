@@ -1,3 +1,105 @@
+## 0.3.4 —— 竖视频不再被压成邮票；点画面进全屏
+
+### 一、扇上改旋转，设置页「画面旋转」不跟着动
+
+上一版加的通知是对的，问题出在**接收端只认带开关的行**：
+
+```objc
+// 0.3.3 的写法
+for (UITableViewCell *cell in self.tableView.visibleCells) {
+    if (![cell.accessoryView isKindOfClass:[UISwitch class]]) continue;   // ← 非开关行整段跳过
+    ...
+}
+```
+
+「画面旋转」「悬浮球图标」「钩子状态」这几行**没有 `UISwitch`**，右侧摘要走的是
+`detailTextLabel`，于是一进循环就被 `continue` 掉了。旋转明明写进了同一个
+`NSUserDefaults` 键，界面却停在旧值 —— 看起来就是「不跟着动」。
+
+改成按 `indexPath` 逐行分派：开关行只改 `on`（不动 cell 结构，免得打断用户
+正在拨的那颗开关的动画），其余行各自回填右侧文字。
+
+```objc
+if (ip.section == 0 && ip.row == 1) {
+    cell.detailTextLabel.text = SLVFloatIconSummary();
+} else if (ip.section == 1 && ip.row == 0) {
+    // 走的是自绘跑马灯，不是 detailTextLabel
+    if ([cell isKindOfClass:[SLVScrollValueCell class]]) {
+        ((SLVScrollValueCell *)cell).valueView.text = SLVCamStatusSummary();
+    }
+} else if (ip.section == 2 && ip.row == 2) {
+    cell.detailTextLabel.text = SLVRotationSummary();
+}
+```
+
+### 二、竖视频预览看不清
+
+预览台原来固定 156 高，画面按 `ResizeAspect` 等比缩进去。同样的框，占位面积差 3 倍：
+
+| 素材 | 框 | 实际画面 | 面积 |
+|---|---|---|---|
+| 竖 9:16 | 358 × 156 | 88 × 156 | 13,689 |
+| 横 16:9 | 358 × 156 | 277 × 156 | 43,264 |
+| 方形 1:1 | 358 × 156 | 156 × 156 | 24,336 |
+
+竖拍素材两边各留 135pt 黑边，等于在看一张邮票。
+（预览页 0.2.25 修过同一个坑，搬预览台的时候漏掉了。）
+
+现在高度按素材宽高比算，clamp 在 156…280：
+
+```objc
+static CGFloat SLVStageHeightFor(CGFloat boxW, CGFloat aspect) {
+    CGFloat h = kSLStageMaxH;
+    if (aspect > 0.01 && boxW > 0.0) h = boxW / aspect;
+    if (h < kSLStageMinH) h = kSLStageMinH;   // 156：横视频 / 超宽素材
+    if (h > kSLStageMaxH) h = kSLStageMaxH;   // 280：再高就把列表挤没了
+    return kSLStageTop + h + kSLStageGap + kSLStageBarH;
+}
+```
+
+改完的实测：
+
+| 素材 | 舞台 | 画面 | 面积变化 |
+|---|---|---|---|
+| 竖 9:16 | 358 × 280 | 158 × 280 | 3.2× |
+| 横 16:9 | 358 × 201 | 358 × 201 | 1.3× |
+| 方形 1:1 | 358 × 280 | 280 × 280 | 3.2× |
+
+**宽高比必须过 `preferredTransform`**：直接读 `naturalSize` 拿到的是传感器坐标，
+竖拍是 1920×1080（看着像横的），只有过一遍 transform 才是眼睛看到的 1080×1920。
+
+```objc
+CGSize d = CGSizeApplyAffineTransform(vt.naturalSize, vt.preferredTransform);
+d.width = fabs(d.width); d.height = fabs(d.height);
+return d.width / d.height;
+```
+
+副作用：表头高度**随素材变化**（切横视频 201、切竖视频 280，跳 79pt）。
+换高度时给 `tableHeaderView` 包了一层 0.2s 动画，让它滑过去而不是「啪」一下。
+
+### 三、点画面进全屏
+
+只调高度的话，竖视频最多也就 158 宽，细节还是看不清；
+只加全屏的话，列表里连「这是横的还是竖的」都看不出来。两个一起才完整。
+
+舞台挂了个 `UITapGestureRecognizer`，点画面 push 独立预览页（就是原来设置页那个）。
+按钮要能先拿到 touch，所以 `shouldReceiveTouch:` 里碰到 `UIControl` 一律不接：
+
+```objc
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)t {
+    UIView *v = t.view;
+    while (v && v != _box) {
+        if ([v isKindOfClass:[UIControl class]]) return NO;   // 播放 / 喇叭
+        v = v.superview;
+    }
+    return YES;
+}
+```
+
+那边读的也是 `[SLVMediaStore currentItem]`，跟舞台放的是同一个素材，不会对不上。
+
+---
+
 ## 0.3.3 —— 预览搬进素材页；设置页开关不再掉队
 
 ### 一、设置页开关不同步
