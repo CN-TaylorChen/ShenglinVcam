@@ -22,7 +22,7 @@
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.14"
+#define SLVVersion @"0.3.15"
 
 // 每个开关的 tag。原来只有「循环 / 镜像 / 音频」三个设了 tag（0/1/2），
 // 「启用」那个没设，默认就是 0 —— 跟「循环播放」撞在一起。以前没人按 tag 区分，
@@ -482,7 +482,7 @@ static NSString *SLVRotationSummary(void) {
         } else if (ip.row == 3) {
             // 0.3.12：只有陌陌才走到这一行（行数在 numberOfRowsInSection 里判断）。
             // 开 = 正方形裁切、不放大；关 = 铺满整帧（0.3.10 的老行为）。
-            cell.textLabel.text = @"实拍时刻不放大";
+            cell.textLabel.text = @"实拍不放大";
             sw = [[UISwitch alloc] init];
             sw.on = SLVBoolForKey(kSLCamSquareCropKey, NO);
             sw.tag = SLVSwitchTagSquareCrop;
@@ -574,7 +574,7 @@ static NSString *SLVRotationSummary(void) {
     if (sw.tag == SLVSwitchTagSquareCrop) {
         SLVSetBool(kSLCamSquareCropKey, sw.on);
         SLVCamReloadAll();
-        SLVToast(sw.on ? @"实拍时刻：不放大" : @"实拍时刻：铺满整帧");
+        SLVToast(sw.on ? @"不放大 开" : @"不放大 关");
         return;
     }
     SLVSetBool(sw.tag == SLVSwitchTagLoop ? kSLCamLoopKey : kSLCamMirrorKey, sw.on);

@@ -135,8 +135,7 @@ static NSString *SLVFanAngleName(NSInteger i) {
     CAShapeLayer *_ringL[5];
     CAShapeLayer *_glowL[5];
     CAShapeLayer *_progL[5];   // 0.3.13：双功能球的按住进度环
-    CAShapeLayer *_badgeDot;   // 0.3.14：循环球**外**右下角的「实拍时刻开着」小圆点
-                               // 0.3.13 那个 15pt 圆角方块画在球内，压住了图标 —— 见 sl_buildBalls
+    CAShapeLayer *_badgeDot;   // 0.3.15：循环球内**左上角**的「实拍时刻开着」小圆点
     BOOL _on[5];
 
     UIView *_col;
@@ -393,17 +392,23 @@ static NSString *SLVFanAngleName(NSInteger i) {
         _glowL[i] = glow;
         _progL[i] = prog;
 
-        // 0.3.14：实拍时刻开着时，在循环球**外面**的右下角点一个小圆点。
+        // 0.3.15：实拍时刻开着时，在循环球内的**左上角**点一个小圆点。
         //
-        // 0.3.13 这里是 15pt 圆角方块，画在球内的 (25,25)。球心在 (22,22)，
-        // 角标中心离球心只有 14.8pt，而图标半径就有 11pt —— 角标是按「矩形角落」
-        // 摆的，可球是圆的，必压图标。现在挪到球外，跟图标一点不碰。
+        // 位置一路挪过三版：
+        //   0.3.13  15pt 方块画在球内 (25,25) → 压图标
+        //   0.3.14  挪到球外右下 +20          → 飘着，更丑
+        //   0.3.15  球内左上 (-12.5,-12.5)    → 贴边、不压、不飘
         //
-        // 位置：球心往右下 20pt（球半径 22，所以整个点都在球外面），
-        // 半径 4.5，白色 1.2 描边 —— 跟进度环（半径 24、线宽 2.5）只在边上擦过 1pt，
-        // 而且这一层是在进度环之后加的，真叠上也是点压环，不会看着像环断了。
+        // 位置：球心往**左上** 12.5pt，半径 4.5，白色 1.2 描边。
+        //
+        // 为什么左上这一档刚好：
+        //   球心到点心 = 12.5×√2 ≈ 17.7，点半径 4.5
+        //   → 点内沿离球心 13.2，图标半径只有 10  → 不压图标
+        //   → 点外沿离球心 22.2，球半径 22        → 正好贴边，不飘
+        //   → 进度环在 24±1.25，点外沿 22.2 还差 0.5 才碰到 → 不打架
+        // 左上还有个好处：标签列在球右边，左边是空的，不会挤。
         if (i == SLVFanSwitchLoop) {
-            CGPoint dc = CGPointMake(SLV_FAN_BALL_R + 20.0, SLV_FAN_BALL_R + 20.0);
+            CGPoint dc = CGPointMake(SLV_FAN_BALL_R - 12.5, SLV_FAN_BALL_R - 12.5);
 
             CAShapeLayer *dot = [CAShapeLayer layer];
             dot.frame = b.bounds;
@@ -621,7 +626,7 @@ static NSString *SLVFanAngleName(NSInteger i) {
     _iconV[i].tintColor = on ? accent : [UIColor colorWithWhite:0.55 alpha:1.0];
     _ringL[i].strokeColor = on ? [accent colorWithAlphaComponent:0.9].CGColor : nil;
 
-    // 0.3.14：实拍时刻开着 → 循环球外右下角亮一个小圆点
+    // 0.3.15：实拍时刻开着 → 循环球内左上角亮一个小圆点
     if (i == SLVFanSwitchLoop && _badgeDot) {
         _badgeDot.hidden = !SLVFanBool(kSLCamSquareCropKey, NO);
     }
@@ -796,10 +801,10 @@ static NSString *SLVFanAngleName(NSInteger i) {
     a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
     [p addAnimation:a forKey:@"slArm"];
 
-    // 0.3.14：落球给一次轻震 —— 告诉手指「已经开始计时了，再按住不动就能换功能」。
-    // 不震的话，环刚起头那一小段很难看出到底有没有在走。
+    // 0.3.15：落球给一次 Medium —— 0.3.14 用 Light 太轻，实际用下来「没什么感觉」。
+    // 这一下是告诉手指「已经开始计时了，再按住不动就能换功能」。
     UIImpactFeedbackGenerator *h =
-        [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
     [h prepare];
     [h impactOccurred];
 }
@@ -833,12 +838,21 @@ static NSString *SLVFanAngleName(NSInteger i) {
         _iconV[sw].image = (sw == SLVFanSwitchEnabled) ? SLVFanLibraryIcon()
                                                        : SLVFanSquareCropIcon();
 
-        // 0.3.14：环画满、功能切换的这一刻给**中震** —— 比落球那下重一档，
-        // 不看屏幕也能分清「刚开始计时」和「已经切过去了」。
-        UIImpactFeedbackGenerator *h =
-            [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-        [h prepare];
-        [h impactOccurred];
+        // 0.3.15：环满换功能用 **Heavy + Rigid 双段**。
+        // 0.3.14 是单发 Medium，实机几乎摸不到。Heavy 打底、60ms 后补一发 Rigid，
+        // 两下叠起来是 UIKit 能给的最强手感（不用 CoreHaptics 也不会太吵）。
+        UIImpactFeedbackGenerator *hHeavy =
+            [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
+        [hHeavy prepare];
+        [hHeavy impactOccurred];
+
+        UIImpactFeedbackGenerator *hRigid =
+            [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleRigid];
+        [hRigid prepare];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [hRigid impactOccurred];      // block 持有它，不会提前释放
+        });
 
         // 图标弹一下。光换图不弹，眼睛容易漏掉 —— 这一下是把「换了」推到眼前。
         UIImageView *iv = _iconV[sw];
@@ -1052,5 +1066,7 @@ void SLVFanToggleSquareCrop(void) {
     BOOL on = !SLVFanBool(kSLCamSquareCropKey, NO);
     SLVFanSetBool(kSLCamSquareCropKey, on);
     SLVCamReloadAll();
-    SLVToast(on ? @"实拍时刻：开（不放大）" : @"实拍时刻：关（铺满）");
+    // 0.3.15：文案砍到最短。这时候手上已经有中震 + 图标切换 + 成功震三重反馈了，
+    // toast 只负责确认「现在是开还是关」，不需要再解释「不放大 / 铺满」。
+    SLVToast(on ? @"不放大 开" : @"不放大 关");
 }
