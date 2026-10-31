@@ -665,15 +665,13 @@ static NSString *SLVStageTime(Float64 sec) {
     return [NSString stringWithFormat:@"%ld:%02ld", t / 60, t % 60];
 }
 
-@interface SLVListPreviewHeader : UIView <UIGestureRecognizerDelegate>
+@interface SLVListPreviewHeader : UIView
 /// 现在挂的是哪个素材（文件名），空串表示空台。切素材靠它判要不要重建播放器
 @property (nonatomic, copy) NSString *fileKey;
 /// 当前素材的宽 / 高，0 表示未知（按最矮的横框处理）
 @property (nonatomic, assign) CGFloat aspect;
 /// 宽高比变了 → 控制器据此调整表头高度
 @property (nonatomic, copy) void (^slOnAspectChange)(CGFloat aspect);
-/// 点了舞台（不是按钮）→ 进全屏预览
-@property (nonatomic, copy) void (^slOnTapStage)(void);
 - (void)sl_showItem:(SLVMediaItem *)it autoplay:(BOOL)play;
 - (void)sl_replay;
 - (void)sl_pause;
@@ -777,31 +775,7 @@ static NSString *SLVStageTime(Float64 sec) {
     [self sl_updateMuteIcon];
     [self sl_updatePlayIcon];
 
-    // 点画面进全屏。手势挂在 _box 上，但按钮得先拿到 touch ——
-    // 见 gestureRecognizer:shouldReceiveTouch:，碰到 UIControl 一律不接。
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self
-                                                                        action:@selector(sl_stageTapped)];
-    tap.delegate = self;
-    tap.cancelsTouchesInView = NO;
-    [_box addGestureRecognizer:tap];
-
     return self;
-}
-
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)t {
-    (void)g;
-    // 触摸落在播放 / 喇叭按钮（或它们内部的 label）上时不要抢
-    UIView *v = t.view;
-    while (v && v != _box) {
-        if ([v isKindOfClass:[UIControl class]]) return NO;
-        v = v.superview;
-    }
-    return YES;
-}
-
-- (void)sl_stageTapped {
-    if (!self.fileKey.length) return;       // 空台不响应
-    if (self.slOnTapStage) self.slOnTapStage();
 }
 
 - (void)dealloc {
@@ -1125,7 +1099,7 @@ static void SLVPresentSettingsWhenFree(UIViewController *host, NSInteger attempt
     // 胶囊移除后，设置面板的入口挪到这里：单击球 → 素材页 → 左上角齿轮 → 设置。
     // 放左边是因为右边「完成 / ＋」两个位置都占满了，而「完成」必须留在最右。
     self.navigationItem.leftBarButtonItem = SLVPillIconBarItem(@"gearshape", @"设置", self, @selector(sl_openSettings));
-    self.tableView.estimatedSectionFooterHeight = 28;
+    self.tableView.estimatedSectionFooterHeight = 16;
     self.tableView.estimatedSectionHeaderHeight = 26;
     self.tableView.rowHeight = 56;
 
@@ -1144,14 +1118,6 @@ static void SLVPresentSettingsWhenFree(UIViewController *host, NSInteger attempt
         // 这个回调可能发生在 sl_showItem 里、也就是表格正在布局的时候。
         // 立刻重设 tableHeaderView 会跟当前这轮布局打架（严重时死循环），所以推到下一轮。
         dispatch_async(dispatch_get_main_queue(), ^{ [ws sl_layoutStageAnimated:YES]; });
-    };
-
-    // 点画面 → 进独立预览页全屏看。
-    // 那边读的也是 [SLVMediaStore currentItem]，跟舞台放的是同一个素材，不会对不上。
-    self.stage.slOnTapStage = ^{
-        SLVMediaListController *ss = ws;
-        if (!ss) return;
-        [ss.navigationController pushViewController:[[SLVMediaPreviewController alloc] init] animated:YES];
     };
 
     [self sl_reload];
@@ -1262,12 +1228,10 @@ static void SLVPresentSettingsWhenFree(UIViewController *host, NSInteger attempt
     return [NSString stringWithFormat:@"我的素材 · %lu 个", (unsigned long)self.items.count];
 }
 
-- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)section {
+// 0.3.4：段尾说明全部去掉，只留 16pt 分组间距 —— 返回 0 会让最后一行贴到屏幕底。
+- (CGFloat)tableView:(UITableView *)tv heightForFooterInSection:(NSInteger)section {
     (void)tv; (void)section;
-    if (self.items.count) {
-        return @"点一行就切过去并在上面播放。左滑可取消替换或删除。";
-    }
-    return @"还没有素材。点右上角「＋」选一段视频或一张图片，它会替换摄像头画面。";
+    return 16.0;
 }
 
 - (void)tableView:(UITableView *)tv willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)ip {

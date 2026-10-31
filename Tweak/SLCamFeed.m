@@ -14,7 +14,112 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <ImageIO/ImageIO.h>
+#import <Accelerate/Accelerate.h>
 #import <unistd.h>
+
+#pragma mark - 渲染到 YUV 的正确姿势（0.3.5）
+
+// 背景：宿主要的是 420f / 420v 双平面（NV12），而 CoreImage 的默认 CIContext 是
+// Metal 的 —— 往这种双平面 buffer 上 render，**亮度平面写对了、色度平面写错了**。
+// 症状是白底 + 亮绿的人形轮廓（色度里混进了亮度信息），只在「必须过 CoreImage」
+// 的两条路上出现：图片素材、以及开了旋转 / 镜像的视频。
+//
+// 视频不旋转不镜像时走解码器直出（AVAssetReaderTrackOutput 直接吐 420f），
+// 压根不碰 CoreImage，所以一直是正常的 —— 这也是「视频好、图片绿」的原因。
+//
+// 修法分两条，最后都收敛到同一段「BGRA → vImage 转 NV12」：
+//   · 图片：一辈子只渲染一次，本来可以直接换 CPU 渲染；但既然视频那条路已经写好了，
+//     就统一走 BGRA + vImage，少一条路径少一个坑
+//   · 视频每帧：CPU 渲染扛不住 30fps，而 CI 对 BGRA 100% 可靠，转 YUV 交给 Accelerate
+//     （平面偏移 / stride / 色彩矩阵全由它算，不用自己搬字节）
+
+/// 把 BGRA 的内容搬进**已经存在**的 NV12 buffer 的两个平面。
+/// dst 必须是 420v / 420f，宽高是偶数。dst 比 src 小的话只取左上角那块。
+static BOOL SLVBlitBGRAtoNV12(CVPixelBufferRef src, CVPixelBufferRef dst) {
+    if (!src || !dst) return NO;
+
+    OSType df = CVPixelBufferGetPixelFormatType(dst);
+    BOOL full = (df == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+    if (!full && df != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) return NO;
+
+    size_t w = CVPixelBufferGetWidth(dst);
+    size_t h = CVPixelBufferGetHeight(dst);
+    // 420 是 2x2 下采样，宽高必须偶数；奇数会少一行 / 一列，边缘出现斜纹
+    w &= ~(size_t)1;
+    h &= ~(size_t)1;
+    if (w < 2 || h < 2) return NO;
+    if (CVPixelBufferGetWidth(src) < w || CVPixelBufferGetHeight(src) < h) return NO;
+
+    CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferLockBaseAddress(dst, 0);
+
+    BOOL ok = YES;
+    void *yBase = CVPixelBufferGetBaseAddressOfPlane(dst, 0);
+    void *uvBase = CVPixelBufferGetBaseAddressOfPlane(dst, 1);
+    void *sBase = CVPixelBufferGetBaseAddress(src);
+    if (!yBase || !uvBase || !sBase) ok = NO;
+
+    if (ok) {
+        vImage_Buffer s = { .data = sBase,
+                            .height = (vImagePixelCount)h,
+                            .width  = (vImagePixelCount)w,
+                            .rowBytes = CVPixelBufferGetBytesPerRow(src) };
+        vImage_Buffer y = { .data = yBase,
+                            .height = (vImagePixelCount)h,
+                            .width  = (vImagePixelCount)w,
+                            .rowBytes = CVPixelBufferGetBytesPerRowOfPlane(dst, 0) };
+        // 色度平面只有一半宽高；一个 CbCr 交织像素 = 2 字节，所以 rowBytes 天然是 w
+        vImage_Buffer uv = { .data = uvBase,
+                             .height = (vImagePixelCount)(h / 2),
+                             .width  = (vImagePixelCount)(w / 2),
+                             .rowBytes = CVPixelBufferGetBytesPerRowOfPlane(dst, 1) };
+
+        // 数字视频（16-235）还是全范围（0-255），跟宿主声明的格式一致，
+        // 不然暗部会发灰、高光会过曝。
+        vImage_YpCbCrPixelRange range = full
+            ? (vImage_YpCbCrPixelRange){ 0, 128, 255, 255, 255, 0, 255, 0 }
+            : (vImage_YpCbCrPixelRange){ 16, 128, 235, 240, 235, 16, 240, 16 };
+
+        vImage_ARGBToYpCbCr info;
+        // 苹果相机管线一律 BT.709；BGRA 在小端机上的内存布局就是 B,G,R,A，
+        // 正好对上 kvImageARGB8888。
+        if (vImageConvert_ARGBToYpCbCr_GenerateConversion(
+                kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2, &range,
+                &info, kvImageARGB8888, kvImage420Yp8_CbCr8, kvImageNoFlags) != kvImageNoError) {
+            ok = NO;
+        } else if (vImageConvert_ARGB8888To420Yp8_CbCr8(
+                       &s, &y, &uv, &range, &info, kvImageNoFlags) != kvImageNoError) {
+            ok = NO;
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    return ok;
+}
+
+/// 把一张 BGRA 的 CVPixelBuffer 转成新建的 420v / 420f 双平面。
+/// 失败返回 NULL。目标格式不是 NV12 时也返回 NULL。
+static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt) {
+    if (!src) return NULL;
+    if (dstFmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
+        dstFmt != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) return NULL;
+
+    size_t w = CVPixelBufferGetWidth(src) & ~(size_t)1;
+    size_t h = CVPixelBufferGetHeight(src) & ~(size_t)1;
+    if (w < 2 || h < 2) return NULL;
+
+    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+    CVPixelBufferRef dst = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, dstFmt,
+                            (__bridge CFDictionaryRef)attrs, &dst) != kCVReturnSuccess) return NULL;
+
+    if (!SLVBlitBGRAtoNV12(src, dst)) {
+        CVPixelBufferRelease(dst);
+        return NULL;
+    }
+    return dst;
+}
 
 // 音频水位（单位：秒）。
 //
@@ -267,17 +372,40 @@
     CIImage *scaled = [self sl_image:img toWidth:w height:h mirror:NO rotation:0];
     if (!scaled) return;
 
+    // 0.3.5：先渲染成 BGRA，再按目标格式转。
+    //
+    // 原来直接把图往 pf 上渲染 —— 宿主给的是 420f/420v 时，Metal 版 CIContext
+    // 写出来的色度平面是错的，画面上就是「白底 + 亮绿人形轮廓」。
+    // BGRA 是 CI 最可靠的输出格式，转 YUV 交给 vImage，平面偏移和 stride 它自己算。
     NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
-    CVPixelBufferRef pb = NULL;
-    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, pf,
-                            (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess) {
+    CVPixelBufferRef bgra = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+                            (__bridge CFDictionaryRef)attrs, &bgra) != kCVReturnSuccess) {
         return;
     }
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    [_ciContext render:scaled toCVPixelBuffer:pb
+    [_ciContext render:scaled toCVPixelBuffer:bgra
                 bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h) colorSpace:cs];
     CGColorSpaceRelease(cs);
+
+    CVPixelBufferRef pb = NULL;
+    if (pf == kCVPixelFormatType_32BGRA) {
+        pb = bgra;                       // 宿主本来就要 BGRA，不用转
+    } else {
+        pb = SLVConvertBGRAtoNV12(bgra, pf);
+        CVPixelBufferRelease(bgra);
+        if (!pb) {
+            // 既不是 BGRA 也不是 NV12（422 / 10bit 这类）。这种格式极少见，
+            // 退回老路径让 CI 直接渲染 —— 可能仍然偏色，但至少不是黑屏。
+            if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, pf,
+                                    (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess) return;
+            CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
+            [_ciContext render:scaled toCVPixelBuffer:pb
+                        bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h) colorSpace:cs2];
+            CGColorSpaceRelease(cs2);
+        }
+    }
 
     BOOL stale = NO;
     [_lock lock];
@@ -763,28 +891,58 @@
                        format:(OSType)pf
                        mirror:(BOOL)mirror
                      rotation:(NSInteger)rotation {
-    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
-    CVPixelBufferRef dst = NULL;
-    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, pf, (__bridge CFDictionaryRef)attrs, &dst) != kCVReturnSuccess)
-        return NULL;
-
     size_t sw = CVPixelBufferGetWidth(src);
     size_t sh = CVPixelBufferGetHeight(src);
-    if (sw < 1 || sh < 1) { CVPixelBufferRelease(dst); return NULL; }
+    if (sw < 1 || sh < 1 || w < 1 || h < 1) return NULL;
 
     CIImage *img = [self sl_image:[CIImage imageWithCVPixelBuffer:src]
                           toWidth:w
                            height:h
                            mirror:mirror
                          rotation:rotation];
-    if (!img) { CVPixelBufferRelease(dst); return NULL; }
+    if (!img) return NULL;
+
+    // 0.3.5：先渲染成 BGRA，再按目标格式转。
+    //
+    // 原来直接把结果往 pf 上渲染。宿主要 420f/420v（NV12 双平面）时，
+    // Metal 版 CIContext 写出来的色度平面是错的 —— 亮度进去了、色度没进去，
+    // 解出来就是「白底 + 亮绿人形轮廓」。开镜像 / 旋转的视频和所有图片都中招，
+    // 不旋转不镜像的视频走解码器直出，所以一直正常。
+    //
+    // BGRA 是 CI 最可靠的输出格式，转 NV12 交给 vImage（平面偏移和 stride 它自己算）。
+    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+    CVPixelBufferRef bgra = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+                            (__bridge CFDictionaryRef)attrs, &bgra) != kCVReturnSuccess) return NULL;
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     [_ciContext render:img
-       toCVPixelBuffer:dst
+       toCVPixelBuffer:bgra
                 bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)
             colorSpace:cs];
     CGColorSpaceRelease(cs);
+
+    CVPixelBufferRef dst = NULL;
+    if (pf == kCVPixelFormatType_32BGRA) {
+        dst = bgra;                       // 宿主本来就要 BGRA，不用再转
+        bgra = NULL;
+    } else {
+        dst = SLVConvertBGRAtoNV12(bgra, pf);
+        CVPixelBufferRelease(bgra);
+        if (!dst) {
+            // 既不是 BGRA 也不是 NV12（422 / 10bit 这类，极少见）。
+            // 退回老路径让 CI 直接渲染 —— 可能仍然偏色，但总比黑屏强。
+            if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, pf,
+                                    (__bridge CFDictionaryRef)attrs, &dst) != kCVReturnSuccess) return NULL;
+            CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
+            [_ciContext render:img
+               toCVPixelBuffer:dst
+                        bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)
+                    colorSpace:cs2];
+            CGColorSpaceRelease(cs2);
+        }
+    }
+    if (!dst) return NULL;
 
     // 把源帧的色彩附件带到目标帧上。
     //
@@ -870,13 +1028,38 @@
     CVPixelBufferRelease(src);
     if (!img) return NO;
 
+    // 0.3.5：跟 sl_render: 一样的道理 —— 不能直接往宿主的 NV12 buffer 上 render，
+    // 色度平面会写错，拍出来的照片就是绿轮廓。先渲 BGRA，再让 vImage 写平面。
+    OSType dpf = CVPixelBufferGetPixelFormatType(dst);
+    BOOL isNV12 = (dpf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+                   dpf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+
+    if (!isNV12) {
+        // BGRA（或其它单平面格式）：CI 直接写就行
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        [_ciContext render:img
+           toCVPixelBuffer:dst
+                    bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)
+                colorSpace:cs];
+        CGColorSpaceRelease(cs);
+        return YES;
+    }
+
+    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+    CVPixelBufferRef bgra = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+                            (__bridge CFDictionaryRef)attrs, &bgra) != kCVReturnSuccess) return NO;
+
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     [_ciContext render:img
-       toCVPixelBuffer:dst
+       toCVPixelBuffer:bgra
                 bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)
             colorSpace:cs];
     CGColorSpaceRelease(cs);
-    return YES;
+
+    BOOL ok = SLVBlitBGRAtoNV12(bgra, dst);
+    CVPixelBufferRelease(bgra);
+    return ok;
 }
 
 #pragma mark - 出音频

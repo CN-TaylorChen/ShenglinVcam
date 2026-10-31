@@ -21,7 +21,7 @@
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.4"
+#define SLVVersion @"0.3.5"
 
 // 每个开关的 tag。原来只有「循环 / 镜像 / 音频」三个设了 tag（0/1/2），
 // 「启用」那个没设，默认就是 0 —— 跟「循环播放」撞在一起。以前没人按 tag 区分，
@@ -57,10 +57,6 @@ static CGFloat SLVMeasureLeading(UITableView *tv) {
 
 static UIView *SLVMakeHeader(NSString *text, CGFloat x, CGFloat width) {
     return SLVAlignHeader(text, x, width);
-}
-
-static UIView *SLVMakeFooter(NSString *text, CGFloat x, CGFloat width) {
-    return SLVAlignFooter(text, x, width);
 }
 
 #pragma mark - 「当前素材」右侧长文本：跑马灯
@@ -225,7 +221,7 @@ static UIView *SLVMakeFooter(NSString *text, CGFloat x, CGFloat width) {
     self.navigationItem.titleView = [self sl_titleView];
     self.navigationItem.rightBarButtonItem = SLVPillBarItem(@"完成", self, @selector(sl_close));
     SLVApplyGlassTable(self.tableView);
-    self.tableView.estimatedSectionFooterHeight = 28;
+    self.tableView.estimatedSectionFooterHeight = 16;
     self.tableView.estimatedSectionHeaderHeight = 26;
 
     // 0.3.3：设置页开着的时候，用户还能长按悬浮球改开关（扇上的那几个）。
@@ -418,30 +414,11 @@ static NSString *SLVRotationSummary(void) {
     return section == 0 ? 26 : 22;
 }
 
-- (NSString *)sl_footerForSection:(NSInteger)section {
-    if (section == 0) return @"关掉后胶囊不再展开，长按球仍可进设置。";
-    if (section == 1) return @"导入后自动选中。视频循环播放，图片定格不动。点进素材页可以直接预览和切换。";
-    if (section == 2) return @"旋转按顺时针计算，画面会铺满取景框、多出来的部分居中裁掉。";
-    if (section == 3) return @"关掉后麦克风会被静音，不会录入环境声。素材没有音轨时同样生效。";
-    return nil;
-}
-
-- (UIView *)tableView:(UITableView *)tv viewForFooterInSection:(NSInteger)section {
-    NSString *text = [self sl_footerForSection:section];
-    if (!text.length) return nil;
-    return SLVMakeFooter(text, [self sl_leadingForTableView:tv], tv.bounds.size.width);
-}
-
+// 0.3.5：段尾说明全部去掉。剩下这 16pt 只是分组间距 ——
+// 返回 0 会让上下两组贴在一起，看起来像一组。
 - (CGFloat)tableView:(UITableView *)tv heightForFooterInSection:(NSInteger)section {
-    NSString *text = [self sl_footerForSection:section];
-    if (!text.length) return 16.0;   // 没文案时纯当分组间距，返回 0 会让两组贴在一起
-    CGFloat w = tv.bounds.size.width - 68;
-    if (w <= 0) return UITableViewAutomaticDimension;
-    CGRect r = [text boundingRectWithSize:CGSizeMake(w, CGFLOAT_MAX)
-                                  options:NSStringDrawingUsesLineFragmentOrigin
-                               attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:12]}
-                                  context:nil];
-    return ceil(r.size.height) + 14;
+    (void)tv; (void)section;
+    return 16.0;
 }
 
 - (void)tableView:(UITableView *)tv willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)ip {
@@ -540,8 +517,10 @@ static NSString *SLVRotationSummary(void) {
     NSArray<NSString *> *names = @[@"不旋转", @"顺时针 90°", @"顺时针 180°", @"顺时针 270°"];
     NSInteger cur = SLVRotationValue();
 
+    // 0.3.4：sheet 不再带说明文案 —— 标题已经说清是「画面旋转」，
+    // 选项名也自带方向，再加一行解释纯属噪音。
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"画面旋转"
-                                                                  message:@"按顺时针方向调整素材画面"
+                                                                  message:nil
                                                            preferredStyle:UIAlertControllerStyleActionSheet];
     for (NSUInteger i = 0; i < vals.count; i++) {
         NSInteger v = vals[i].integerValue;

@@ -35,7 +35,7 @@ ShenglinVcam_FILES = Tweak/SLCam.x \
 
 ShenglinVcam_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function
 ShenglinVcam_LDFLAGS = -Xlinker -not_for_dyld_shared_cache
-ShenglinVcam_FRAMEWORKS = UIKit Foundation AVFoundation CoreVideo CoreMedia CoreImage AudioToolbox PhotosUI UniformTypeIdentifiers
+ShenglinVcam_FRAMEWORKS = UIKit Foundation AVFoundation CoreVideo CoreMedia CoreImage AudioToolbox PhotosUI UniformTypeIdentifiers Accelerate
 ShenglinVcam_LIBRARIES = objc
 
 include $(THEOS_MAKE_PATH)/library.mk

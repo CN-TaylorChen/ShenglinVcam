@@ -1595,6 +1595,7 @@ void SLVEnsureFloatButton(void) {
         return;
     }
     SLVFloatButton *btn = (SLVFloatButton *)[w viewWithTag:SLVBtnTag];
+    BOOL created = NO;   // 这一轮是不是新建了球（新建的球状态是白的，末尾要补刷一次）
     // tag 是自己独享的 20941，正常不会撞；但万一宿主的某个视图碰巧也用这个值，
     // 强转过去会一路把别人的视图当球使 —— 类型不对就当没找到。
     if (btn && ![btn isKindOfClass:[SLVFloatButton class]]) btn = nil;
@@ -1653,8 +1654,21 @@ void SLVEnsureFloatButton(void) {
         }
         sLastMountPos = c;
         sHaveMountPos = YES;
+        created = YES;
     }
     sSLFloatBtn = btn;
+
+    // 0.3.5：新建的球必须马上刷一次状态。
+    //
+    // initWithFrame: 里写死了 sl_applyState:Idle（白），而全项目只有 SLVCamReloadAll
+    // 和「换图标」会调 SLVRefreshFloatButton —— 这个每 2 秒跑一次的轮询从来没刷过状态。
+    // 于是「已经启用 + 素材也在」的情况下，只要球是新建的（冷启动第一次挂载，
+    // 或者被宿主移除后 sSLFloatBtn 这个 __weak 释放、下次重建），它就一直是白的，
+    // 直到用户去设置页把开关拨一下才变绿。
+    //
+    // 只在新建时刷，不进每轮轮询 —— SLVCamArmed() 会走到 [SLVMediaStore allItems]，
+    // 那个方法每次都真的扫一遍沙盒目录再逐个 stat，2 秒一次纯属白烧 IO。
+    if (created) SLVRefreshFloatButton();
 }
 
 // 统一入口：异常不再静默吞掉（限频 30s 一条，避免轮询刷屏）

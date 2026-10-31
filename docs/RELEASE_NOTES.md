@@ -1,3 +1,94 @@
+## 0.3.5 —— 图片/镜像不再发绿；悬浮球不再「明明是绿的却是白的」
+
+### 一、图片素材、开了镜像的视频：白底 + 亮绿人形轮廓
+
+现象：选图片替换摄像头，预览里正常，**一进拍摄界面**整个画面变成白底 + 绿色的人形 / 树枝 / 鞋子轮廓，边缘还带青色描边。开「镜像画面」后用视频素材也一样。
+
+根因不在宿主，在**我们自己把 RGB 渲染成 YUV 的方式**。
+
+先看两条取帧路径的差别：
+
+| 素材 | 怎么拿帧 | 结果 |
+|---|---|---|
+| 视频，不旋转不镜像 | `AVAssetReaderTrackOutput` 直接解码成宿主格式（420f） | 正常 |
+| 视频，开旋转/镜像 | `sl_render:` → `CIContext render:toCVPixelBuffer:` 渲进 420f | **绿** |
+| 图片（任何情况） | `sl_loadStillImage` → 同一句 render 渲进 420f | **绿** |
+
+`CIContext` 默认是 Metal 后端。往 **NV12 双平面**（420v/420f）buffer 上 render 时，
+它把亮度平面写对了、**色度平面写错了** —— 色度里混进了亮度信息。解出来就是：
+平坦区域（白背景）色度接近中性所以看着正常，边缘处色度剧烈跳变 → 亮绿轮廓。
+
+这也解释了为什么「视频一直好、图片一进来就绿」：视频不旋转不镜像时压根不碰 CoreImage。
+
+**修法**：CI 只往 BGRA 渲（它对 BGRA 100% 可靠），转 YUV 交给 Accelerate：
+
+```objc
+// 1) 先渲成 BGRA
+CVPixelBufferCreate(..., kCVPixelFormatType_32BGRA, ..., &bgra);
+[_ciContext render:img toCVPixelBuffer:bgra bounds:... colorSpace:cs];
+
+// 2) 再用 vImage 转成 NV12，平面偏移和 stride 全交给它
+vImageConvert_ARGBToYpCbCr_GenerateConversion(
+    kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2, &range,
+    &info, kvImageARGB8888, kvImage420Yp8_CbCr8, kvImageNoFlags);
+vImageConvert_ARGB8888To420Yp8_CbCr8(&s, &y, &uv, &range, &info, kvImageNoFlags);
+```
+
+三处都改了：图片加载、`sl_render:`（旋转/镜像）、`renderIntoPixelBuffer:`（拍照）。
+
+细节：
+- **range 必须跟着格式走**：420v 用 16-235，420f 用 0-255。写错的话暗部发灰、高光过曝。
+- **BT.709**：苹果相机管线一律 709，不是 601。
+- **宽高取偶数**：420 是 2×2 下采样，奇数尺寸会少一行一列，边缘出现斜纹。
+- **BGRA 的内存布局**在小端机上就是 B,G,R,A，正好对上 `kvImageARGB8888`。
+- 非 NV12 的目标格式（422 / 10bit）退回老路径 —— 可能仍偏色，但不会黑屏。
+
+顺带在 `Makefile` 的 `ShenglinVcam_FRAMEWORKS` 里加了 `Accelerate`（没动 `_FILES`）。
+
+### 二、悬浮球：明明启用了，还是白的
+
+球的颜色只有两个入口：
+
+```objc
+// SLFloatingBall.m
+BOOL working = SLVCamEnabled() && SLVCamArmed();
+SLVFloatState want = working ? SLVFloatStateReady : SLVFloatStateIdle;
+if (btn && btn.slState != want) [btn sl_applyState:want];
+```
+
+调它的地方全项目只有两处：`SLVCamReloadAll()`（拨开关 / 换素材 / 改旋转镜像）和「换悬浮球图标」。
+
+而球的初始状态是写死的：
+
+```objc
+// initWithFrame:
+[self sl_applyState:SLVFloatStateIdle];   // 白
+```
+
+**问题在那个每 2 秒跑一次的轮询 `SLVEnsureFloatButton()` —— 它只负责挂载和迁移窗口，从来没刷过一次状态。**
+
+于是两种情况会卡在白球：
+
+1. **冷启动**：球先建出来（白），此时没人调 `SLVCamReloadAll`。配置里「启用」开着、素材也选好了，球不知道。
+2. **球被宿主移除后重建**：`sSLFloatBtn` 是 `__weak`，抖音摘掉球、对象释放后，下次轮询走 `if (!btn)` 新建一个 —— 又是白的。
+
+修法：在 `SLVEnsureFloatButton()` 创建完球之后补一次刷新。
+
+```objc
+sSLFloatBtn = btn;
+if (created) SLVRefreshFloatButton();   // 新建的球固定是白，必须刷一次
+```
+
+**只在新建时刷**，不放进每轮轮询 —— `SLVCamArmed()` 会走到 `[SLVMediaStore allItems]`，那个方法是真去扫一遍沙盒目录再逐个 stat，没有缓存，2 秒一次纯属白烧 IO。
+
+### 三、素材页
+
+- 点画面进全屏预览撤掉了（点了会跳页，跟「点行切素材」抢操作），只保留播放 / 喇叭按钮
+- 段尾说明全部去掉，footer 高度 28 → 16，只留分组间距
+- 旋转选择框的说明文案也去掉了，标题已经说清
+
+---
+
 ## 0.3.4 —— 竖视频不再被压成邮票；点画面进全屏
 
 ### 一、扇上改旋转，设置页「画面旋转」不跟着动
