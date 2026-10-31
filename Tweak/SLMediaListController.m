@@ -1256,16 +1256,42 @@ static void SLVPresentSettingsWhenFree(UIViewController *host, NSInteger attempt
     SLVMediaItem *it = self.items[ip.row];
     BOOL cur = [[SLVMediaStore currentItem].fileName isEqualToString:it.fileName];
 
-    // 0.3.3：点行 = 切过去 + 在上面播放。「再点一次取消替换」挪到左滑菜单 ——
-    // 同一个点击既要「换片」又要「取消」，两者会打架：点了想预览，结果把替换取消了。
     if (!cur) {
+        // 选新的：切过去 + 在上面播放
         [SLVMediaStore setCurrentItem:it];
         SLVCamReloadAll();          // 顺带发配置变更通知，设置页的摘要会跟着变
         SLVToast(@"已切换");
         [tv reloadData];
+        [self.stage sl_showItem:it autoplay:YES];
+        return;
     }
-    [self.stage sl_showItem:it autoplay:YES];
-    if (cur) [self.stage sl_replay];   // 点已经选中的那行 = 从头再放一遍
+
+    // 0.3.7：点已经选中的那行 = 问要不要取消替换。
+    //
+    // 0.3.3 把「取消」整个挪进了左滑菜单，结果没人找得到 —— 左滑是隐藏操作，
+    // 界面上又没有任何提示（说明文字还按你的要求全删了）。
+    // 现在恢复点行，但**不直接取消**：0.3.3 之前的教训是「点了想预览，
+    // 结果把替换取消了」，所以这里弹一个二次确认，两个意图都能表达。
+    UIAlertController *ac =
+        [UIAlertController alertControllerWithTitle:@"取消替换？"
+                                            message:it.displayName
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"继续预览" style:UIAlertActionStyleCancel
+                                        handler:^(UIAlertAction *a) {
+        (void)a;
+        [ws.stage sl_replay];       // 就在原地从头再放一遍
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消替换" style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *a) {
+        (void)a;
+        [SLVMediaStore setCurrentItem:nil];
+        SLVCamReloadAll();
+        [ws sl_reload];
+        [ws sl_refreshStage];
+        SLVToast(@"已取消");
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
 }
 
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tv

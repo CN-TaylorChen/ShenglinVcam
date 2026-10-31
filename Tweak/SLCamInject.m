@@ -341,6 +341,30 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
                 CMVideoFormatDescriptionRef useFmt = (CMVideoFormatDescriptionRef)fmt;
                 CMVideoFormatDescriptionRef ownFmt = NULL;
                 if (!CMVideoFormatDescriptionMatchesImageBuffer((CMVideoFormatDescriptionRef)fmt, frame)) {
+                    // 0.3.7：把「为什么判不匹配」摊开打出来。
+                    //
+                    // MatchesImageBuffer 只比三项：子类型、尺寸、bytesPerRow。
+                    // 日志里假帧和宿主 fmt 的子类型（BGRA）、尺寸（1080x1920）都一样，
+                    // 那就只可能差在行跨度上 —— 我们的帧是 CVPixelBufferCreate 直出的，
+                    // 宿主的是 pixelBufferPool 分配的，两者对齐策略不一定相同。
+                    if (sSLCamOwnFmtLogged++ == 0) {
+                        CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions((CMVideoFormatDescriptionRef)fmt);
+                        CFTypeRef rbv = CMVideoFormatDescriptionGetExtension((CMVideoFormatDescriptionRef)fmt,
+                                                                            CFSTR("CVBytesPerRow"));
+                        long hostRB = 0;
+                        if (rbv && CFGetTypeID(rbv) == CFNumberGetTypeID()) {
+                            CFNumberGetValue((CFNumberRef)rbv, kCFNumberLongType, &hostRB);
+                        }
+                        size_t frameRB = CVPixelBufferGetBytesPerRow(frame);
+                        size_t realRB = CVPixelBufferGetBytesPerRow(img);
+                        SLVLog(@"注入: 假帧不匹配 · fmt %dx%d %@ 跨度=%ld · 假帧 %zux%zu %@ 跨度=%zu · 真帧跨度=%zu%@",
+                              d.width, d.height, SLVFourCC(CMFormatDescriptionGetMediaSubType(fmt)),
+                              hostRB,
+                              CVPixelBufferGetWidth(frame), CVPixelBufferGetHeight(frame),
+                              SLVFourCC(CVPixelBufferGetPixelFormatType(frame)), frameRB,
+                              realRB,
+                              (hostRB > 0 && (size_t)hostRB != frameRB) ? @" ← 跨度不一致" : @"");
+                    }
                     ownFmt = SLVCamMakeFormatDescription(fmt, frame);
                     if (ownFmt) {
                         useFmt = ownFmt;

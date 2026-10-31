@@ -103,16 +103,18 @@ static BOOL SLVBlitBGRAtoNV12(CVPixelBufferRef src, CVPixelBufferRef dst) {
 
 /// 给自建的 BGRA 帧补上色彩附件。
 ///
-/// 日志里能直接看出差别：解码器给的视频帧带 9 项扩展（YCbCrMatrix /
-/// ColorPrimaries / TransferFunction 都在），我们自建的图片帧只有 2 项
-/// （Version、CVBytesPerRow）。宿主拿不到色彩标注，怎么解释这堆字节就不好说了。
-/// 苹果相机管线一律 BT.709，跟视频帧保持一致。
+/// 日志里能直接看出差别：解码器给的视频帧带 9 项扩展，我们自建的图片帧只有 2 项
+/// （Version、CVBytesPerRow）。
+///
+/// 注意这里**不设 YCbCrMatrix** —— BGRA 是 RGB 格式，没有 YUV 平面，
+/// 给它标一个 BT.709 的 YCbCr 矩阵在语义上是错的，下游万一照这个做 RGB→YUV
+/// 的反向换算，颜色就全歪了。RGB 帧只需要 primaries + transfer function。
 static void SLVTagBGRAFrame(CVPixelBufferRef pb) {
     if (!pb) return;
     NSDictionary *atts = @{
-        (id)kCVImageBufferYCbCrMatrixKey: (id)kCVImageBufferYCbCrMatrix_ITU_R_709_2,
         (id)kCVImageBufferColorPrimariesKey: (id)kCVImageBufferColorPrimaries_ITU_R_709_2,
-        (id)kCVImageBufferTransferFunctionKey: (id)kCVImageBufferTransferFunction_ITU_R_709_2,
+        // sRGB 的伽马，不是 BT.709 的视频伽马（那个约 1.9，会把对比度压扁）
+        (id)kCVImageBufferTransferFunctionKey: CFSTR("IEC_sRGB"),
     };
     CVBufferSetAttachments(pb, (__bridge CFDictionaryRef)atts, kCVAttachmentMode_ShouldPropagate);
 }
