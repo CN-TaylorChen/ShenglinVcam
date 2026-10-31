@@ -135,7 +135,7 @@ static NSString *SLVFanAngleName(NSInteger i) {
     CAShapeLayer *_ringL[5];
     CAShapeLayer *_glowL[5];
     CAShapeLayer *_progL[5];   // 0.3.13：双功能球的按住进度环
-    CAShapeLayer *_badgeDot;   // 0.3.15：循环球内**左上角**的「实拍时刻开着」小圆点
+    // 0.3.16：「实拍时刻开着」的角标整个去掉 —— 球太小，塞哪儿都丑。
     BOOL _on[5];
 
     UIView *_col;
@@ -392,39 +392,11 @@ static NSString *SLVFanAngleName(NSInteger i) {
         _glowL[i] = glow;
         _progL[i] = prog;
 
-        // 0.3.15：实拍时刻开着时，在循环球内的**左上角**点一个小圆点。
+        // 0.3.16：这里原本挂一个「实拍时刻开着」的角标（0.3.13 球内方块 → 0.3.14 球外圆点
+        // → 0.3.15 球内左上圆点），三版都觉得丑，去掉。
         //
-        // 位置一路挪过三版：
-        //   0.3.13  15pt 方块画在球内 (25,25) → 压图标
-        //   0.3.14  挪到球外右下 +20          → 飘着，更丑
-        //   0.3.15  球内左上 (-12.5,-12.5)    → 贴边、不压、不飘
-        //
-        // 位置：球心往**左上** 12.5pt，半径 4.5，白色 1.2 描边。
-        //
-        // 为什么左上这一档刚好：
-        //   球心到点心 = 12.5×√2 ≈ 17.7，点半径 4.5
-        //   → 点内沿离球心 13.2，图标半径只有 10  → 不压图标
-        //   → 点外沿离球心 22.2，球半径 22        → 正好贴边，不飘
-        //   → 进度环在 24±1.25，点外沿 22.2 还差 0.5 才碰到 → 不打架
-        // 左上还有个好处：标签列在球右边，左边是空的，不会挤。
-        if (i == SLVFanSwitchLoop) {
-            CGPoint dc = CGPointMake(SLV_FAN_BALL_R - 12.5, SLV_FAN_BALL_R - 12.5);
-
-            CAShapeLayer *dot = [CAShapeLayer layer];
-            dot.frame = b.bounds;
-            dot.path = [UIBezierPath bezierPathWithArcCenter:dc
-                                                      radius:4.5
-                                                  startAngle:0
-                                                    endAngle:M_PI * 2.0
-                                                   clockwise:YES].CGPath;
-            dot.fillColor = [self sl_accent].CGColor;
-            dot.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.95].CGColor;
-            dot.lineWidth = 1.2;
-            dot.hidden = YES;
-            [b.layer addSublayer:dot];
-
-            _badgeDot = dot;
-        }
+        // 状态靠「长按循环球时图标变不变」+ toast + 震动来确认，不再常驻标识。
+        // 球只有 44pt，图标占掉中间 20pt，剩下的环带太窄，硬塞东西怎么放都别扭。
     }
 
     // 旋转球外圈：暗底环 + 实弧 + 端点圆点
@@ -625,11 +597,6 @@ static NSString *SLVFanAngleName(NSInteger i) {
     _tintV[i].alpha = on ? 0.20 : 0.0;
     _iconV[i].tintColor = on ? accent : [UIColor colorWithWhite:0.55 alpha:1.0];
     _ringL[i].strokeColor = on ? [accent colorWithAlphaComponent:0.9].CGColor : nil;
-
-    // 0.3.15：实拍时刻开着 → 循环球内左上角亮一个小圆点
-    if (i == SLVFanSwitchLoop && _badgeDot) {
-        _badgeDot.hidden = !SLVFanBool(kSLCamSquareCropKey, NO);
-    }
 }
 
 - (void)sl_refreshArc {
@@ -1066,7 +1033,7 @@ void SLVFanToggleSquareCrop(void) {
     BOOL on = !SLVFanBool(kSLCamSquareCropKey, NO);
     SLVFanSetBool(kSLCamSquareCropKey, on);
     SLVCamReloadAll();
-    // 0.3.15：文案砍到最短。这时候手上已经有中震 + 图标切换 + 成功震三重反馈了，
-    // toast 只负责确认「现在是开还是关」，不需要再解释「不放大 / 铺满」。
-    SLVToast(on ? @"不放大 开" : @"不放大 关");
+    // 0.3.16：文案改回「实拍时刻：开 / 关」。
+    // 0.3.15 那版写成「不放大 开」，省略了主语，看着一头雾水 —— 短不是目的，看得懂才是。
+    SLVToast(on ? @"实拍时刻：开" : @"实拍时刻：关");
 }

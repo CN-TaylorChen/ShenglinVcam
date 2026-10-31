@@ -20,7 +20,7 @@
 #import "SLTarget.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.15"
+#define SLVVersion @"0.3.16"
 
 /// 设置页「运行日志」那行右侧的钩子状态（SLVLogViewController.h 里声明的）
 NSString *SLVHookStatusSummary(void) {
