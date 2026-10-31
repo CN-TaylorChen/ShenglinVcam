@@ -113,8 +113,10 @@ static void SLVTagBGRAFrame(CVPixelBufferRef pb) {
     if (!pb) return;
     NSDictionary *atts = @{
         (id)kCVImageBufferColorPrimariesKey: (id)kCVImageBufferColorPrimaries_ITU_R_709_2,
-        // sRGB 的伽马，不是 BT.709 的视频伽马（那个约 1.9，会把对比度压扁）
-        (id)kCVImageBufferTransferFunctionKey: CFSTR("IEC_sRGB"),
+        // sRGB 的伽马，不是 BT.709 的视频伽马（那个约 1.9，会把对比度压扁）。
+        // 用 NSString 字面量而不是 CFSTR：CFString 和 NSString 是 toll-free bridged，
+        // 但 CFSTR 展开成 CFStringRef，塞进 NSDictionary 字面量会报「不是 ObjC 对象」。
+        (id)kCVImageBufferTransferFunctionKey: @"IEC_sRGB",
     };
     CVBufferSetAttachments(pb, (__bridge CFDictionaryRef)atts, kCVAttachmentMode_ShouldPropagate);
 }
