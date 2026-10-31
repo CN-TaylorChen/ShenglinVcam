@@ -101,6 +101,47 @@ static BOOL SLVBlitBGRAtoNV12(CVPixelBufferRef src, CVPixelBufferRef dst) {
     return ok;
 }
 
+/// 给自建的 BGRA 帧补上色彩附件。
+///
+/// 日志里能直接看出差别：解码器给的视频帧带 9 项扩展（YCbCrMatrix /
+/// ColorPrimaries / TransferFunction 都在），我们自建的图片帧只有 2 项
+/// （Version、CVBytesPerRow）。宿主拿不到色彩标注，怎么解释这堆字节就不好说了。
+/// 苹果相机管线一律 BT.709，跟视频帧保持一致。
+static void SLVTagBGRAFrame(CVPixelBufferRef pb) {
+    if (!pb) return;
+    NSDictionary *atts = @{
+        (id)kCVImageBufferYCbCrMatrixKey: (id)kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+        (id)kCVImageBufferColorPrimariesKey: (id)kCVImageBufferColorPrimaries_ITU_R_709_2,
+        (id)kCVImageBufferTransferFunctionKey: (id)kCVImageBufferTransferFunction_ITU_R_709_2,
+    };
+    CVBufferSetAttachments(pb, (__bridge CFDictionaryRef)atts, kCVAttachmentMode_ShouldPropagate);
+}
+
+/// 把一帧中心像素的 BGRA 打出来。
+///
+/// 这是为了分清「我们渲错了」和「宿主解释错了」：
+///   · 中心像素是正常的白 / 正常颜色 → 帧本身没问题，绿是下游解释出来的
+///   · 中心像素就已经是绿的值（G 高、R/B 低）→ CI 渲染这一步就错了
+static void SLVLogCenterPixel(CVPixelBufferRef pb, NSString *tag) {
+    if (!pb) return;
+    OSType pf = CVPixelBufferGetPixelFormatType(pb);
+    size_t w = CVPixelBufferGetWidth(pb);
+    size_t h = CVPixelBufferGetHeight(pb);
+    if (pf != kCVPixelFormatType_32BGRA || w < 2 || h < 2) {
+        SLVLog(@"%@ 中心像素跳过（pf=%u %zux%zu）", tag, (unsigned)pf, w, h);
+        return;
+    }
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
+    size_t rb = CVPixelBufferGetBytesPerRow(pb);
+    if (base) {
+        uint8_t *p = base + (h / 2) * rb + (w / 2) * 4;
+        SLVLog(@"%@ 中心像素 B=%u G=%u R=%u A=%u（%zux%zu）",
+               tag, p[0], p[1], p[2], p[3], w, h);
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+}
+
 /// 把一张 BGRA 的 CVPixelBuffer 转成新建的 420v / 420f 双平面。
 /// 失败返回 NULL。目标格式不是 NV12 时也返回 NULL。
 static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt) {
@@ -229,7 +270,17 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     if ((self = [super init])) {
         _lock = [NSLock new];
         _audioPCM = [NSMutableData data];
-        _ciContext = [CIContext contextWithOptions:nil];
+        // 0.3.6：整个 CIContext 改成 CPU 渲染。
+        //
+        // 日志证明宿主抖音要的是 BGRA（pf=1111970369），所以绿屏跟 YUV 无关 ——
+        // 问题出在「Metal 版 CIContext 渲染进我们自己造的 CVPixelBuffer」这一步。
+        // 视频帧是解码器分配的（自带 Metal 兼容 + 完整色彩附件）一直正常，
+        // 图片帧和镜像帧是我们自己建 buffer 再渲，就绿了。
+        //
+        // 图片只渲一次、镜像/拍照是低频，CPU 渲染慢几十毫秒完全能接受，
+        // 但它是软件直接写内存，不依赖 Metal 兼容性，结果一定对。
+        // 不旋转不镜像的视频走解码器直出，压根不经过这里，性能不受影响。
+        _ciContext = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @YES }];
         _loopEnabled = YES;
         _mirrorEnabled = NO;
         _rotation = 0;
@@ -375,11 +426,15 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     CIImage *scaled = [self sl_image:img toWidth:w height:h mirror:NO rotation:0];
     if (!scaled) return;
 
-    // 0.3.5：先渲染成 BGRA，再按目标格式转。
+    // 0.3.6：用 CPU 渲染，并给帧补上色彩附件。
     //
-    // 原来直接把图往 pf 上渲染 —— 宿主给的是 420f/420v 时，Metal 版 CIContext
-    // 写出来的色度平面是错的，画面上就是「白底 + 亮绿人形轮廓」。
-    // BGRA 是 CI 最可靠的输出格式，转 YUV 交给 vImage，平面偏移和 stride 它自己算。
+    // 日志（12:10:34）证明宿主抖音要的是 **BGRA**（pf=1111970369），不是 420f ——
+    // 所以 0.3.5 那条 vImage 转换对图片路径根本没执行，绿屏跟 YUV 毫无关系。
+    //
+    // 真正可疑的是「Metal 版 CIContext 渲染进我们自己 CVPixelBufferCreate 的 buffer」。
+    // 视频帧是解码器分配的，自带 Metal 兼容 + 完整色彩附件，一直正常；
+    // 图片帧是我们造的（只有 IOSurfaceProperties），渲出来就不对。
+    // 图片只渲一次，直接走 CPU 最稳，顺便把色彩附件补齐。
     NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
     CVPixelBufferRef bgra = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
@@ -389,8 +444,10 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     [_ciContext render:scaled toCVPixelBuffer:bgra
-                bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h) colorSpace:cs];
+                       bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h) colorSpace:cs];
     CGColorSpaceRelease(cs);
+    SLVTagBGRAFrame(bgra);
+    SLVLogCenterPixel(bgra, @"feed 图片渲染");
 
     CVPixelBufferRef pb = NULL;
     if (pf == kCVPixelFormatType_32BGRA) {
@@ -405,10 +462,11 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
                                     (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess) return;
             CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
             [_ciContext render:scaled toCVPixelBuffer:pb
-                        bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h) colorSpace:cs2];
+                               bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h) colorSpace:cs2];
             CGColorSpaceRelease(cs2);
         }
     }
+    SLVLogCenterPixel(pb, @"feed 图片出帧");
 
     BOOL stale = NO;
     [_lock lock];
