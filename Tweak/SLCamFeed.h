@@ -6,8 +6,8 @@
 //  不碰 UI、不碰 hook，只管解码、循环、缩放、格式对齐。
 //
 //  调用顺序（注入层负责）：
-//    第一次拿到真帧 → 把它的像素格式和尺寸喂给 copyFrameForPixelFormat:size:
-//    → 本类据此重建解码管线 → 之后每帧都返回同格式的假画面。
+//    第一次拿到真帧 → 把宿主那个 buffer 交给 copyFrameForHostBuffer:
+//    → 本类据此重建解码管线，并把素材原地写进宿主的 buffer → 之后每帧都一样。
 //
 
 #import <Foundation/Foundation.h>
@@ -42,18 +42,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// 取下一帧（原始尺寸）。返回 +1 的 buffer，调用方负责 CFRelease；没有可用帧返回 NULL。
 - (nullable CVPixelBufferRef)copyNextFrame CF_RETURNS_RETAINED;
 
-/// 按宿主真实帧的像素格式和尺寸取一帧。返回 +1，调用方 CFRelease。
-///
-/// 第一次被调用（或宿主换了相机 / 分辨率导致格式变化）时会记下目标格式并重建
-/// 解码管线，**这一帧返回 NULL**，注入层据此放行真帧。宁可漏一两帧真画面，
-/// 也不要在采集线程上阻塞等解码 —— 那是黑屏和掉帧的根源。
-///
-/// 注意：这是**预览**用的，它自己造 buffer。注入层不要用它，用下面那个。
-- (nullable CVPixelBufferRef)copyFrameForPixelFormat:(OSType)pixelFormat
-                                                size:(CGSize)size
-    CF_RETURNS_RETAINED;
-
-/// 注入专用（0.3.8）：把宿主**自己的**真帧 buffer 交进来，返回一帧可以直接交给宿主的画面。
+/// 注入专用：把宿主**自己的**真帧 buffer 交进来，返回一帧可以直接交给宿主的画面。
 ///
 /// 关键点是**不再自己造 buffer**。三轮日志已经证明：子类型、尺寸、行跨度全都一致，
 /// 宿主那边照样是绿的 —— 差别只剩「buffer 是谁造的」。真帧是摄像头采集的 IOSurface，
@@ -71,7 +60,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// 拍照专用：按当前「旋转 / 镜像」设置摆好，但**不重建解码管线**地取一帧。
 ///
-/// 为什么不能直接用 copyFrameForPixelFormat:size:：那个方法会记下目标格式并让
+/// 为什么不能直接用 copyFrameForHostBuffer:：那个方法会记下目标格式并让
 /// 解码线程按它重建管线。拍一张照片就把预览管线换掉，代价是紧接着的几帧预览
 /// 取不到数据（返回 NULL → 放行真画面），画面上会闪一下真实摄像头。
 ///

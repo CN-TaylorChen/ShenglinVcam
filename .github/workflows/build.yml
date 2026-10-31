@@ -32,6 +32,25 @@ jobs:
           set -o pipefail
           make 2>&1 | tee build.log
 
+      # dylib 交给系统时得带一张「身份证」。Theos 链接出来的只是占位空章
+      # （CodeDirectory.flags = 0x0，缺 CS_ADHOC），大部分越狱环境不查这个，
+      # 但确实存在会查的环境 —— 那种情况下表现是「装上了、也启用了，却完全没效果」，
+      # 而且不报错不崩溃，极难定位。
+      #
+      # codesign 是 macOS 自带的，不用额外装 ldid；ad-hoc 签名不需要证书。
+      # 必须放在打包 deb 之前，否则 deb 里装的还是没签的那个。
+      - name: Ad-hoc sign dylib
+        run: |
+          set -e
+          codesign --force --sign - ShenglinVcam.dylib
+          echo "--- 签名结果 ---"
+          codesign -dv --verbose=4 ShenglinVcam.dylib 2>&1 | sed -n '1,12p'
+          # 自检：没签成 adhoc 就让 CI 挂掉，别把签不上的包发出去
+          if ! codesign -dv --verbose=4 ShenglinVcam.dylib 2>&1 | grep -qi "adhoc"; then
+            echo "::error::dylib 没有签成 adhoc"
+            exit 1
+          fi
+
       # 失败时把日志回传到 commit comment —— Actions 日志接口要鉴权，
       # 公开可读的 commit comment 是唯一能匿名取到的通道
       - name: Report build log on failure

@@ -447,8 +447,8 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
 
 // 把一张图片变成一帧 CVPixelBuffer，塞进 _latestVideo。
 //
-// 只做一次。之后所有出图路径（预览的 copyFrameForPixelFormat:、拍照的
-// copyOrientedFrameForPixelFormat:、抖音的 renderIntoPixelBuffer:）读的都是
+// 只做一次。之后所有出图路径（注入的 copyFrameForHostBuffer:、拍照的
+// copyOrientedFrameForPixelFormat: / renderIntoPixelBuffer:）读的都是
 // 这同一个 buffer，缩放 / 旋转 / 镜像全由它们原有的逻辑处理，这里不用重复实现。
 - (void)sl_loadStillImage {
     NSString *path = nil;
@@ -479,8 +479,8 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     CGRect ext = img.extent;
     if (ext.size.width < 1 || ext.size.height < 1) return;
 
-    // 目标尺寸：宿主已经告诉我们格式就按它来（这样 copyFrameForPixelFormat:
-    // 能走零转换直出），还没告诉就按原图（长边封顶 2048）。
+    // 目标尺寸：宿主已经告诉我们格式就按它来（这样注入时能直接 memcpy
+    // 进宿主的 buffer），还没告诉就按原图（长边封顶 2048）。
     OSType pf = kCVPixelFormatType_32BGRA;
     size_t w = 0, h = 0;
     if (key.length) {
@@ -600,7 +600,7 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
                 skey = _stillKey;
                 [_lock unlock];
                 // 宿主换了分辨率 / 像素格式 → 这张图得按新目标重渲一次，
-                // 否则 copyFrameForPixelFormat: 每帧都要现场做一次 CI 缩放，
+                // 否则注入时每帧都要现场做一次 CI 缩放，
                 // 30fps 下等于白烧一整个核。
                 BOOL same = (skey == nil && key == nil) || [skey isEqualToString:key];
                 if (!loaded || !same) [self sl_loadStillImage];
@@ -932,46 +932,6 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     return pb;
 }
 
-- (CVPixelBufferRef)copyFrameForPixelFormat:(OSType)pixelFormat size:(CGSize)size {
-    if (pixelFormat == 0 || size.width < 1 || size.height < 1) return NULL;
-    size_t w = (size_t)size.width;
-    size_t h = (size_t)size.height;
-
-    NSString *key = [NSString stringWithFormat:@"%u:%zux%zu", (unsigned)pixelFormat, w, h];
-    [_lock lock];
-    BOOL changed = ![_pipelineKey isEqualToString:key];
-    if (changed) { _pipelineKey = key; _reconfigRequested = YES; }
-    BOOL hasFrame = (_latestVideo != NULL);
-    [_lock unlock];
-
-    // 目标格式刚变、手里还没有任何帧：放行这一帧真画面，让解码线程按新格式重建
-    if (changed && !hasFrame) return NULL;
-
-    [_lock lock];
-    CVPixelBufferRef pb = _latestVideo ? (CVPixelBufferRef)CVPixelBufferRetain(_latestVideo) : NULL;
-    [_lock unlock];
-    if (!pb) return NULL;
-
-    size_t sw = CVPixelBufferGetWidth(pb);
-    size_t sh = CVPixelBufferGetHeight(pb);
-    OSType spf = CVPixelBufferGetPixelFormatType(pb);
-    NSInteger rot = [self sl_normalizedRotation];
-
-    // 尺寸、格式都对上、又没开镜像/旋转，才能零转换直出
-    if (sw == w && sh == h && spf == pixelFormat && !self.mirrorEnabled && rot == 0) {
-        return pb;
-    }
-
-    CVPixelBufferRef out = [self sl_render:pb
-                                   toWidth:w
-                                    height:h
-                                    format:pixelFormat
-                                    mirror:self.mirrorEnabled
-                                  rotation:rot];
-    CVPixelBufferRelease(pb);
-    return out;
-}
-
 // 注入专用（0.3.8）：把宿主**自己的**真帧 buffer 交进来，返回一帧能直接交给宿主的画面。
 //
 // 为什么不再自己造 buffer —— 三轮日志把这个方向堵死了：
@@ -1080,7 +1040,7 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     return 0;
 }
 
-// 拍照专用出帧。跟 copyFrameForPixelFormat:size: 的区别只有一点：
+// 拍照专用出帧。跟 copyFrameForHostBuffer: 的区别只有一点：
 // **不动 _pipelineKey / _reconfigRequested**，所以预览管线一根手指都不碰。
 //
 // 代价是每次拍照都要现场做一次 CI 渲染（约十几毫秒），但拍照是低频操作，

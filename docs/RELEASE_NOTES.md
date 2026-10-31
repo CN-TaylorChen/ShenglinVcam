@@ -1,3 +1,40 @@
+## 0.3.9 —— 收尾：绿屏确认已修，清理死代码，dylib 补真签名
+
+0.3.8 装上后绿屏消失，日志里 `注入: 假帧不匹配` 那一行也不再出现（0.3.7 每次必打）。
+功能层面这一版**没有任何变化**，只是收拾一下。
+
+### 一、删掉一个没人用的旧函数
+
+`copyFrameForPixelFormat:size:` —— 0.3.8 起注入改走 `copyFrameForHostBuffer:`，
+它就没有任何调用方了。留着只会让以后看代码的人多一个「这玩意儿还用不用」的疑问。
+
+### 二、dylib 补 ad-hoc 签名
+
+Theos 链接出来的 dylib 只带一张**占位空章**（`CodeDirectory.flags = 0x0`，缺 `CS_ADHOC`），
+不是真签名。绝大多数越狱环境不查这个，但确实存在会查的环境 —— 那种情况下表现是
+**装上了、也启用了，却完全没效果**，而且不报错不崩溃，极难定位。
+
+现在 CI 在编译完、打包前用 `codesign --force --sign -` 补一个 ad-hoc 签名（macOS 自带，
+不需要证书也不需要装 ldid），签完还会自检：**没签成 adhoc 就让 CI 直接挂掉**，
+不会把签不上的包发出去。
+
+### 三、顺便解释一下日志里那行「跳过 N 个方法」
+
+```
+注入: 跳过 7 个方法（签名不是单指针参数，挂了会丢参）: -[AVCaptureVideoDataOutput setSampleBufferDelegate:queue:], ...
+```
+
+这 7 个是**故意不挂**的，不是没找到：
+
+- `setSampleBufferDelegate:queue:` 有两个参数，`getTransformedDetectedObjectsInfoFromSampleBuffer:connection:` 也是
+- `sampleBufferDelegate` / `sampleBufferCallbackQueue` 是 getter，没有参数
+
+我们的 hook 只接「self + _cmd + 一个指针参数」的方法。多参数方法硬挂会把参数丢掉，
+宿主直接崩；getter 挂了也没有任何意义。所以它们被列出来是为了证明「看过、确认不该挂」，
+而不是失败。这行只在启动时打一次，平时不用管。
+
+---
+
 ## 0.3.8 —— 绿屏：不再自己造 buffer，改成原地改写宿主那一帧
 
 ### 一、绿屏：前三轮全猜错了，这次换了方向
