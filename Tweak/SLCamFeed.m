@@ -1161,9 +1161,9 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     return dst;
 }
 
-/// 陌陌（com.wemomo.momoappdemo1）的「实拍时刻」窗口只显示整帧中间那块，
-/// 上下各约 47% 被裁在窗口外。我们按整帧铺满，等于让素材先被放大一遍、
-/// 再被它裁一遍 —— 方图放大 1.78 倍，全身直接出画。
+/// 陌陌（国内版 com.immomo.momo / com.wemomo.momoappdemo1）的「实拍时刻」
+/// 窗口只显示整帧中间那块，上下各约 47% 被裁在窗口外。我们按整帧铺满，
+/// 等于让素材先被放大一遍、再被它裁一遍 —— 方图放大 1.78 倍，全身直接出画。
 ///
 /// 0.3.11：这个进程里把 aspect-fill 的参考框从「整帧」收成「中间那个正方形」，
 /// 只裁一刀。9:16 素材算出来的倍数仍是 1.0，行为完全不变；其它 App 走原逻辑。
@@ -1172,8 +1172,9 @@ static BOOL SLVSquareCropWindow(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        square = [bid isEqualToString:@"com.wemomo.momoappdemo1"];
-        if (square) SLVLog(@"feed 陌陌实拍时刻：按中间正方形裁切，不放大");
+        square = [bid isEqualToString:@"com.immomo.momo"]              // 国内版
+              || [bid isEqualToString:@"com.wemomo.momoappdemo1"];     // 海外 / 测试包
+        if (square) SLVLog(@"feed 陌陌实拍时刻（%@）：按中间正方形裁切，不放大", bid);
     });
     return square;
 }

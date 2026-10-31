@@ -47,8 +47,13 @@ CGFloat s = MAX(rw / 素材宽, rh / 素材高);
 
 ### 影响范围
 
-**只有陌陌**（`com.wemomo.momoappdemo1`）。判断在 `SLVSquareCropWindow()` 里，
-抖音、QQ、微信、系统相机全部走原来的逻辑，行为零变化。
+**只有陌陌**，两个包名都覆盖：
+
+- `com.immomo.momo` —— 国内版
+- `com.wemomo.momoappdemo1` —— 海外 / 测试包
+
+判断在 `SLVSquareCropWindow()` 里，抖音、QQ、微信、系统相机全部走原来的逻辑，
+行为零变化。
 
 图片和视频**都生效** —— 两者共用 `sl_image:` 这一份数学（图片加载时过一遍、
 视频解码时每帧过一遍），所以改一处两边一起变。
