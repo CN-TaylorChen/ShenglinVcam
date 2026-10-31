@@ -83,12 +83,15 @@ static BOOL SLVBlitBGRAtoNV12(CVPixelBufferRef src, CVPixelBufferRef dst) {
         vImage_ARGBToYpCbCr info;
         // 苹果相机管线一律 BT.709；BGRA 在小端机上的内存布局就是 B,G,R,A，
         // 正好对上 kvImageARGB8888。
+        // 注意 range 是在 GenerateConversion 里用掉的，转换函数本身不吃它 ——
+        // 第 5 个参数是 permuteMap（通道重排表），不重排就是 0,1,2,3。
+        const uint8_t permute[4] = { 0, 1, 2, 3 };
         if (vImageConvert_ARGBToYpCbCr_GenerateConversion(
                 kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2, &range,
                 &info, kvImageARGB8888, kvImage420Yp8_CbCr8, kvImageNoFlags) != kvImageNoError) {
             ok = NO;
         } else if (vImageConvert_ARGB8888To420Yp8_CbCr8(
-                       &s, &y, &uv, &range, &info, kvImageNoFlags) != kvImageNoError) {
+                       &s, &y, &uv, &info, permute, kvImageNoFlags) != kvImageNoError) {
             ok = NO;
         }
     }
