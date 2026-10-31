@@ -349,8 +349,8 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
                     // 宿主的是 pixelBufferPool 分配的，两者对齐策略不一定相同。
                     if (sSLCamOwnFmtLogged++ == 0) {
                         CMVideoDimensions d = CMVideoFormatDescriptionGetDimensions((CMVideoFormatDescriptionRef)fmt);
-                        CFTypeRef rbv = CMVideoFormatDescriptionGetExtension((CMVideoFormatDescriptionRef)fmt,
-                                                                            CFSTR("CVBytesPerRow"));
+                        CFTypeRef rbv = CMFormatDescriptionGetExtension((CMFormatDescriptionRef)fmt,
+                                                                        CFSTR("CVBytesPerRow"));
                         long hostRB = 0;
                         if (rbv && CFGetTypeID(rbv) == CFNumberGetTypeID()) {
                             CFNumberGetValue((CFNumberRef)rbv, kCFNumberLongType, &hostRB);
