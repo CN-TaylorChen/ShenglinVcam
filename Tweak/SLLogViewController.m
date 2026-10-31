@@ -112,6 +112,13 @@
     [self sl_reload];
 }
 
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // 状态是实时变的（去开一下相机，待命就变替换中），回到这一页要重新取一次。
+    // 只刷状态卡、不重读日志正文 —— 否则滚动位置会被顶回底部。
+    [self sl_refreshStatus];
+}
+
 - (void)sl_toggleStatus {
     self.statusExpanded = !self.statusExpanded;
     self.statusDetail.hidden = !self.statusExpanded;
@@ -125,29 +132,40 @@
 - (void)sl_updateStatusLabel {
     NSString *arrow = self.statusExpanded ? @"▾" : @"▸";
     NSString *hint = self.statusExpanded ? @"轻点收起" : @"轻点展开";
+    NSString *state = SLVHookStateShort();
     if (self.hookCount > 0) {
-        self.statusLabel.text = [NSString stringWithFormat:@"%@ 已装钩子 %ld 个（%@）", arrow, (long)self.hookCount, hint];
+        self.statusLabel.text = [NSString stringWithFormat:@"%@ 已装钩子 %ld 个 · %@（%@）",
+                                 arrow, (long)self.hookCount, state, hint];
     } else {
-        self.statusLabel.text = [NSString stringWithFormat:@"%@ 未装上钩子（%@）", arrow, hint];
+        // 0 个有两种情况（根本没装上 / 装上了但一个都没命中），靠 state 区分，
+        // 不再像以前那样一律说「未装上」。
+        self.statusLabel.text = [NSString stringWithFormat:@"%@ %@（%@）", arrow, state, hint];
     }
 }
 
-- (void)sl_reload {
+// 只刷状态卡，不碰日志正文。
+//
+// 0.3.10：原来这里靠解析 SLVHookStatusSummary() 的字符串数个数 —— 找「已装钩子：」
+// 前缀、再按两个空格切分。那个格式早就不存在了（现在返回「替换中 · N 个方法」），
+// 前缀永远对不上，于是数量恒为 0，标题行永远显示「未装上钩子」，
+// 跟展开后写着的「替换中 · 2 个方法」自相矛盾。
+// 现在直接问 SLVHookCount() 要数字，不再猜字符串。
+- (void)sl_refreshStatus {
     NSString *summary = @"没有装上任何钩子（类名/方法签名不匹配，把日志发给开发者）";
     @try { NSString *s = SLVHookStatusSummary(); if (s.length) summary = s; } @catch (NSException *e) { }
     self.fullSummary = summary;
 
     NSInteger n = 0;
-    NSString *body = summary;
-    if ([summary hasPrefix:@"已装钩子："]) {
-        body = [summary substringFromIndex:@"已装钩子：".length];
-        if (body.length > 0) n = (NSInteger)[[body componentsSeparatedByString:@"  "] count];
-    }
+    @try { n = SLVHookCount(); } @catch (NSException *e) { n = 0; }
     self.hookCount = n;
 
     self.statusDetail.text = [NSString stringWithFormat:@"%@\n\n文件：%@",
-                              body.length ? body : @"(无)", [SLVLog filePath] ?: @"(不可写)"];
+                              summary.length ? summary : @"(无)", [SLVLog filePath] ?: @"(不可写)"];
     [self sl_updateStatusLabel];
+}
+
+- (void)sl_reload {
+    [self sl_refreshStatus];
 
     self.tv.text = [SLVLog tailLines:400] ?: @"(暂无日志)";
     if (self.tv.text.length > 1) {

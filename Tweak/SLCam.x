@@ -20,7 +20,7 @@
 #import "SLTarget.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.9"
+#define SLVVersion @"0.3.10"
 
 /// 设置页「运行日志」那行右侧的钩子状态（SLVLogViewController.h 里声明的）
 NSString *SLVHookStatusSummary(void) {
@@ -29,6 +29,19 @@ NSString *SLVHookStatusSummary(void) {
     if (n <= 0) return @"未命中";
     if (SLVCamInjecting()) return [NSString stringWithFormat:@"替换中 · %d 个方法", n];
     return [NSString stringWithFormat:@"待命 · %d 个方法", n];
+}
+
+/// 日志页状态卡用：直接给数字，不让界面去猜字符串
+NSInteger SLVHookCount(void) {
+    if (!SLVCamHooksInstalled()) return 0;
+    return (NSInteger)SLVCamHookCount();
+}
+
+/// 日志页状态卡用：短状态词
+NSString *SLVHookStateShort(void) {
+    if (!SLVCamHooksInstalled()) return @"未装上";
+    if (SLVCamHookCount() <= 0) return @"未命中";
+    return SLVCamInjecting() ? @"替换中" : @"待命";
 }
 
 %ctor {
