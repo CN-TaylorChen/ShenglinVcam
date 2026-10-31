@@ -84,14 +84,28 @@ static UIImage *SLVFanIcon(NSInteger idx) {
     return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
 }
 
-/// 「启用」球被停住之后换成这个 —— 图标从电源变成播放，一眼看出松手会去预览
-static UIImage *SLVFanPreviewIcon(void) {
+/// 「启用」球被按住之后换成这个 —— 从电源变成网格，一眼看出松手会进素材库
+static UIImage *SLVFanLibraryIcon(void) {
     UIImageSymbolConfiguration *cfg =
         [UIImageSymbolConfiguration configurationWithPointSize:SLV_FAN_ICON_PT
                                                         weight:UIImageSymbolWeightSemibold];
-    UIImage *img = [UIImage systemImageNamed:@"play.rectangle.fill" withConfiguration:cfg];
-    if (!img) img = [UIImage systemImageNamed:@"play.fill" withConfiguration:cfg];
-    if (!img) img = [UIImage systemImageNamed:@"play.circle.fill" withConfiguration:cfg];
+    UIImage *img = [UIImage systemImageNamed:@"square.grid.2x2" withConfiguration:cfg];
+    if (!img) img = [UIImage systemImageNamed:@"rectangle.grid.2x2.fill" withConfiguration:cfg];
+    if (!img) img = [UIImage systemImageNamed:@"photo.on.rectangle" withConfiguration:cfg];
+    return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+}
+
+/// 「循环」球被按住之后换成这个 —— 中间一块的方框 = 只留正中、不放大
+static UIImage *SLVFanSquareCropIcon(void) {
+    UIImageSymbolConfiguration *cfg =
+        [UIImageSymbolConfiguration configurationWithPointSize:SLV_FAN_ICON_PT
+                                                        weight:UIImageSymbolWeightSemibold];
+    UIImage *img = nil;
+    if (@available(iOS 16.0, *)) {
+        img = [UIImage systemImageNamed:@"rectangle.center.inset.filled" withConfiguration:cfg];
+    }
+    if (!img) img = [UIImage systemImageNamed:@"square.dashed" withConfiguration:cfg];
+    if (!img) img = [UIImage systemImageNamed:@"crop" withConfiguration:cfg];
     return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
 }
 
@@ -120,6 +134,9 @@ static NSString *SLVFanAngleName(NSInteger i) {
     UIImageView *_iconV[5];
     CAShapeLayer *_ringL[5];
     CAShapeLayer *_glowL[5];
+    CAShapeLayer *_progL[5];   // 0.3.13：双功能球的按住进度环
+    CAShapeLayer *_badgeBg;    // 0.3.13：循环球右下角「实拍时刻开着」的角标
+    CAShapeLayer *_badgeFg;
     BOOL _on[5];
 
     UIView *_col;
@@ -141,11 +158,11 @@ static NSString *SLVFanAngleName(NSInteger i) {
     CGFloat _arcProgress;
     NSInteger _shownAngle;
 
-    // 0.2.22：停在「启用」球上不动 = 预览素材。
+    // 0.3.13：双功能球。停在「启用」上不动 = 进素材库，停在「循环」上不动 = 切实拍时刻。
     // 扇的交互本来就是「按下 → 滑到某个球 → 松手提交」，没有单击，
-    // 所以只能靠「停留时长」区分：滑过去就松手 = 切开关，停住不走 = 预览。
-    BOOL _previewArmed;
-    BOOL _previewPending;
+    // 所以只能靠「停留时长」区分：滑过去就松手 = 切开关，停住不走 = 第二功能。
+    NSInteger _armedSwitch;    // 已经切成第二功能的球，-1 = 没有
+    NSInteger _armToken;       // 递增令牌：换了球之后旧的计时回调自己作废
 }
 
 #pragma mark 构建
@@ -340,12 +357,60 @@ static NSString *SLVFanAngleName(NSInteger i) {
         glow.opacity = 0.0;
         [b.layer addSublayer:glow];
 
+        // 0.3.13：双功能球的「按住进度环」。画在球外沿一圈，strokeEnd 从 0 走到 1。
+        // 只有「启用」「循环」两个球会用到，其余球的层常驻隐藏，不占视觉。
+        CAShapeLayer *prog = [CAShapeLayer layer];
+        prog.frame = b.bounds;
+        prog.path = [UIBezierPath bezierPathWithArcCenter:CGPointMake(SLV_FAN_BALL_R, SLV_FAN_BALL_R)
+                                                   radius:SLV_FAN_BALL_R + 2.0
+                                               startAngle:-M_PI_2
+                                                 endAngle:M_PI_2 * 3.0
+                                                clockwise:YES].CGPath;
+        prog.fillColor = nil;
+        prog.strokeColor = [self sl_accent].CGColor;
+        prog.lineWidth = 2.5;
+        prog.lineCap = kCALineCapRound;
+        prog.strokeEnd = 0.0;
+        prog.hidden = YES;
+        [b.layer addSublayer:prog];
+
         [self addSubview:b];
         _ball[i] = b;
         _tintV[i] = tint;
         _iconV[i] = iv;
         _ringL[i] = ring;
         _glowL[i] = glow;
+        _progL[i] = prog;
+
+        // 0.3.13：实拍时刻开着时，循环球右下角挂一个圆角小方块。
+        // 不挂的话，松手后球恢复循环图标，用户看不出实拍时刻现在是开还是关。
+        // 44pt 的球上角标只有 16pt —— 用实心块而不是虚线描边，缩小后还认得出。
+        if (i == SLVFanSwitchLoop) {
+            CGRect br = CGRectMake(SLV_FAN_BALL_SIDE - 19.0, SLV_FAN_BALL_SIDE - 19.0,
+                                   15.0, 15.0);
+
+            CAShapeLayer *bg = [CAShapeLayer layer];
+            bg.frame = b.bounds;
+            bg.path = [UIBezierPath bezierPathWithRoundedRect:br cornerRadius:4.5].CGPath;
+            bg.fillColor = [self sl_accent].CGColor;
+            bg.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.95].CGColor;
+            bg.lineWidth = 1.0;
+            bg.hidden = YES;
+            [b.layer addSublayer:bg];
+
+            CAShapeLayer *fg = [CAShapeLayer layer];
+            fg.frame = b.bounds;
+            fg.path = [UIBezierPath bezierPathWithRect:CGRectInset(br, 4.0, 4.0)].CGPath;
+            fg.fillColor = nil;
+            fg.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.95].CGColor;
+            fg.lineWidth = 1.0;
+            fg.lineDashPattern = @[@2, @1.5];
+            fg.hidden = YES;
+            [b.layer addSublayer:fg];
+
+            _badgeBg = bg;
+            _badgeFg = fg;
+        }
     }
 
     // 旋转球外圈：暗底环 + 实弧 + 端点圆点
@@ -546,6 +611,13 @@ static NSString *SLVFanAngleName(NSInteger i) {
     _tintV[i].alpha = on ? 0.20 : 0.0;
     _iconV[i].tintColor = on ? accent : [UIColor colorWithWhite:0.55 alpha:1.0];
     _ringL[i].strokeColor = on ? [accent colorWithAlphaComponent:0.9].CGColor : nil;
+
+    // 0.3.13：实拍时刻开着 → 循环球右下角挂角标
+    if (i == SLVFanSwitchLoop && _badgeBg) {
+        BOOL sc = SLVFanBool(kSLCamSquareCropKey, NO);
+        _badgeBg.hidden = !sc;
+        _badgeFg.hidden = !sc;
+    }
 }
 
 - (void)sl_refreshArc {
@@ -602,9 +674,10 @@ static NSString *SLVFanAngleName(NSInteger i) {
 
 - (void)sl_hide {
     _hover = -1;
-    _previewPending = NO;
-    // 调用方在 sl_hide 之前已经读过 slWantsPreview，这里清掉不会丢结果
-    [self sl_setPreviewArmed:NO];
+    // 调用方在 sl_hide 之前已经读过 slWantsLibrary / slWantsSquareCrop，
+    // 这里清掉不会丢结果。
+    [self sl_cancelArmProgress];
+    [self sl_setArmedSwitch:-1];
     [self sl_setAngleOpen:NO];
     for (int i = 0; i < 5; i++) {
         UIView *b = _ball[i];
@@ -667,31 +740,76 @@ static NSString *SLVFanAngleName(NSInteger i) {
         }
     }
 
-    // 停在「启用」球上不动 0.55s → 转成预览入口（松手不切开关）
-    if (hit != SLVFanSwitchEnabled) {
-        if (_previewArmed) [self sl_setPreviewArmed:NO];
+    // 0.3.13：双功能球 —— 停住不动 0.55s 转成第二功能，松手执行第二功能。
+    //   启用球 → 进素材库      循环球 → 切实拍时刻
+    // 其余三个球只有单一功能，滑过去就是切开关，不参与这套。
+    BOOL dual = (hit == SLVFanSwitchEnabled || hit == SLVFanSwitchLoop);
+    if (!dual) {
+        [self sl_cancelArmProgress];
+        [self sl_setArmedSwitch:-1];
         return;
     }
-    if (_previewArmed || _previewPending) return;
+    if (_armedSwitch == hit) return;      // 已经是这颗球的第二功能，别重启动画
 
-    _previewPending = YES;
+    // 换球了：先把上一颗的进度收掉，再给这颗起新的
+    [self sl_cancelArmProgress];
+    NSInteger token = ++_armToken;
+    NSInteger target = hit;
+    [self sl_startArmProgress:target];
+
     __weak typeof(self) ws = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         SLVFanView *ss = ws;
-        if (!ss) return;
-        ss->_previewPending = NO;
+        if (!ss || ss->_armToken != token) return;
         // 松手后 _hover 会被 sl_hide 清成 -1，所以这里能顺带挡掉「刚滑过去就松手」
-        if (ss->_hover == SLVFanSwitchEnabled && !ss->_previewArmed) [ss sl_setPreviewArmed:YES];
+        if (ss->_hover == target) [ss sl_setArmedSwitch:target];
     });
 }
 
-- (void)sl_setPreviewArmed:(BOOL)armed {
-    if (_previewArmed == armed) return;
-    _previewArmed = armed;
-    _iconV[SLVFanSwitchEnabled].image = armed ? SLVFanPreviewIcon() : SLVFanIcon(SLVFanSwitchEnabled);
-    if (armed) {
-        // 轻震一下：不看屏幕也知道已经切到「松手预览」
+/// 给某颗球起一次按住进度：环从 0 线性走到 1，时长和判定阈值一致。
+- (void)sl_startArmProgress:(NSInteger)sw {
+    if (sw < 0 || sw >= 5) return;
+    CAShapeLayer *p = _progL[sw];
+    if (!p) return;
+
+    p.hidden = NO;
+    p.strokeEnd = 1.0;                    // 模型值直接设终态，动画只负责过程
+    CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"strokeEnd"];
+    a.fromValue = @0.0;
+    a.toValue = @1.0;
+    a.duration = 0.55;
+    a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
+    [p addAnimation:a forKey:@"slArm"];
+}
+
+/// 收掉所有进度环，并作废还在跑的计时回调。
+- (void)sl_cancelArmProgress {
+    _armToken++;                          // 旧回调看到令牌对不上就自己退出
+    for (int i = 0; i < 5; i++) {
+        if (!_progL[i]) continue;
+        [_progL[i] removeAnimationForKey:@"slArm"];
+        _progL[i].strokeEnd = 0.0;
+        _progL[i].hidden = YES;
+    }
+}
+
+/// 把某颗球切成第二功能（-1 = 全部恢复）。
+///
+/// 图标和进度环**一起**变 —— 保证「看到的」和「松手会执行的」永远是同一个功能。
+/// 只换文字不换图标（或反过来）就会出现「写着循环、松手却切了实拍时刻」的错位。
+- (void)sl_setArmedSwitch:(NSInteger)sw {
+    if (_armedSwitch == sw) return;
+    NSInteger old = _armedSwitch;
+    _armedSwitch = sw;
+
+    if (old >= 0 && old < 5) {
+        _iconV[old].image = SLVFanIcon(old);
+    }
+    if (sw >= 0 && sw < 5) {
+        _iconV[sw].image = (sw == SLVFanSwitchEnabled) ? SLVFanLibraryIcon()
+                                                       : SLVFanSquareCropIcon();
+        // 轻震一下：不看屏幕也知道已经切到第二功能
         UIImpactFeedbackGenerator *h =
             [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
         [h prepare];
@@ -823,8 +941,12 @@ static NSString *SLVFanAngleName(NSInteger i) {
     return _angleIndex;
 }
 
-- (BOOL)slWantsPreview {
-    return _previewArmed;
+- (BOOL)slWantsLibrary {
+    return _armedSwitch == SLVFanSwitchEnabled;
+}
+
+- (BOOL)slWantsSquareCrop {
+    return _armedSwitch == SLVFanSwitchLoop;
 }
 
 - (CGPoint)slFanCenter {
@@ -888,4 +1010,11 @@ void SLVFanCommit(NSInteger sw, NSInteger angle) {
         // 松开手指那一刻扇已经收了，屏幕上什么反馈都没有 —— 补一句说明改了什么。
         if (msg.length) SLVToast(msg);
     }
+}
+
+void SLVFanToggleSquareCrop(void) {
+    BOOL on = !SLVFanBool(kSLCamSquareCropKey, NO);
+    SLVFanSetBool(kSLCamSquareCropKey, on);
+    SLVCamReloadAll();
+    SLVToast(on ? @"实拍时刻：开（不放大）" : @"实拍时刻：关（铺满）");
 }

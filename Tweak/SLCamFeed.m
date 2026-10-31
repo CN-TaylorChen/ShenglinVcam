@@ -336,6 +336,10 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
                 mirror:(BOOL)mirror
               rotation:(NSInteger)rotation
             squareCrop:(BOOL)squareCrop;
+- (CIImage *)sl_blurBackdropForImage:(CIImage *)img
+                                 src:(CVPixelBufferRef)src
+                               width:(size_t)w
+                              height:(size_t)h;
 
 @end
 
@@ -1277,6 +1281,14 @@ BOOL SLVCamIsMomoProcess(void) {
                        squareCrop:squareCrop];
     if (!img) return NO;
 
+    // 0.3.13：素材盖不满整个框时，先用同一帧的模糊放大版把框铺满。
+    //
+    // 不铺会怎样：CI 只把 img 覆盖到的像素写进去，**其余像素保持原值** ——
+    // 而 dst 是宿主的真帧，原值就是真实摄像头画面。实拍时刻开正方形裁切后，
+    // 横屏素材上下各空 420px，录出来就是「中间素材、上下键盘和地毯」。
+    // 铺一层模糊底既不露真摄像头，也比黑条自然。
+    img = [self sl_blurBackdropForImage:img src:src width:w height:h];
+
     BOOL isNV12 = (dpf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
                    dpf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
 
@@ -1307,6 +1319,43 @@ BOOL SLVCamIsMomoProcess(void) {
     BOOL ok = SLVBlitBGRAtoNV12(bgra, dst);
     CVPixelBufferRelease(bgra);
     return ok;
+}
+
+/// 素材没盖满目标框时，补一层「同一帧的模糊放大版」当底。
+///
+/// 返回的图保证覆盖满 (0,0,w,h)：本来就盖满的原样返回，没盖满的叠一层模糊底。
+///
+/// 模糊在 **1/4 分辨率**上做 —— 模糊本来就不需要高分辨率，缩下去再放大回来肉眼
+/// 分不出，成本却降到几分之一。1080×1920 直接 sigma=30 是 30fps 扛不住的。
+- (CIImage *)sl_blurBackdropForImage:(CIImage *)img
+                                 src:(CVPixelBufferRef)src
+                               width:(size_t)w
+                              height:(size_t)h {
+    if (!img) return img;
+
+    CGRect e = img.extent;
+    BOOL covers = e.origin.x <= 0.5 && e.origin.y <= 0.5
+               && e.size.width >= (CGFloat)w - 0.5
+               && e.size.height >= (CGFloat)h - 0.5;
+    if (covers) return img;   // 9:16 素材走这里，一次额外渲染都不做
+
+    // 底图：同一帧按「铺满整帧」算一遍（squareCrop:NO），再裁到目标框。
+    // 不旋转不镜像 —— 模糊完看不出方向，省一次变换。
+    CIImage *base = [self sl_image:[CIImage imageWithCVPixelBuffer:src]
+                           toWidth:w
+                            height:h
+                            mirror:NO
+                          rotation:0
+                        squareCrop:NO];
+    if (!base) return img;
+    base = [base imageByCroppingToRect:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)];
+
+    CIImage *small = [base imageByApplyingTransform:CGAffineTransformMakeScale(0.25, 0.25)];
+    small = [small imageByApplyingGaussianBlurWithSigma:8.0];   // ≈ 全尺寸 sigma 32
+    CIImage *blurred = [[small imageByApplyingTransform:CGAffineTransformMakeScale(4.0, 4.0)]
+                        imageByCroppingToRect:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)];
+
+    return [img imageByCompositingOverImage:blurred];
 }
 
 /// 把当前素材帧画进**调用方给的** buffer，原地改写内容，不换指针、不改所有权。

@@ -57,9 +57,13 @@ typedef NS_ENUM(NSInteger, SLVFanSwitch) {
 /// 选中的角度档位 0..3，-1 = 没选（只有停在旋转球上才有值）
 @property (nonatomic, readonly) NSInteger slPickedAngle;
 
-/// 0.2.22：手指停在「启用」球上不动 0.55s 再松手 = 想预览素材，不切开关。
-/// 松手时要先读这个值再调 sl_hide，hide 会把它清掉。
-@property (nonatomic, readonly) BOOL slWantsPreview;
+/// 0.3.13：手指停在「启用」球上不动 0.55s 再松手 = 进素材库，不切开关。
+/// 停在「循环」球上同理 = 切实拍时刻模式（只有陌陌里有意义）。
+/// 这两个球是双功能的，按住时图标和标签会一起换成第二功能。
+///
+/// 松手时要**先读**这两个值再调 sl_hide，hide 会把它们清掉。
+@property (nonatomic, readonly) BOOL slWantsLibrary;
+@property (nonatomic, readonly) BOOL slWantsSquareCrop;
 
 /// 用当前设置初始化各球的状态（进扇之前调一次）
 - (void)sl_reloadStates;
@@ -69,3 +73,7 @@ typedef NS_ENUM(NSInteger, SLVFanSwitch) {
 /// 把一次选择写进设置并刷新帧源。
 /// sw 传 SLVFanSwitch 下标；angle 只有旋转用得上（0..3，-1 当 0）。
 void SLVFanCommit(NSInteger sw, NSInteger angle);
+
+/// 切换「实拍时刻不放大」开关（扇里长按循环球走这条）。
+/// 只对陌陌生效；别的 App 调了也只写一个用不上的值。
+void SLVFanToggleSquareCrop(void);

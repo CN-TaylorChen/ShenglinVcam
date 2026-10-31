@@ -843,7 +843,7 @@ static void SLVSetFrameBorder(CALayer *l, UIColor *c, CGFloat width, NSTimeInter
 #pragma mark 长按扇
 
 /// 0.2.22：长按停在「启用」球上不动 → 松手进预览。定义在文件末尾。
-static void SLVShowMediaPreview(void);
+static void SLVShowMediaLibrary(void);
 
 // 球贴哪条边：取四个方向里最近的那条。贴角落时上下 / 左右距离接近，
 // 取到哪条都不算错 —— SLVFanView 内部会把扇角收窄、半径缩小，保证不出屏。
@@ -938,11 +938,13 @@ static void SLVShowMediaPreview(void);
 
 - (void)sl_tap {
     // 长按结束后个别机型还会补一次 touchUpInside，这里挡掉，
-    // 否则「长按出扇 → 松手」会顺带把素材库也弹出来。
+    // 否则「长按出扇 → 松手」会顺带把设置页也弹出来。
     if (CFAbsoluteTimeGetCurrent() - _longPressAt < 0.7) return;
-    // 关掉「启用」之后球也要能点：素材库跟启用状态无关，
-    // 用户常常是「先换素材，再打开开关」，这里不能拦。
-    SLVCamHandleArrowTap(self);
+    // 0.3.13：点击主球进**设置**（原来进素材库）。
+    // 素材库挪到「长按启用球」，设置页里也还有「当前素材」那一行，两条路都通。
+    // 跟启用状态无关 —— 用户常常是「先改设置，再打开开关」，这里不能拦。
+    UIViewController *host = SLVTopViewController();
+    if (host) [SLVFloatPanelController presentSettingsFrom:host];
 }
 
 - (void)sl_longPress:(UILongPressGestureRecognizer *)g {
@@ -967,12 +969,15 @@ static void SLVShowMediaPreview(void);
         if (_fan) {
             NSInteger sw = _fan.slPickedSwitch;
             NSInteger ang = _fan.slPickedAngle;
-            // 必须在 sl_hide 之前读 —— 收起时会把这个标志清掉
-            BOOL preview = _fan.slWantsPreview;
+            // 必须在 sl_hide 之前读 —— 收起时会把这两个标志清掉
+            BOOL library = _fan.slWantsLibrary;
+            BOOL squareCrop = _fan.slWantsSquareCrop;
             [self sl_hideFan];
             if (g.state == UIGestureRecognizerStateEnded) {
-                // 停住「启用」球再松手 = 预览素材，不切开关
-                if (preview) SLVShowMediaPreview();
+                // 停住「启用」球再松手 = 进素材库，不切开关
+                // 停住「循环」球再松手 = 切实拍时刻模式，不切循环
+                if (library) SLVShowMediaLibrary();
+                else if (squareCrop) SLVFanToggleSquareCrop();
                 else SLVFanCommit(sw, ang);
             }
         }
@@ -1860,12 +1865,16 @@ void SLVStartEntryWatcher(void) {
 // 两种情况分开走：浮窗已经开着（设置页 / 素材页）就直接推进它自己的导航栈；
 // 没开着才新起一层。不能只调 presentFrom: —— 它有「已经开着就不再叠第二层」
 // 的守卫，浮窗开着时这次点击会被静默吃掉。
-static void SLVShowMediaPreview(void) {
+//
+// 0.3.13：原来这里弹的是「预览当前素材」（SLVMediaPreviewController），
+// 现在长按启用球 = 进**素材库列表**（SLVMediaListController）。
+// 预览没丢：列表里点任意一行就直接预览并切过去。
+static void SLVShowMediaLibrary(void) {
     if (sSLFloatPanel && sSLFloatPanel.presentingViewController && sSLFloatPanel.nav) {
-        [sSLFloatPanel.nav pushViewController:[[SLVMediaPreviewController alloc] init] animated:YES];
+        [sSLFloatPanel.nav pushViewController:[[SLVMediaListController alloc] init] animated:YES];
         return;
     }
     UIViewController *host = SLVTopViewController();
     if (!host) return;
-    [SLVFloatPanelController presentFrom:host root:[[SLVMediaPreviewController alloc] init]];
+    [SLVFloatPanelController presentFrom:host root:[[SLVMediaListController alloc] init]];
 }
