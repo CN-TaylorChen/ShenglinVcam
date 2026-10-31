@@ -979,6 +979,15 @@ static void SLVShowMediaLibrary(void);
                 if (library) SLVShowMediaLibrary();
                 else if (squareCrop) SLVFanToggleSquareCrop();
                 else SLVFanCommit(sw, ang);
+
+                // 0.3.14：第二功能真的执行了，补一记「成功」震动收尾。
+                // 三档手感是递进的：落球轻震 → 环满中震 → 执行成功震，
+                // 闭着眼也能数出走到哪一步了。
+                if (library || squareCrop) {
+                    UINotificationFeedbackGenerator *n = [[UINotificationFeedbackGenerator alloc] init];
+                    [n prepare];
+                    [n notificationOccurred:UINotificationFeedbackTypeSuccess];
+                }
             }
         }
     }

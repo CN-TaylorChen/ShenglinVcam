@@ -135,8 +135,8 @@ static NSString *SLVFanAngleName(NSInteger i) {
     CAShapeLayer *_ringL[5];
     CAShapeLayer *_glowL[5];
     CAShapeLayer *_progL[5];   // 0.3.13：双功能球的按住进度环
-    CAShapeLayer *_badgeBg;    // 0.3.13：循环球右下角「实拍时刻开着」的角标
-    CAShapeLayer *_badgeFg;
+    CAShapeLayer *_badgeDot;   // 0.3.14：循环球**外**右下角的「实拍时刻开着」小圆点
+                               // 0.3.13 那个 15pt 圆角方块画在球内，压住了图标 —— 见 sl_buildBalls
     BOOL _on[5];
 
     UIView *_col;
@@ -163,6 +163,12 @@ static NSString *SLVFanAngleName(NSInteger i) {
     // 所以只能靠「停留时长」区分：滑过去就松手 = 切开关，停住不走 = 第二功能。
     NSInteger _armedSwitch;    // 已经切成第二功能的球，-1 = 没有
     NSInteger _armToken;       // 递增令牌：换了球之后旧的计时回调自己作废
+    // 0.3.14：**正在计时的那颗球**，-1 = 没有。
+    //
+    // 0.3.13 少了这一项，判重只看 _armedSwitch，而它要 0.55s 之后才赋值 ——
+    // 这 0.55s 里手指每抖一下（sl_trackPoint: 每次 touch move 都会被调用）都会
+    // 走一遍「取消动画 + 重开动画」，进度环永远跑不满，看起来就是「快满了又从头跑」。
+    NSInteger _armBall;
 }
 
 #pragma mark 构建
@@ -178,6 +184,11 @@ static NSString *SLVFanAngleName(NSInteger i) {
     _hover = -1;
     _angleIndex = -1;
     _shownAngle = 0;
+    // 0.3.14：必须显式置 -1。ivar 默认是 0，而 0 正好是 SLVFanSwitchEnabled ——
+    // 不置的话第一次长按「启用」球会被 sl_trackPoint: 里的 _armedSwitch == hit
+    // 直接挡掉，进度环根本不起，「长按进素材库」第一次永远不生效。
+    _armedSwitch = -1;
+    _armBall = -1;
     self.backgroundColor = [UIColor clearColor];
     self.userInteractionEnabled = NO;
     self.alpha = 0.0;
@@ -382,34 +393,32 @@ static NSString *SLVFanAngleName(NSInteger i) {
         _glowL[i] = glow;
         _progL[i] = prog;
 
-        // 0.3.13：实拍时刻开着时，循环球右下角挂一个圆角小方块。
-        // 不挂的话，松手后球恢复循环图标，用户看不出实拍时刻现在是开还是关。
-        // 44pt 的球上角标只有 16pt —— 用实心块而不是虚线描边，缩小后还认得出。
+        // 0.3.14：实拍时刻开着时，在循环球**外面**的右下角点一个小圆点。
+        //
+        // 0.3.13 这里是 15pt 圆角方块，画在球内的 (25,25)。球心在 (22,22)，
+        // 角标中心离球心只有 14.8pt，而图标半径就有 11pt —— 角标是按「矩形角落」
+        // 摆的，可球是圆的，必压图标。现在挪到球外，跟图标一点不碰。
+        //
+        // 位置：球心往右下 20pt（球半径 22，所以整个点都在球外面），
+        // 半径 4.5，白色 1.2 描边 —— 跟进度环（半径 24、线宽 2.5）只在边上擦过 1pt，
+        // 而且这一层是在进度环之后加的，真叠上也是点压环，不会看着像环断了。
         if (i == SLVFanSwitchLoop) {
-            CGRect br = CGRectMake(SLV_FAN_BALL_SIDE - 19.0, SLV_FAN_BALL_SIDE - 19.0,
-                                   15.0, 15.0);
+            CGPoint dc = CGPointMake(SLV_FAN_BALL_R + 20.0, SLV_FAN_BALL_R + 20.0);
 
-            CAShapeLayer *bg = [CAShapeLayer layer];
-            bg.frame = b.bounds;
-            bg.path = [UIBezierPath bezierPathWithRoundedRect:br cornerRadius:4.5].CGPath;
-            bg.fillColor = [self sl_accent].CGColor;
-            bg.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.95].CGColor;
-            bg.lineWidth = 1.0;
-            bg.hidden = YES;
-            [b.layer addSublayer:bg];
+            CAShapeLayer *dot = [CAShapeLayer layer];
+            dot.frame = b.bounds;
+            dot.path = [UIBezierPath bezierPathWithArcCenter:dc
+                                                      radius:4.5
+                                                  startAngle:0
+                                                    endAngle:M_PI * 2.0
+                                                   clockwise:YES].CGPath;
+            dot.fillColor = [self sl_accent].CGColor;
+            dot.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.95].CGColor;
+            dot.lineWidth = 1.2;
+            dot.hidden = YES;
+            [b.layer addSublayer:dot];
 
-            CAShapeLayer *fg = [CAShapeLayer layer];
-            fg.frame = b.bounds;
-            fg.path = [UIBezierPath bezierPathWithRect:CGRectInset(br, 4.0, 4.0)].CGPath;
-            fg.fillColor = nil;
-            fg.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.95].CGColor;
-            fg.lineWidth = 1.0;
-            fg.lineDashPattern = @[@2, @1.5];
-            fg.hidden = YES;
-            [b.layer addSublayer:fg];
-
-            _badgeBg = bg;
-            _badgeFg = fg;
+            _badgeDot = dot;
         }
     }
 
@@ -612,11 +621,9 @@ static NSString *SLVFanAngleName(NSInteger i) {
     _iconV[i].tintColor = on ? accent : [UIColor colorWithWhite:0.55 alpha:1.0];
     _ringL[i].strokeColor = on ? [accent colorWithAlphaComponent:0.9].CGColor : nil;
 
-    // 0.3.13：实拍时刻开着 → 循环球右下角挂角标
-    if (i == SLVFanSwitchLoop && _badgeBg) {
-        BOOL sc = SLVFanBool(kSLCamSquareCropKey, NO);
-        _badgeBg.hidden = !sc;
-        _badgeFg.hidden = !sc;
+    // 0.3.14：实拍时刻开着 → 循环球外右下角亮一个小圆点
+    if (i == SLVFanSwitchLoop && _badgeDot) {
+        _badgeDot.hidden = !SLVFanBool(kSLCamSquareCropKey, NO);
     }
 }
 
@@ -749,7 +756,12 @@ static NSString *SLVFanAngleName(NSInteger i) {
         [self sl_setArmedSwitch:-1];
         return;
     }
-    if (_armedSwitch == hit) return;      // 已经是这颗球的第二功能，别重启动画
+    // 0.3.14：同一颗球已经在计时就直接返回。
+    //
+    // 这一行是「环快跑满了又从头跑」的解药。0.3.13 只判 _armedSwitch，
+    // 而它要 0.55s 之后才赋值 —— 这段时间里 sl_trackPoint: 每次 touch move
+    // 都会被调用一次，手指只要抖 1px 就会把环清零重跑。
+    if (_armedSwitch == hit || _armBall == hit) return;
 
     // 换球了：先把上一颗的进度收掉，再给这颗起新的
     [self sl_cancelArmProgress];
@@ -773,6 +785,8 @@ static NSString *SLVFanAngleName(NSInteger i) {
     CAShapeLayer *p = _progL[sw];
     if (!p) return;
 
+    _armBall = sw;                        // 记住「正在计时的是这颗」
+
     p.hidden = NO;
     p.strokeEnd = 1.0;                    // 模型值直接设终态，动画只负责过程
     CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"strokeEnd"];
@@ -781,11 +795,19 @@ static NSString *SLVFanAngleName(NSInteger i) {
     a.duration = 0.55;
     a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
     [p addAnimation:a forKey:@"slArm"];
+
+    // 0.3.14：落球给一次轻震 —— 告诉手指「已经开始计时了，再按住不动就能换功能」。
+    // 不震的话，环刚起头那一小段很难看出到底有没有在走。
+    UIImpactFeedbackGenerator *h =
+        [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [h prepare];
+    [h impactOccurred];
 }
 
 /// 收掉所有进度环，并作废还在跑的计时回调。
 - (void)sl_cancelArmProgress {
     _armToken++;                          // 旧回调看到令牌对不上就自己退出
+    _armBall = -1;
     for (int i = 0; i < 5; i++) {
         if (!_progL[i]) continue;
         [_progL[i] removeAnimationForKey:@"slArm"];
@@ -805,15 +827,29 @@ static NSString *SLVFanAngleName(NSInteger i) {
 
     if (old >= 0 && old < 5) {
         _iconV[old].image = SLVFanIcon(old);
+        _iconV[old].transform = CGAffineTransformIdentity;
     }
     if (sw >= 0 && sw < 5) {
         _iconV[sw].image = (sw == SLVFanSwitchEnabled) ? SLVFanLibraryIcon()
                                                        : SLVFanSquareCropIcon();
-        // 轻震一下：不看屏幕也知道已经切到第二功能
+
+        // 0.3.14：环画满、功能切换的这一刻给**中震** —— 比落球那下重一档，
+        // 不看屏幕也能分清「刚开始计时」和「已经切过去了」。
         UIImpactFeedbackGenerator *h =
-            [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+            [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
         [h prepare];
         [h impactOccurred];
+
+        // 图标弹一下。光换图不弹，眼睛容易漏掉 —— 这一下是把「换了」推到眼前。
+        UIImageView *iv = _iconV[sw];
+        iv.transform = CGAffineTransformMakeScale(0.78, 0.78);
+        [UIView animateWithDuration:0.34
+                              delay:0
+             usingSpringWithDamping:0.48
+              initialSpringVelocity:0.7
+                            options:UIViewAnimationOptionBeginFromCurrentState
+                         animations:^{ iv.transform = CGAffineTransformIdentity; }
+                         completion:nil];
     }
 }
 
