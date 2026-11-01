@@ -804,6 +804,111 @@ static void SLVCamWriterStartWriting(id self, SEL _cmd) {
     if (gSLWriterStartOrig) gSLWriterStartOrig(self, _cmd);
 }
 
+// 0.3.27：写完把成品读回来，看 transform 到底有没有写进文件。
+//
+// 0.3.26 的日志已经证明「设置留住了」：setTransform 补了 90°，
+// startWriting 兜底一次都没触发（说明读回来就是 90°）。
+// 但文件还是歪，那就只剩两种可能：
+//   A. transform 压根没进文件的 tkhd matrix —— 那 setTransform 时机不对
+//   B. 进了，但 Telegram 转码时丢了 —— 那 transform 这条路彻底无效，
+//      只能让 buffer 本身变竖（动 AVCaptureConnection）
+//
+// 这条日志一次就能分开。
+
+// 把文件里视频轨的 transform 打出来。异步加载 tracks，最多等 2 秒。
+// 只做「读 + 打日志」，任何异常都咽掉 —— 这是探针，绝不能影响宿主写文件。
+static void SLVLogTrackTransformNow(NSURL *url, NSString *tag) {
+    if (!url) return;
+    @try {
+        AVURLAsset *a = [AVURLAsset URLAssetWithURL:url options:nil];
+
+        // tracks 在新系统上是异步加载的，同步读会拿到空数组 —— 等它加载完
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [a loadValuesAsynchronouslyForKeys:@[@"tracks"] completionHandler:^{
+            dispatch_semaphore_signal(sem);
+        }];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
+                                                   (int64_t)(2 * NSEC_PER_SEC)));
+
+        NSArray *tracks = [a tracksWithMediaType:AVMediaTypeVideo];
+        if (tracks.count == 0) {
+            SLVLog(@"录制: %@ %@ 读不到视频轨（可能已删除）", tag, url.lastPathComponent);
+            return;
+        }
+        for (AVAssetTrack *t in tracks) {
+            CGAffineTransform tr = t.preferredTransform;
+            CGSize ns = t.naturalSize;
+            BOOL idt = (fabs(tr.a - 1.0) < 0.01 && fabs(tr.b) < 0.01 &&
+                        fabs(tr.c) < 0.01 && fabs(tr.d - 1.0) < 0.01);
+            SLVLog(@"录制: %@ %@ 视频 %.0fx%.0f transform=[%.2f %.2f %.2f %.2f]%@",
+                   tag, url.lastPathComponent, ns.width, ns.height,
+                   tr.a, tr.b, tr.c, tr.d,
+                   idt ? @" （identity）" : @"");
+        }
+    } @catch (NSException *e) {
+        SLVLog(@"录制: %@ 读失败（%@）", tag, e.reason ?: @"?");
+    }
+}
+
+// 上面那个函数里有个 2 秒的信号量。宿主调 finishWriting / export 很可能在**主线程**，
+// 直接跑会把界面卡住 —— 主线程上就丢后台队列（日志晚几十毫秒无所谓），
+// 已经在别的线程就当场跑，省得文件被宿主删掉之后再读不到。
+static void SLVLogTrackTransform(NSURL *url, NSString *tag) {
+    if (!url) return;
+    if ([NSThread isMainThread]) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            SLVLogTrackTransformNow(url, tag);
+        });
+    } else {
+        SLVLogTrackTransformNow(url, tag);
+    }
+}
+
+static void (*gSLWriterFinishOrig)(id, SEL, void (^)(void));
+
+static void SLVCamWriterFinishWriting(id self, SEL _cmd, void (^handler)(void)) {
+    AVAssetWriter *w = (AVAssetWriter *)self;
+    NSURL *url = w.outputURL;
+
+    void (^wrapped)(void) = [^{
+        if (handler) handler();
+        SLVLogTrackTransform(url, @"成品");
+    } copy];
+
+    if (gSLWriterFinishOrig) gSLWriterFinishOrig(self, _cmd, wrapped);
+}
+
+// 0.3.27：Telegram 发视频消息时，会不会把刚录的文件再导一遍？
+// 如果会，transform 就算进了原文件，也可能在这一步丢掉 —— 那 transform 这条路就废了，
+// 只能改成「让 buffer 本身就是竖的」。
+static void (*gSLExportInitOrig)(id, SEL, id, id);
+
+static id SLVCamExportInit(id self, SEL _cmd, id asset, id preset) {
+    if (gSLExportInitOrig) self = gSLExportInitOrig(self, _cmd, asset, preset);
+    @try {
+        if ([asset isKindOfClass:[AVURLAsset class]]) {
+            NSURL *u = [(AVURLAsset *)asset URL];
+            SLVLog(@"录制: Telegram 开始导出 %@（preset=%@）", u.lastPathComponent, preset ?: @"?");
+            SLVLogTrackTransform(u, @"导出前");
+        }
+    } @catch (NSException *e) { }
+    return self;
+}
+
+static void (*gSLExportRunOrig)(id, SEL, void (^)(void));
+
+static void SLVCamExportRun(id self, SEL _cmd, void (^handler)(void)) {
+    NSURL *out = nil;
+    @try { out = [(AVAssetExportSession *)self outputURL]; } @catch (NSException *e) { }
+
+    void (^wrapped)(void) = [^{
+        if (handler) handler();
+        SLVLogTrackTransform(out, @"导出后");
+    } copy];
+
+    if (gSLExportRunOrig) gSLExportRunOrig(self, _cmd, wrapped);
+}
+
 // AVFAudio 是 iOS 14 起独立出来的框架，宿主不一定会主动加载。
 // objc_getClass 拿不到就 dlopen 一次再取。
 static Class SLVCamLoadClass(const char *name, const char *framework) {
@@ -851,8 +956,21 @@ static void SLVCamInstallRecordingProbes(void) {
     SLVCamHookSel(writer, NSSelectorFromString(@"startWriting"),
                  (IMP)SLVCamWriterStartWriting, (IMP *)&gSLWriterStartOrig);
 
-    SLVLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d writerInput=%d writer=%d",
-          inputNode != nil, rec != nil, movie != nil, writerInput != nil, writer != nil);
+    // 0.3.27：写完把成品读回来，看 transform 到底有没有进文件
+    SLVCamHookSel(writer, NSSelectorFromString(@"finishWritingWithCompletionHandler:"),
+                 (IMP)SLVCamWriterFinishWriting, (IMP *)&gSLWriterFinishOrig);
+
+    // 0.3.27：Telegram 会不会拿这个文件再导一遍
+    Class exporter = SLVCamLoadClass("AVAssetExportSession",
+                                     "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
+    SLVCamHookSel(exporter, NSSelectorFromString(@"initWithAsset:presetName:"),
+                 (IMP)SLVCamExportInit, (IMP *)&gSLExportInitOrig);
+    SLVCamHookSel(exporter, NSSelectorFromString(@"exportAsynchronouslyWithCompletionHandler:"),
+                 (IMP)SLVCamExportRun, (IMP *)&gSLExportRunOrig);
+
+    SLVLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d writerInput=%d writer=%d export=%d",
+          inputNode != nil, rec != nil, movie != nil, writerInput != nil, writer != nil,
+          exporter != nil);
 }
 
 #pragma mark - 拍照接管（0.2.15）

@@ -1,3 +1,72 @@
+## 0.3.27 —— 先把「transform 到底进没进文件」问清楚
+
+0.3.26 的结论没错，但没解决问题。用户反馈：**发送出去的视频消息还是歪的，跟预览不一样。**
+
+这一版先不动画面，只加两条能一次定性的日志。理由很简单 —— 剩下的可能只有两种，
+它们对应的修法完全相反，再猜就是白费一轮。
+
+### 已经排掉的可能
+
+```
+13:52:12 录制: VideoDataOutput 连接 旋转=0 镜像=N
+13:52:13 录制: setTransform #1 宿主=[1.00 0.00 -0.00 1.00] → 实际=[0.00 1.00 -1.00 0.00] （补 90°）
+```
+
+- `VideoDataOutput 连接 旋转=0` —— 宿主交出来的 buffer 是**原始横的 1920x1080**，
+  我们塞进去的是按用户设置转过的素材。这是对的，不是病。
+- `setTransform` 补 90° 成功，而且 `startWriting 兜底` **一次都没触发**
+  —— 说明 `startWriting` 时读回来就是 90°，**我们设的值确实留住了**，没被宿主覆盖。
+
+所以「设置没生效」这条排掉了。
+
+### 剩下的两种可能
+
+| | 现象 | 修法 |
+|---|---|---|
+| **A** | 成品文件里 `transform` 还是 identity | `setTransform` 的**时机**不对（在 writer 已经读取 transform 之后才设的），得往前挪 |
+| **B** | 成品文件里 `transform` 是 `[0 1 -1 0]` | transform 进了文件，是 **Telegram 转码时丢掉的**。那 transform 这条路彻底无效，只能让 **buffer 本身变竖**（动 `AVCaptureConnection` 的旋转角） |
+
+这两条路差别很大：A 改几行，B 要动会话、可能连带影响预览。**不能猜。**
+
+### 加了什么
+
+**一、写完读回成品**
+
+挂 `-[AVAssetWriter finishWritingWithCompletionHandler:]`，在宿主自己的 completion
+跑完之后，用 `AVURLAsset` 把刚写出的文件读回来，打视频轨的 `naturalSize` 和
+`preferredTransform`：
+
+```
+录制: 成品 xxx.mp4 视频 1920x1080 transform=[0.00 1.00 -1.00 0.00]
+```
+
+- 看到 `[0.00 1.00 -1.00 0.00]` → 是 **B**
+- 看到 `[1.00 0.00 -0.00 1.00] （identity）` → 是 **A**
+
+`tracks` 在新系统上是异步加载的，同步读会拿到空数组，所以用信号量等一次（最多 2 秒）。
+
+**二、看 Telegram 有没有再导一遍**
+
+视频消息这条路，Telegram 有可能把录好的文件丢进 `AVAssetExportSession` 重编一次。
+如果会，那 transform 就算进了原文件，也可能在这一步丢 —— 那就还是 B。
+
+所以挂两个点：`initWithAsset:presetName:` 和 `exportAsynchronouslyWithCompletionHandler:`，
+导出前后各打一次 transform：
+
+```
+录制: Telegram 开始导出 xxx.mp4（preset=AVAssetExportPresetPassthrough）
+录制: 导出前 xxx.mp4 视频 1920x1080 transform=[0.00 1.00 -1.00 0.00]
+录制: 导出后 yyy.mp4 视频 1920x1080 transform=[0.00 1.00 -1.00 0.00]
+```
+
+如果根本没有 `Telegram 开始导出` 这一行，说明是直传，问题就只在原文件上。
+
+### 这一版不改画面
+
+纯探针，**出图和方向一行没动**。原来能用的（拍照、预览、不闪）都还是原样。
+
+---
+
 ## 0.3.26 —— 预览和文件差一个水平镜像
 
 0.3.25 的两件事都成了：
