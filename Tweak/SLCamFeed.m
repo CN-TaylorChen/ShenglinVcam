@@ -359,6 +359,14 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     // 会稳定下来，几帧之后重建一次。
     NSString *_pendingKey;
     int _pendingCount;
+
+    // 0.3.23：宿主最近一次交给我们的真帧尺寸。
+    //
+    // 拍照要判断「宿主的视频输出是竖的还是横的」，才能决定补多少度。
+    // 原来拿的是 _latestVideo（**素材**帧）的尺寸 —— 素材是我们自己的，
+    // 跟宿主视频输出的朝向没有任何关系，那个判断等于在瞎猜。
+    // 只有宿主真帧的尺寸才代表「宿主的画面是躺的还是立的」。
+    CGSize _lastHostSize;
     NSMutableData *_audioPCM;
     NSUInteger _audioReadCursor;
     AudioStreamBasicDescription _audioDstASBD;
@@ -1039,6 +1047,15 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     return s;
 }
 
+// 0.3.23：宿主真帧的尺寸（不是素材的）。
+// 拍照判断「宿主的视频输出是竖是横」只能用它 —— 素材尺寸跟宿主朝向无关。
+- (CGSize)latestHostFrameSize {
+    [_lock lock];
+    CGSize s = _lastHostSize;
+    [_lock unlock];
+    return s;
+}
+
 - (CVPixelBufferRef)copyNextFrame {
     [_lock lock];
     CVPixelBufferRef pb = _latestVideo ? (CVPixelBufferRef)CVPixelBufferRetain(_latestVideo) : NULL;
@@ -1070,6 +1087,11 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     size_t hh = CVPixelBufferGetHeight(host);
     if (hw < 1 || hh < 1) return NULL;
     OSType hpf = CVPixelBufferGetPixelFormatType(host);
+
+    // 0.3.23：记下宿主真帧的尺寸，拍照那条路要靠它判断朝向。
+    [_lock lock];
+    _lastHostSize = CGSizeMake((CGFloat)hw, (CGFloat)hh);
+    [_lock unlock];
 
     NSInteger rot = [self sl_normalizedRotation];
     BOOL mirror = self.mirrorEnabled;
@@ -1191,6 +1213,18 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
 // 代价是每次拍照都要现场做一次 CI 渲染（约十几毫秒），但拍照是低频操作，
 // 拿这点开销换「预览不闪一下真摄像头」完全值得。
 - (CVPixelBufferRef)copyOrientedFrameForPixelFormat:(OSType)pixelFormat size:(CGSize)size {
+    return [self copyOrientedFrameForPixelFormat:pixelFormat size:size extraRotation:0];
+}
+
+// 0.3.23：带补偿角的版本。
+//
+// `extraRotation` 是「在用户设的旋转之外再补多少度」，由调用方按拍照的 EXIF
+// 方向算出来。原来只有 `renderIntoPixelBuffer:extraRotation:` 有这个概念，
+// JPEG 那条路（`fileDataRepresentation`）完全没有 —— Swiftgram 恰好走的是它，
+// 于是照片永远是「素材转 userRot」的姿势，跟预览对不上。
+- (CVPixelBufferRef)copyOrientedFrameForPixelFormat:(OSType)pixelFormat
+                                               size:(CGSize)size
+                                      extraRotation:(NSInteger)extraRotation {
     if (pixelFormat == 0) return NULL;
 
     [_lock lock];
@@ -1202,7 +1236,10 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     size_t sh = CVPixelBufferGetHeight(pb);
     if (sw < 1 || sh < 1) { CVPixelBufferRelease(pb); return NULL; }
 
-    NSInteger rot = [self sl_normalizedRotation];
+    // 补偿角可能把结果推出 0~359，先归一化再交给 sl_image:
+    NSInteger rot = ([self sl_normalizedRotation] + extraRotation) % 360;
+    if (rot < 0) rot += 360;
+    if (rot != 0 && rot != 90 && rot != 180 && rot != 270) rot = 0;
     BOOL mirror = self.mirrorEnabled;
 
     size_t w, h;

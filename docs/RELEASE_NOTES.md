@@ -1,3 +1,71 @@
+## 0.3.23 —— 修「拍照方向不对」和「录制中画面突然放大」
+
+0.3.22 把乱闪和卡顿修掉了（日志里 `撤掉显示层` 从一秒 3 次降到 0 次、
+`管线就绪` 从 40 多行降到 4 次）。剩下两个问题，一个是方向，一个是裁切。
+
+### 一、拍照和录制方向不一样：JPEG 那条路压根没管方向
+
+`SLVCamPhotoJPEG()` 取帧是这么写的：
+
+```objc
+CVPixelBufferRef pb = [[SLVCamFeed shared]
+    copyOrientedFrameForPixelFormat:kCVPixelFormatType_32BGRA size:CGSizeZero];
+```
+
+`size:CGSizeZero` 让输出尺寸取「素材旋转后的尺寸」。用户设的是 270°，
+素材 1080×1920 转 270 变成 **1920×1080**，于是照片是一张 16:9 的横图 ——
+而预览是 4:3 竖屏（369×492）。一个横一个竖，比例都不同。
+
+更要命的是 `SLVCamPhotoExtraRotation`（按 EXIF 补 90° 的那个）**只挂在
+`-[AVCapturePhoto pixelBuffer]` 上**。Swiftgram 走的是 `fileDataRepresentation`，
+一次都没调用过补偿。日志里只有：
+
+```
+12:01:37 注入: 拍照已接管（AVCapturePhotoOutput）· 返回素材画面 270° / 镜像关
+```
+
+**改法：** 新增 `SLVCamPhotoUprightRotation()`，做两件事：
+
+1. 角度 **相加** 而不是抵消 —— 用户设的 `rotation` 是对着预览调出来的，
+   而预览正不正 = 素材转 `userRot` 再叠上预览层的 `connection` 角度。
+   所以素材本身的朝向偏差是 `-(userRot + connection)`，拍照要反着转回来。
+   竖拍后摄：`270 + 90 = 360 = 0` → 素材原样输出，正好是正的。
+2. 尺寸跟着摆正 —— 照片 buffer 是传感器原始方向（4032×3024 横），
+   摆正之后是 3024×4032 竖，宽高必须换。
+
+`copyOrientedFrameForPixelFormat:size:` 同时加了带 `extraRotation:` 的版本，
+老的两参数版原样转发（`extraRotation:0`），抖音那条 `pixelBuffer` 路径一行没动。
+
+### 二、录制中画面突然放大 8%：藏起来的预览层还在喂帧
+
+录屏逐帧量出来的：10.53 秒 630 帧，帧间差中位数 0.06，**只有 4.79 秒处跳了一次**
+（diff 15.43）—— 不是黑帧、不是真画面，是取景框缩放变了约 8%。
+
+Swiftgram 一次会话挂着两个预览层（`369x492 镜像=Y` 4:3 前置、`369x656 镜像=N`
+16:9 后置），切换摄像头时不是销毁旧的，而是把旧的藏起来。0.3.22 只判断了
+`pl.superlayer`，藏起来的那个照样每帧喂帧 —— 它的 `bounds` 一变，
+`ResizeAspectFill` 就重算一次裁切。
+
+**改法：**
+
+- 新增 `SLVCamPreviewLayerVisible()`：查 `isHidden` / `opacity` / 是否还在窗口里，
+  并顺着 `superlayer` 一路查上去（CALayer 的 hidden 不往下传）。
+- `SLVCamSyncPreviewGeometry` 的 `bounds` 变化要**连续两次读到同一个新值**才应用，
+  但幅度超过 15%（换方向 / 从 0×0 变成有尺寸）立刻生效，免得卡在旧尺寸。
+
+### 三、加了三个朝向探针（只读，不改行为）
+
+「预览是正的、文件是歪的」只可能是两种原因：录制那条 connection 的角度跟预览层
+不一致，或者宿主根本没把角度写进文件。先把这三个数拿到手：
+
+- `录制: VideoDataOutput 连接 旋转=? 镜像=?`
+- `录制: MovieFileOutput 连接 旋转=? 镜像=?`
+- `录制: AVAssetWriterInput.transform = [a=.. b=.. c=.. d=..]`
+
+下一次贴日志就能直接定位，不用再猜。
+
+---
+
 ## 0.3.22 —— 修「乱闪」和「录制卡顿」：管线别每帧重建
 
 0.3.21 之后预览层能接管了，但在 Swiftgram 上暴露出两个更底层的问题。

@@ -66,6 +66,7 @@ static NSString *SLVFourCC(OSType v) {
 static void SLVCamFeedPreview(CMSampleBufferRef sb);
 static void SLVCamTeardownPreview(void);
 static void SLVCamTeardownPreviewIfStale(void);
+static NSInteger SLVCamPreviewRotationDeg(AVCaptureConnection *conn);
 
 /// 音视频输出可能各自重写了 _processSampleBuffer:，必须按 Method 分别保存原始 IMP，
 /// 否则音频会走到视频的原始实现上去（表现为只有画面变、声音还在）。
@@ -505,6 +506,28 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
         }
     }
 
+    // 0.3.23：一次性把「这条 video data output 的 connection」打出来。
+    // 宿主写文件时会不会再转一次，取决于它自己的 connection 角度 ——
+    // 这个数跟预览层的角度一对比，就知道「文件歪」是不是差在这里。
+    if (mediaType == kCMMediaType_Video) {
+        static BOOL sLoggedOutConn = NO;
+        if (!sLoggedOutConn) {
+            sLoggedOutConn = YES;
+            @try {
+                AVCaptureConnection *c =
+                    [(AVCaptureVideoDataOutput *)self connectionWithMediaType:AVMediaTypeVideo];
+                if (c) {
+                    SLVLog(@"录制: VideoDataOutput 连接 旋转=%ld 镜像=%@",
+                           (long)SLVCamPreviewRotationDeg(c), c.isVideoMirrored ? @"Y" : @"N");
+                } else {
+                    SLVLog(@"录制: VideoDataOutput 拿不到 video 连接");
+                }
+            } @catch (NSException *e) {
+                SLVLog(@"录制: VideoDataOutput 读连接失败（%@）", e.reason ?: @"?");
+            }
+        }
+    }
+
     if (fake) {
         // 0.3.21：同一帧也喂给预览层。
         // Turrit 的预览是 AVCaptureVideoPreviewLayer，直连采集设备、不读 data output ——
@@ -660,8 +683,39 @@ static void SLVCamMovieStartProbe(id self, SEL _cmd, NSURL *url, id delegate) {
         logged = YES;
         SLVLog(@"音频: 命中 AVCaptureMovieFileOutput 录制（%@）· 画面会绕过 VideoDataOutput",
               url.lastPathComponent ?: @"?");
+
+        // 0.3.23：把这条 connection 的旋转角打出来。
+        // 「预览是正的、文件是歪的」只可能有两种原因：这条 connection 的角度跟
+        // 预览层不一致，或者宿主根本没把角度写进文件。先把这个数拿到手。
+        @try {
+            AVCaptureConnection *c =
+                [(AVCaptureMovieFileOutput *)self connectionWithMediaType:AVMediaTypeVideo];
+            if (c) {
+                SLVLog(@"录制: MovieFileOutput 连接 旋转=%ld 镜像=%@",
+                       (long)SLVCamPreviewRotationDeg(c), c.isVideoMirrored ? @"Y" : @"N");
+            } else {
+                SLVLog(@"录制: MovieFileOutput 拿不到 video 连接");
+            }
+        } @catch (NSException *e) {
+            SLVLog(@"录制: MovieFileOutput 读连接失败（%@）", e.reason ?: @"?");
+        }
     }
     if (gSLMovieStartOrig) gSLMovieStartOrig(self, _cmd, url, delegate);
+}
+
+// 0.3.23：AVAssetWriter 这条路写文件时的 transform。
+// 宿主如果在这里设了旋转，文件播放时就会转；没设（或者设成 identity）就不转 ——
+// 我们塞进去的「躺着」的像素就会原样播出来，也就是「发送后歪 90°」。
+static void (*gSLWriterTransformOrig)(id, SEL, CGAffineTransform);
+
+static void SLVCamWriterSetTransform(id self, SEL _cmd, CGAffineTransform t) {
+    static BOOL logged = NO;
+    if (!logged) {
+        logged = YES;
+        SLVLog(@"录制: AVAssetWriterInput.transform = [a=%.2f b=%.2f c=%.2f d=%.2f tx=%.0f ty=%.0f]",
+               t.a, t.b, t.c, t.d, t.tx, t.ty);
+    }
+    if (gSLWriterTransformOrig) gSLWriterTransformOrig(self, _cmd, t);
 }
 
 // AVFAudio 是 iOS 14 起独立出来的框架，宿主不一定会主动加载。
@@ -698,8 +752,13 @@ static void SLVCamInstallRecordingProbes(void) {
     SLVCamHookSel(movie, NSSelectorFromString(@"startRecordingToOutputFileURL:recordingDelegate:"),
                  (IMP)SLVCamMovieStartProbe, (IMP *)&gSLMovieStartOrig);
 
-    SLVLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d",
-          inputNode != nil, rec != nil, movie != nil);
+    // 0.3.23：录制文件的朝向探针
+    Class writerInput = SLVCamLoadClass("AVAssetWriterInput", "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
+    SLVCamHookSel(writerInput, NSSelectorFromString(@"setTransform:"),
+                 (IMP)SLVCamWriterSetTransform, (IMP *)&gSLWriterTransformOrig);
+
+    SLVLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d writerInput=%d",
+          inputNode != nil, rec != nil, movie != nil, writerInput != nil);
 }
 
 #pragma mark - 拍照接管（0.2.15）
@@ -833,36 +892,98 @@ static NSData *(*gSLPhotoDataCustomOrig)(id, SEL, id);
 static void   (*gSLPhotoCaptureOrig)(id, SEL, id, id);
 static CVPixelBufferRef (*gSLPhotoPBOrig)(id, SEL);
 
+// 0.3.23：拍照要「摆正」，需要两个数 —— 转多少度、最终多大。
+//
+// 为什么补的角度要跟用户设的旋转**相加**：
+//   用户设的 rotation 是**对着预览调**出来的 —— 他转到「预览看着正」为止。
+//   而预览正不正，是「素材转 userRot」再叠上「预览层转 connection」的结果。
+//   所以素材本身的朝向偏差 = -(userRot + connection)。
+//   拍照要把它摆回正，就得转 +(userRot + connection)。
+//
+// 竖拍后摄：EXIF 6（要顺时针 90 才正），预览层 connection 通常也是 90，
+// 用户把 rotation 调到 270 → 270 + 90 = 360 = 0 → 素材原样输出，正好是正的。
+// 这就是日志里「返回素材画面 270°」那个值的真正含义。
+//
+// 尺寸同样要摆正：`AVCapturePhoto` 的 buffer 是传感器原始方向（4032x3024 横），
+// 摆正之后是 3024x4032 竖，宽高必须跟着换 —— 否则出来的是张横图。
+static NSInteger SLVCamPhotoUprightRotation(id photo, CGSize rawSize, CGSize *outSize) {
+    NSInteger cw = 90;   // 拿不到 EXIF 就按最常见的竖拍后摄（EXIF 6）处理
+    @try {
+        NSDictionary *meta = [(AVCapturePhoto *)photo metadata];
+        NSNumber *v = meta[(NSString *)kCGImagePropertyOrientation];
+        switch (v ? v.integerValue : 6) {
+            case 1: case 2: cw = 0;   break;
+            case 3: case 4: cw = 180; break;
+            case 5: case 7: cw = 90;  break;   // 带镜像的那几个按旋转部分算
+            case 6:         cw = 90;  break;
+            case 8:         cw = 270; break;
+            default:        cw = 90;  break;
+        }
+    } @catch (NSException *e) { }
+
+    if (outSize) {
+        if ((cw == 90 || cw == 270) && rawSize.width >= 1 && rawSize.height >= 1) {
+            *outSize = CGSizeMake(rawSize.height, rawSize.width);
+        } else {
+            *outSize = rawSize;
+        }
+    }
+    return cw;
+}
+
 /// 从素材取一帧、按当前旋转/镜像摆好、转成 JPEG。
 /// 条件不满足返回 nil，调用方原样放行真照片。
-static NSData *SLVCamPhotoJPEG(void) {
+static void SLVCamPhotoLogOnce(CGSize raw, CGSize out, NSInteger cw);
+
+static NSData *SLVCamPhotoJPEG(id photo) {
     if (!SLVCamInjecting() || !SLVCamArmed()) return nil;
+
+    // 0.3.23：尺寸必须跟**真照片**走。
+    //
+    // 原来传的是 CGSizeZero，输出尺寸就取「素材旋转后的尺寸」—— 素材 1080x1920
+    // 转 270 变成 1920x1080，于是照片是 16:9 横图，而预览是 4:3 竖屏。
+    // 一个横一个竖，这就是「拍照和录制方向不一样」的直接原因。
+    CGSize raw = CGSizeZero;
+    if (gSLPhotoPBOrig) {
+        CVPixelBufferRef real = gSLPhotoPBOrig(photo, NSSelectorFromString(@"pixelBuffer"));
+        if (real) raw = CGSizeMake(CVPixelBufferGetWidth(real), CVPixelBufferGetHeight(real));
+    }
+
+    CGSize outSize = CGSizeZero;
+    NSInteger cw = SLVCamPhotoUprightRotation(photo, raw, &outSize);
+
     CVPixelBufferRef pb = [[SLVCamFeed shared]
-        copyOrientedFrameForPixelFormat:kCVPixelFormatType_32BGRA size:CGSizeZero];
+        copyOrientedFrameForPixelFormat:kCVPixelFormatType_32BGRA
+                                   size:outSize
+                          extraRotation:cw];
     if (!pb) return nil;
     NSData *jpeg = SLVCamJPEGFromPixelBuffer(pb, 0.92);
     CVPixelBufferRelease(pb);
+    if (jpeg.length) SLVCamPhotoLogOnce(raw, outSize, cw);
     return jpeg.length ? jpeg : nil;
 }
 
-static void SLVCamPhotoLogOnce(void) {
+static void SLVCamPhotoLogOnce(CGSize raw, CGSize out, NSInteger cw) {
     static BOOL logged = NO;
     if (logged) return;
     logged = YES;
-    SLVLog(@"注入: 拍照已接管（AVCapturePhotoOutput）· 返回素材画面 %ld° / 镜像%@",
-          (long)([SLVCamFeed shared].rotation % 360),
+    SLVLog(@"注入: 拍照已接管（AVCapturePhotoOutput）· 照片 %.0fx%.0f → 摆正 %.0fx%.0f · "
+          @"设置 %ld° + 补偿 %ld° = %ld° / 镜像%@",
+          raw.width, raw.height, out.width, out.height,
+          (long)([SLVCamFeed shared].rotation % 360), (long)cw,
+          (long)((([SLVCamFeed shared].rotation % 360) + cw) % 360),
           [SLVCamFeed shared].mirrorEnabled ? @"开" : @"关");
 }
 
 static NSData *SLVCamPhotoFileData(id self, SEL _cmd) {
-    NSData *fake = SLVCamPhotoJPEG();
-    if (fake) { SLVCamPhotoLogOnce(); return fake; }
+    NSData *fake = SLVCamPhotoJPEG(self);
+    if (fake) return fake;
     return gSLPhotoDataOrig ? gSLPhotoDataOrig(self, _cmd) : nil;
 }
 
 static NSData *SLVCamPhotoFileDataCustom(id self, SEL _cmd, id customizer) {
-    NSData *fake = SLVCamPhotoJPEG();
-    if (fake) { SLVCamPhotoLogOnce(); return fake; }
+    NSData *fake = SLVCamPhotoJPEG(self);
+    if (fake) return fake;
     return gSLPhotoDataCustomOrig ? gSLPhotoDataCustomOrig(self, _cmd, customizer) : nil;
 }
 
@@ -879,12 +1000,19 @@ static void SLVCamPhotoCapture(id self, SEL _cmd, id settings, id delegate) {
 }
 
 // 照片缓冲的「方向类别」可能跟预览缓冲不一样：
-// 视频输出那条路拿到的是**已经转过向**的缓冲（抖音是 1080x1920 竖屏），
-// 而 AVCapturePhoto 给的是**传感器原始方向**（3840x2160 横屏）。两者差 90°。
+// 视频输出那条路拿到的缓冲已经带上了 connection 的朝向（Swiftgram 日志里是
+// 1920x1440 横的，Turrit 是 1712x1284 横的），而 AVCapturePhoto 给的是
+// **传感器原始方向**，两者可能差 90°。
 // 不补这一下，素材就被塞进一个转了 90° 的框里 —— 预览正、拍出来歪。
 //
 // 补哪个方向由照片自己的 EXIF 方向决定：EXIF 说「要顺时针转 90° 才正」（=6），
 // 我们就先逆时针转 90°（=270°），等宿主/系统把它转回来正好抵消。
+//
+// 0.3.23 备注：这条路（`-[AVCapturePhoto pixelBuffer]`）只有抖音在走，
+// Swiftgram 走的是 `fileDataRepresentation`，用的是另一套（见
+// SLVCamPhotoUprightRotation）。两套不能合并 —— pixelBuffer 那条路是
+// **原地改写宿主的原始 buffer**，尺寸动不了，只能靠角度补偿；JPEG 那条路
+// 是我们自己出图，尺寸和角度都能自己定。
 static NSInteger SLVCamPhotoExtraRotation(id photo, CGSize dstSize) {
     CGSize vs = [[SLVCamFeed shared] latestFrameSize];
     if (vs.width < 1 || vs.height < 1 || dstSize.width < 1 || dstSize.height < 1) return 0;
@@ -1065,6 +1193,64 @@ static NSInteger SLVCamPreviewRotationDeg(AVCaptureConnection *conn) {
     return ((deg % 360) + 360) % 360;
 }
 
+// 0.3.23：这个预览层现在真的在屏幕上吗？
+//
+// Swiftgram 一次会话里同时挂着两个预览层（4:3 前置 369x492 镜像=Y、
+// 16:9 后置 369x656 镜像=N）。切换摄像头时它不是销毁旧的，而是把旧的藏起来。
+// 0.3.22 只判断了 superlayer，藏起来的那个照样每帧喂帧 —— 它的 bounds 一变，
+// ResizeAspectFill 就重算一次裁切，屏幕上看到的就是「录制过程中画面突然放大一下」。
+//
+// CALayer 的 hidden / opacity 不会往下传，所以要顺着 superlayer 一路查上去。
+static BOOL SLVCamPreviewLayerVisible(AVCaptureVideoPreviewLayer *pl) {
+    if (!pl) return NO;
+    if (pl.isHidden) return NO;
+    if (pl.opacity < 0.01f) return NO;
+    if (pl.bounds.size.width < 8.0 || pl.bounds.size.height < 8.0) return NO;
+
+    // 预览层的 delegate 通常是承载它的 UIView，能借此判断「还在不在窗口里」
+    id d = pl.delegate;
+    if ([d isKindOfClass:[UIView class]]) {
+        if (!((UIView *)d).window) return NO;
+    }
+
+    CALayer *p = pl.superlayer;
+    int guard = 0;
+    while (p && guard++ < 16) {
+        if (p.hidden) return NO;
+        if (p.opacity < 0.01f) return NO;
+        p = p.superlayer;
+    }
+    return YES;
+}
+
+// 0.3.23：bounds 变化要「连续两次读到同一个新值」才应用。
+//
+// 布局动画、键盘弹出、切换摄像头时的过渡，都会让 pl.bounds 连续几帧微调。
+// 原来每 0.25 秒对一次、差 0.5px 就改，于是裁切跟着一格一格重算 —— 录屏里
+// 4.79 秒那一下「人物突然放大 8%」就是这么来的。
+//
+// 但大幅度变化（换方向、换层、从 0x0 变成有尺寸）必须立刻生效，否则会一直卡在旧尺寸。
+static char kSLPreviewPendingSizeKey;
+
+static BOOL SLVCamPreviewSizeStable(AVCaptureVideoPreviewLayer *pl, CGFloat lw, CGFloat lh) {
+    NSString *cur = [NSString stringWithFormat:@"%.1fx%.1f", lw, lh];
+    NSString *last = objc_getAssociatedObject(pl, &kSLPreviewPendingSizeKey);
+    if (last) {
+        NSArray *parts = [last componentsSeparatedByString:@"|"];
+        NSString *lastSize = parts.count > 0 ? parts[0] : @"";
+        int n = parts.count > 1 ? [parts[1] intValue] : 0;
+        if ([lastSize isEqualToString:cur]) {
+            n++;
+            objc_setAssociatedObject(pl, &kSLPreviewPendingSizeKey,
+                [NSString stringWithFormat:@"%@|%d", cur, n], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return n >= 2;
+        }
+    }
+    objc_setAssociatedObject(pl, &kSLPreviewPendingSizeKey,
+        [NSString stringWithFormat:@"%@|1", cur], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return NO;
+}
+
 /// 把显示层的几何对齐到预览层。
 ///
 /// 90/270 度时把显示层的 bounds 宽高互换：内容先按「横过来的那个矩形」排版，
@@ -1097,7 +1283,14 @@ static void SLVCamSyncPreviewGeometry(AVCaptureVideoPreviewLayer *pl) {
     CGFloat lh = swap ? pw : ph;
 
     if (fabs(dl.bounds.size.width - lw) > 0.5 || fabs(dl.bounds.size.height - lh) > 0.5) {
-        dl.bounds = CGRectMake(0.0, 0.0, lw, lh);
+        // 0.3.23：小幅度抖动要两次确认，大幅度变化立刻生效
+        CGFloat cw0 = dl.bounds.size.width, ch0 = dl.bounds.size.height;
+        BOOL big = (cw0 < 1.0 || ch0 < 1.0)
+                || (fabs(cw0 - lw) / MAX(lw, 1.0) > 0.15)
+                || (fabs(ch0 - lh) / MAX(lh, 1.0) > 0.15);
+        if (big || SLVCamPreviewSizeStable(pl, lw, lh)) {
+            dl.bounds = CGRectMake(0.0, 0.0, lw, lh);
+        }
     }
     CGPoint pos = CGPointMake(CGRectGetMidX(pb), CGRectGetMidY(pb));
     if (!CGPointEqualToPoint(dl.position, pos)) dl.position = pos;
@@ -1118,6 +1311,9 @@ static void SLVCamMountPreviewDisplay(AVCaptureVideoPreviewLayer *pl) {
     // 「挂上显示层 预览=0x0 会话=有」—— 一块零面积的层，白建一套渲染面。
     // 等它有了尺寸，下一帧自然会再进来一次。
     if (pl.bounds.size.width < 8.0 || pl.bounds.size.height < 8.0) return;
+
+    // 0.3.23：藏起来的预览层不挂。挂着它就会跟着喂帧，bounds 一变就重算裁切。
+    if (!SLVCamPreviewLayerVisible(pl)) return;
 
     AVSampleBufferDisplayLayer *dl = objc_getAssociatedObject(pl, &kSLPreviewDisplayKey);
     if (!dl) {
@@ -1179,9 +1375,10 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb) {
 
     for (AVCaptureVideoPreviewLayer *pl in layers) {
         if (![pl isKindOfClass:[AVCaptureVideoPreviewLayer class]]) continue;
-        // 已经离开视图树的预览层不用管：相机关掉之后 App 会把它丢掉，
-        // 我们再去挂显示层只是白占内存。
-        if (!pl.superlayer) continue;
+        // 0.3.23：藏起来 / 透明的预览层一律跳过。
+        // 原来只判 superlayer，Swiftgram 那两层里被藏起来的那一层照样每帧喂，
+        // 它的 bounds 一变，屏幕上正在显示的那层就跟着「放大一下」。
+        if (!SLVCamPreviewLayerVisible(pl)) continue;
 
         AVSampleBufferDisplayLayer *dl = objc_getAssociatedObject(pl, &kSLPreviewDisplayKey);
         if (!dl) {

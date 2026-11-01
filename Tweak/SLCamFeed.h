@@ -84,6 +84,15 @@ BOOL SLVCamIsMomoProcess(void);
                                                         size:(CGSize)size
     CF_RETURNS_RETAINED;
 
+/// 同上，但可以在用户设的旋转之外再补一个角度（0.3.23）。
+///
+/// 拍照必须用这个：`AVCapturePhoto` 给的是传感器原始方向，跟预览差一个 90°，
+/// 不补的话照片永远是「素材转 userRot」的姿势，跟预览对不上。
+- (nullable CVPixelBufferRef)copyOrientedFrameForPixelFormat:(OSType)pixelFormat
+                                                        size:(CGSize)size
+                                               extraRotation:(NSInteger)extraRotation
+    CF_RETURNS_RETAINED;
+
 /// 把当前素材帧画进**调用方给的** buffer，原地改写内容，不换指针、不改所有权。
 ///
 /// 给 `-[AVCapturePhoto pixelBuffer]` 这类「buffer 归宿主所有、只能改内容」的场景用。
@@ -119,9 +128,13 @@ BOOL SLVCamIsMomoProcess(void);
 /// 视频原始分辨率；读不出来返回 CGSizeZero
 - (CGSize)frameSize;
 
-/// 当前预览缓冲的尺寸 —— 宿主真正在用的那个（1080x1920 之类），不是素材的。
-/// 拍照要拿它判断「预览是竖屏还是横屏」，从而决定补多少度。没有帧返回 CGSizeZero。
+/// 当前素材帧的尺寸（1080x1920 之类）。注意这**不是**宿主 buffer 的尺寸。
+/// 拍照判断朝向别用它 —— 素材是我们自己的，跟宿主朝向无关。
 - (CGSize)latestFrameSize;
+
+/// 宿主最近一次交进来的真帧尺寸（1920x1440 之类），代表宿主画面是躺还是立。
+/// 还没拿到过真帧返回 CGSizeZero。
+- (CGSize)latestHostFrameSize;
 
 /// 素材可用：路径非空且文件存在
 - (BOOL)isReady;
