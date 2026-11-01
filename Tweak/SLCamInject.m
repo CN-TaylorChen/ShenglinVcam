@@ -996,11 +996,10 @@ static BOOL SLVCamAppendSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
     if (!ok) {
         sSLAppendFailed++;
         if (sSLAppendFailed <= 5) {
-            AVAssetWriterStatus ws = AVAssetWriterStatusUnknown;
-            @try { ws = inp.writer.status; } @catch (NSException *e) { }
-            SLVLog(@"方向: append 被拒（第 %d 次）· %zux%zu · writer 状态=%ld %@",
-                   sSLAppendFailed, w, h, (long)ws,
-                   inp.writer.error ? inp.writer.error.localizedDescription : @"");
+            // AVAssetWriterInput 上没有公开的 writer 属性（0.3.34 第一次写就编译失败），
+            // 只打返回值 —— 有这一行就够判断「转帧到底进没进去」。
+            SLVLog(@"方向: append 被拒（第 %d 次）· %zux%zu · writer 不再接收这一帧",
+                   sSLAppendFailed, w, h);
         }
     }
     CFRelease(rotated);
