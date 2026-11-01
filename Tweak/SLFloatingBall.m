@@ -1640,6 +1640,62 @@ static CGPoint SLVLoadFloatPos(CGSize size) {
     return CGPointMake(size.width - 36.0, size.height * 0.72);
 }
 
+// 0.3.19：这个窗口在**这个屏幕点**上接不接得住触摸。
+//
+// 关键一步是把球自己临时摘出去：球要是已经挂在这一层，hitTest 会命中球本身，
+// 于是「挂错了」也会被读成「这层接得住」—— 一旦挂错就永远纠正不回来。
+static BOOL SLVWindowAcceptsTouchAt(UIWindow *w, CGPoint pt) {
+    if (!w || !w.isUserInteractionEnabled) return NO;
+    CGPoint p = [w convertPoint:pt fromWindow:nil];   // 屏幕坐标 → 窗口坐标
+    if (!CGRectContainsPoint(w.bounds, p)) return NO; // 球不在这个窗里，挂了也白挂
+
+    UIView *ball = sSLFloatBtn;
+    BOOL old = ball.userInteractionEnabled;
+    if (ball) ball.userInteractionEnabled = NO;
+    UIView *hit = [w hitTest:p withEvent:nil];
+    if (ball) ball.userInteractionEnabled = old;
+    return hit != nil;
+}
+
+// 0.3.19：找出「这个屏幕点上，最上层且真的会接住触摸」的那个窗口。
+//
+// 为什么不能只按 windowLevel 挑：Turrit（Telegram 魔改）有一层全屏的透明窗，
+// 它的 pointInside: 只在自己那几个按钮附近返回 YES。窗口本身「全屏 + 可交互」，
+// 按层级挑必然挑到它，可球不在它的可点区域里 —— 球画得出来（UIWindow 默认不裁剪），
+// 但点击和拖动全被放行给下面的窗口。表现就是「看得见、点不动、拖不动」。
+//
+// 按点问一遍就绕开了：那个点上谁 hitTest 拿得到东西，球就该挂在哪一层。
+static UIWindow *SLVTopWindowAcceptingTouchAt(CGPoint pt) {
+    NSMutableArray<UIWindow *> *list = [NSMutableArray array];
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                if (!w || w.hidden || w.alpha < 0.02) continue;
+                if (SLVIsSystemOverlayWindow(w)) continue;
+                if (!w.isUserInteractionEnabled) continue;
+                [list addObject:w];
+            }
+        }
+    }
+    // 层级高的在前；同层级先看面积（主窗口最大），再看 keyWindow
+    [list sortUsingComparator:^NSComparisonResult(UIWindow *a, UIWindow *b) {
+        if (a.windowLevel != b.windowLevel) {
+            return a.windowLevel > b.windowLevel ? NSOrderedAscending : NSOrderedDescending;
+        }
+        CGSize sa = a.bounds.size, sb = b.bounds.size;
+        CGFloat aa = sa.width * sa.height, ab = sb.width * sb.height;
+        if (aa != ab) return aa > ab ? NSOrderedAscending : NSOrderedDescending;
+        if (a.isKeyWindow != b.isKeyWindow) return a.isKeyWindow ? NSOrderedAscending : NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+
+    for (UIWindow *w in list) {
+        if (SLVWindowAcceptsTouchAt(w, pt)) return w;
+    }
+    return nil;
+}
+
 void SLVEnsureFloatButton(void) {
     UIWindow *w = SLVKeyWindow();
     if (!w) {
@@ -1652,6 +1708,38 @@ void SLVEnsureFloatButton(void) {
         }
         return;
     }
+
+    // 0.3.19：再按「球心那个点」校正一次挂载窗口。
+    // SLVKeyWindow 按层级挑，挑到的可能是「全屏但球那一块不接触摸」的透明窗；
+    // 这里用球的真实落点再问一遍，谁接得住就挂谁。
+    //
+    // 只在「现在挂的这层接不住」时才改判 —— 否则每轮轮询都会因为 hitTest 命中
+    // 不同视图而反复搬家，球会跳。
+    {
+        CGPoint want = SLVClampFloatPos(SLVLoadFloatPos(SLVScreenSize()), SLVHostSizeFor(w));
+        UIWindow *cur = sSLFloatBtn.window;
+        if (cur && SLVWindowAcceptsTouchAt(cur, want)) {
+            // 现在这层就接得住 → 留在这一层。
+            // 必须显式把 w 改回 cur，否则 SLVKeyWindow 下一轮又会挑到那个透明窗，
+            // 把刚搬好的球又拽回去。
+            w = cur;
+        } else {
+            UIWindow *atPoint = SLVTopWindowAcceptingTouchAt(want);
+            if (atPoint && atPoint != w) {
+                static NSString *sLastSwitch = nil;
+                NSString *k = [NSString stringWithFormat:@"%@>%@",
+                               NSStringFromClass([w class]), NSStringFromClass([atPoint class])];
+                if (![sLastSwitch isEqualToString:k]) {
+                    sLastSwitch = [k copy];
+                    SLVLog(@"SL-VCAM: 挂球窗口改判 %@ → %@（球心 %@ 只有后者接得住触摸）",
+                           NSStringFromClass([w class]), NSStringFromClass([atPoint class]),
+                           NSStringFromCGPoint(want));
+                }
+                w = atPoint;
+            }
+        }
+    }
+
     SLVFloatButton *btn = (SLVFloatButton *)[w viewWithTag:SLVBtnTag];
     BOOL created = NO;   // 这一轮是不是新建了球（新建的球状态是白的，末尾要补刷一次）
     // tag 是自己独享的 20941，正常不会撞；但万一宿主的某个视图碰巧也用这个值，
@@ -1716,6 +1804,13 @@ void SLVEnsureFloatButton(void) {
     }
     sSLFloatBtn = btn;
 
+    // 0.3.19：每轮都把自己顶到窗口最上层。
+    //
+    // 宿主（Telegram / QQ 这类）经常往窗口里追加全屏的透明容器来放自己的浮层 ——
+    // 它不画东西，所以球还看得见，但它盖在球上面，触摸全被它吃掉。
+    // 只按 superview 判断「挂没挂好」是发现不了的：球确实还挂在那个窗口上。
+    if (btn && btn.superview) [btn.superview bringSubviewToFront:btn];
+
     // 0.3.18：探一次「球心到底能不能收到触摸」。
     //
     // 「球看得见但点不动」只有两种可能：
@@ -1734,9 +1829,34 @@ void SLVEnsureFloatButton(void) {
                                                           CGRectGetMidY(btn.bounds))
                                        toView:bw];
             UIView *hit = [bw hitTest:hitPt withEvent:nil];
-            SLVLog(@"SL-VCAM: 命中测试 窗口=%@ 交互=%@ 球心命中=%@",
-                   pk, bw.isUserInteractionEnabled ? @"开" : @"关",
+            SLVLog(@"SL-VCAM: 命中测试 窗口=%@ 尺寸=%.0fx%.0f 交互=%@ 球心=%@ 在窗内=%@ 命中=%@",
+                   pk, bw.bounds.size.width, bw.bounds.size.height,
+                   bw.isUserInteractionEnabled ? @"开" : @"关",
+                   NSStringFromCGPoint(btn.center),
+                   CGRectContainsPoint(bw.bounds, btn.center) ? @"Y" : @"N",
                    hit ? NSStringFromClass([hit class]) : @"nil");
+        }
+    }
+
+    // 0.3.19：把整座「窗口栈」打一遍（每个会话只打一次）。
+    // 「点不动」这种事，单看一个窗口说明不了什么 —— 得看谁压着谁、谁在最上面。
+    {
+        static BOOL sDumpedWindows = NO;
+        if (!sDumpedWindows && btn && btn.window) {
+            sDumpedWindows = YES;
+            NSMutableArray<NSString *> *desc = [NSMutableArray array];
+            for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+                if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+                for (UIWindow *x in ((UIWindowScene *)sc).windows) {
+                    [desc addObject:[NSString stringWithFormat:@"%@@%.0f(%.0fx%.0f)%@%@",
+                                     NSStringFromClass([x class]), x.windowLevel,
+                                     x.bounds.size.width, x.bounds.size.height,
+                                     x.hidden ? @"[隐藏]" : @"",
+                                     x.isKeyWindow ? @"[key]" : @""]];
+                }
+            }
+            SLVLog(@"SL-VCAM: 窗口栈 %lu 层 → %@", (unsigned long)desc.count,
+                   [desc componentsJoinedByString:@" | "]);
         }
     }
 
