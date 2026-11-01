@@ -81,11 +81,20 @@ static BOOL SLVBlitBGRAtoNV12(CVPixelBufferRef src, CVPixelBufferRef dst) {
             : (vImage_YpCbCrPixelRange){ 16, 128, 235, 240, 235, 16, 240, 16 };
 
         vImage_ARGBToYpCbCr info;
-        // 苹果相机管线一律 BT.709；BGRA 在小端机上的内存布局就是 B,G,R,A，
-        // 正好对上 kvImageARGB8888。
+        // 苹果相机管线一律 BT.709。
+        //
+        // 0.3.17：permuteMap 从 {0,1,2,3} 改成 {3,2,1,0} —— 整片发蓝的真凶。
+        //
+        // kvImageARGB8888 说的是**逻辑通道序 A,R,G,B**，permuteMap 也按这个顺序
+        // 解释：permute[0] 是喂给 A 的源通道，[1] 喂 R，[2] 喂 G，[3] 喂 B。
+        // 而我们的 buffer 内存里是 B,G,R,A，于是恒等映射变成：
+        //     A←B   R←G   G←R   B←A(=255)
+        // B 通道被 alpha 顶死成 255，暗部不再是黑而是满值蓝 —— 就是那个紫蓝屏。
+        // 反过来映射回 B,G,R,A 就对了。
+        //
         // 注意 range 是在 GenerateConversion 里用掉的，转换函数本身不吃它 ——
-        // 第 5 个参数是 permuteMap（通道重排表），不重排就是 0,1,2,3。
-        const uint8_t permute[4] = { 0, 1, 2, 3 };
+        // 第 5 个参数就是 permuteMap。
+        const uint8_t permute[4] = { 3, 2, 1, 0 };
         if (vImageConvert_ARGBToYpCbCr_GenerateConversion(
                 kvImage_ARGBToYpCbCrMatrix_ITU_R_709_2, &range,
                 &info, kvImageARGB8888, kvImage420Yp8_CbCr8, kvImageNoFlags) != kvImageNoError) {
@@ -209,6 +218,66 @@ static void SLVLogCenterPixel(CVPixelBufferRef pb, NSString *tag) {
                tag, p[0], p[1], p[2], p[3], w, h);
     }
     CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+}
+
+/// 读 NV12 buffer 中心的 Y / Cb / Cr。
+///
+/// 0.3.17 加这个是为了把「整片发蓝」钉死在具体某一步上：
+/// 一边打转换**输入**（BGRA 中心像素），一边打转换**输出**（Y/Cb/Cr），
+/// 两边一对就知道是通道序错了、范围错了，还是根本没错。
+static void SLVLogNV12Center(CVPixelBufferRef pb, NSString *tag) {
+    if (!pb) return;
+    if (!CVPixelBufferIsPlanar(pb) || CVPixelBufferGetPlaneCount(pb) < 2) return;
+
+    size_t w = CVPixelBufferGetWidth(pb);
+    size_t h = CVPixelBufferGetHeight(pb);
+    if (w < 4 || h < 4) return;
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return;
+
+    uint8_t *yB  = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+    uint8_t *uvB = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+    size_t yRB  = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+    size_t uvRB = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+
+    if (yB && uvB) {
+        // 亮度平面是全尺寸，色度平面只有一半宽高；中心点两边都要各取一半
+        size_t yi = (h / 2) * yRB + (w / 2);
+        size_t ui = (h / 4) * uvRB + (w / 4) * 2;
+        SLVLog(@"%@ 中心 Y=%u Cb=%u Cr=%u（%zux%zu）",
+               tag, yB[yi], uvB[ui], uvB[ui + 1], w, h);
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+}
+
+/// 按 BT.709 把 BGRA 中心像素换算成「应该得到的 Y/Cb/Cr」。
+///
+/// 跟 `SLVLogNV12Center` 配套：期望值和实际值差得离谱 = 转换错了；
+/// 两个值对得上但画面还是蓝 = 错在更上游（CI 读素材帧那一步）。
+static void SLVLogExpectYCbCr(CVPixelBufferRef bgra, BOOL full, NSString *tag) {
+    if (!bgra) return;
+    if (CVPixelBufferGetPixelFormatType(bgra) != kCVPixelFormatType_32BGRA) return;
+
+    size_t w = CVPixelBufferGetWidth(bgra);
+    size_t h = CVPixelBufferGetHeight(bgra);
+    if (w < 2 || h < 2) return;
+    if (CVPixelBufferLockBaseAddress(bgra, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return;
+
+    uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(bgra);
+    if (base) {
+        uint8_t *p = base + (h / 2) * CVPixelBufferGetBytesPerRow(bgra) + (w / 2) * 4;
+        double B = p[0], G = p[1], R = p[2];
+        double Y  = 0.2126 * R + 0.7152 * G + 0.0722 * B;
+        double Cb = (B - Y) / 1.8556 + 128.0;
+        double Cr = (R - Y) / 1.5748 + 128.0;
+        if (!full) {                       // 16-235 / 16-240
+            Y  = 16.0 + Y * 219.0 / 255.0;
+            Cb = 128.0 + (Cb - 128.0) * 224.0 / 255.0;
+            Cr = 128.0 + (Cr - 128.0) * 224.0 / 255.0;
+        }
+        SLVLog(@"%@ Y=%.0f Cb=%.0f Cr=%.0f（源 B=%u G=%u R=%u · %@）",
+               tag, Y, Cb, Cr, p[0], p[1], p[2], full ? @"全范围" : @"16-235");
+    }
+    CVPixelBufferUnlockBaseAddress(bgra, kCVPixelBufferLock_ReadOnly);
 }
 
 /// 把一张 BGRA 的 CVPixelBuffer 转成新建的 420v / 420f 双平面。
@@ -919,8 +988,18 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     BOOL keyChanged = ![sLastLoggedKey isEqualToString:key ?: @""];
     if (keyChanged || sLoopRounds % 20 == 0) {
         sLastLoggedKey = key ?: @"";
-        SLVLog(@"feed 管线就绪 %@ (video=%@ audio=%@)%@", key ?: @"(nil)",
+        // 0.3.17：把素材真实尺寸 / 解码格式也打出来。
+        // 「素材尺寸 ≠ 宿主尺寸」是走不走零拷贝的唯一判据，而蓝屏只出现在非零拷贝那条路，
+        // 所以这两个数必须能在日志里直接对上，不然只能靠猜。
+        CGSize ns = CGSizeZero;
+        [_lock lock];
+        ns = _naturalSize;
+        [_lock unlock];
+        OSType decPf = (OSType)[[_videoOut.outputSettings objectForKey:(id)kCVPixelBufferPixelFormatTypeKey] unsignedIntValue];
+        SLVLog(@"feed 管线就绪 %@ (video=%@ audio=%@) · 素材 %.0fx%.0f %u%@",
+              key ?: @"(nil)",
               _videoOut ? @"Y" : @"N", _audioOut ? @"Y" : @"N",
+              ns.width, ns.height, (unsigned)decPf,
               keyChanged ? @"" : [NSString stringWithFormat:@" · 第 %d 轮", sLoopRounds]);
     }
 }
@@ -1317,6 +1396,19 @@ BOOL SLVCamIsMomoProcess(void) {
     CGColorSpaceRelease(cs);
 
     BOOL ok = SLVBlitBGRAtoNV12(bgra, dst);
+
+    // 0.3.17：首次（以及每次换尺寸 / 换格式）把「输入 · 期望 · 实际」三个数打出来。
+    // 期望 ≈ 实际 说明转换是对的；差得远就是通道序或范围错了。
+    // 只在变化时打，30fps 下不会刷屏。
+    static NSString *sLastConvLog = nil;
+    NSString *convKey = [NSString stringWithFormat:@"%zux%zu:%u", w, h, (unsigned)dpf];
+    if (![sLastConvLog isEqualToString:convKey]) {
+        sLastConvLog = [convKey copy];
+        SLVLogCenterPixel(bgra, @"feed 转换前");
+        SLVLogExpectYCbCr(bgra, dpf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, @"feed 期望");
+        SLVLogNV12Center(dst, @"feed 转换后");
+    }
+
     CVPixelBufferRelease(bgra);
     return ok;
 }
