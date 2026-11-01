@@ -1390,11 +1390,27 @@ static void SLVCamSyncPreviewGeometry(AVCaptureVideoPreviewLayer *pl) {
     if (!CGPointEqualToPoint(dl.position, pos)) dl.position = pos;
 
     CATransform3D t = CATransform3DMakeRotation(deg * M_PI / 180.0, 0.0, 0.0, 1.0);
-    if (conn.isVideoMirrored) {
-        // 镜像要作用在「转完之后」的画面上，所以左乘 —— 右乘会变成上下翻。
-        t = CATransform3DConcat(CATransform3DMakeScale(-1.0, 1.0, 1.0), t);
-    }
+
+    // 0.3.26：**不再**叠 connection 的镜像。
+    //
+    // 喂进来的 fake 帧是我们按「用户设置」渲染出来的**最终画面** —— 用户要镜像的话
+    // `sl_image:` 里已经翻过一道了。这里再按 `conn.isVideoMirrored` 翻一次，
+    // 预览就比文件多翻一道，表现就是「录制时预览和发送后方向对不上」。
+    //
+    // Swiftgram 的实测：4:3 前置层是 `镜像=Y`，而文件那边的 transform 只有旋转
+    // （`[a=0 b=1 c=-1 d=0]`，没有 -1 的缩放分量），两边正好差一个水平翻转。
+    // 旋转 90° 叠上镜像，视觉上就成了「歪向另一边」，比单纯镜像更迷惑人。
+    //
+    // 预览层和文件现在用同一套几何：只转，不翻。要镜像就改设置里的开关，
+    // 那一条路会在渲染时生效，预览和文件同时变。
     dl.transform = t;
+
+    static BOOL sLoggedGeom = NO;
+    if (!sLoggedGeom) {
+        sLoggedGeom = YES;
+        SLVLog(@"预览: 几何 预览=%.0fx%.0f 旋转=%ld 显示层=%.0fx%.0f 镜像=不叠（fake 帧已定）",
+               pw, ph, (long)deg, lw, lh);
+    }
 }
 
 /// 挂载 + 对齐几何。**必须在主线程**：CALayer 的属性改动不能从采集线程直接来。
