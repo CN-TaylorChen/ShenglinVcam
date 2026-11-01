@@ -822,109 +822,94 @@ static int sSLAppendRotated = 0;
 static int sSLAppendSkippedFit = 0;
 static int sSLAppendFailed = 0;
 
-static void SLLogRotateFail(NSString *why, OSType pf, size_t w, size_t h) {
-    static int n = 0;
-    if (n++ >= 3) return;
-    SLVLog(@"镜像: 翻转失败 · %@ · %zux%zu pf=%u(%c%c%c%c)", why, w, h, (unsigned)pf,
-           (char)((pf >> 24) & 0xff), (char)((pf >> 16) & 0xff),
-           (char)((pf >> 8) & 0xff), (char)(pf & 0xff));
-}
-
-/// 把一帧图像顺时针转 90°，返回新的 sample buffer（调用方负责 CFRelease）。
+/// 把一帧图像**原地**左右翻转。不新建 buffer、不重建 sample buffer、不碰 fmt。
 ///
-/// 0.3.36：**改用 CoreImage，不再用 vImage。**
+/// 0.3.38：**放弃「新建 buffer + 重建 sample buffer」这条路。**
 ///
-/// 0.3.35 的日志里只有这一行：
+/// 0.3.33 ~ 0.3.37 一直在这条路上打转，而且两头是互斥的：
 ///
-///     方向: 转帧失败（buffer 400x400），本帧原样写
+///   · 新建 fmt（`CMVideoFormatDescriptionCreateForImageBuffer`）→ 重建能过，
+///     但 append 被拒 —— 新 fmt 丢了宿主那 5 项色彩扩展（0.3.33 的表现：
+///     日志说转了 90°，画面一点没变）。
+///   · 复用宿主的 fmt → append 能过，但重建过不了 —— 新 buffer 跟宿主的 fmt
+///     对不上（0.3.35 / 0.3.37 的表现：日志只有一句「翻转失败」）。
 ///
-/// vImage 那条路开头就写死了 `pf == kCVPixelFormatType_32BGRA`，别的格式直接放弃。
-/// 而宿主 writer 收到的 400x400 根本不是 BGRA —— 它是宿主自己从 1920x1440
-/// 缩放出来的，H.264 编码前的 YUV（420v）。所以**每一帧都被放弃了**，
-/// 画面一个像素都没转过。这就是「转了但没效果」的真正原因。
+/// 所以这一版干脆不重建：宿主 append 进来的是哪块 buffer，就直接把那块内存
+/// 左右翻过来，然后把**同一个 sample buffer** 原样 append 回去。
+/// 时间戳、附件、format description 全部原封不动，CM 那边没有任何可校验的东西。
 ///
-/// CoreImage 什么格式都吃（420v / 420f / BGRA），输出格式跟输入一致，
-/// 而且用 CGImagePropertyOrientation 表达「顺时针 90°」，
-/// 「旋转」和「镜像」是两件独立的事，不会糊在一起。
-static CMSampleBufferRef SLVCamRotate90SampleBuffer(CMSampleBufferRef src) {
-    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(src);
-    if (!pb) return NULL;
-
-    size_t w = CVPixelBufferGetWidth(pb);
-    size_t h = CVPixelBufferGetHeight(pb);
-    if (w < 2 || h < 2) return NULL;
+/// 支持两种格式（宿主实际会给的就是这两种）：
+///   · 32 位 BGRA / RGBA —— 每行按 4 字节一组对调
+///   · 420v / 420f 双平面 —— Y 平面每行按 1 字节对调，
+///     CbCr 平面每行按 **2 字节一组**对调（Cb 和 Cr 是一对，拆开颜色就花了）
+static BOOL SLVCamMirrorPixelBufferInPlace(CVPixelBufferRef pb) {
+    if (!pb) return NO;
 
     OSType pf = CVPixelBufferGetPixelFormatType(pb);
+    BOOL is32 = (pf == kCVPixelFormatType_32BGRA || pf == kCVPixelFormatType_32RGBA ||
+                 pf == kCVPixelFormatType_32ABGR || pf == kCVPixelFormatType_32ARGB);
+    BOOL is420 = (pf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+                  pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+    if (!is32 && !is420) return NO;
 
-    static CIContext *ctx = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        ctx = [CIContext contextWithOptions:nil];
-    });
+    if (CVPixelBufferLockBaseAddress(pb, 0) != kCVReturnSuccess) return NO;
 
-    CIImage *ci = [CIImage imageWithCVPixelBuffer:pb];
-    if (!ci) {
-        SLLogRotateFail(@"CIImage 建不出来", pf, w, h);
-        return NULL;
-    }
-
-    // 0.3.37：**只做水平镜像，不旋转。**
-    //
-    // 用户实测：0.3.35（转帧失败、原样写）的时候，「发送和预览是一个方向，
-    // 只是发送的被镜像了」。也就是说方向一直是对的 ——
-    // 前面几版拼命转 90°，转的其实是本来就不需要转的东西。
-    //
-    // 预览层是前置摄像头（isVideoMirrored=YES），它把假帧左右翻过来显示；
-    // 而 writer 那条路没有翻，所以成品跟预览比就「镜像」了。
-    //
-    // UpMirrored = 水平镜像（左右翻转），尺寸不变。
-    CIImage *rot = [ci imageByApplyingCGOrientation:kCGImagePropertyOrientationUpMirrored];
-    if (!rot) {
-        SLLogRotateFail(@"应用镜像失败", pf, w, h);
-        return NULL;
-    }
-
-    CVPixelBufferRef dst = NULL;
-    NSDictionary *attrs = @{
-        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-    };
-    if (CVPixelBufferCreate(kCFAllocatorDefault, h, w, pf,
-                            (__bridge CFDictionaryRef)attrs, &dst) != kCVReturnSuccess || !dst) {
-        SLLogRotateFail(@"目标 buffer 建不出来", pf, w, h);
-        return NULL;
-    }
-
-    [ctx render:rot toCVPixelBuffer:dst bounds:CGRectMake(0, 0, h, w) colorSpace:NULL];
-
-    // 镜像不改变宽高，fmt 永远可以原样复用 —— 色彩扩展一项不少。
-    CMFormatDescriptionRef srcFmt = CMSampleBufferGetFormatDescription(src);
-    CMFormatDescriptionRef newFmt = NULL;
-    if (srcFmt) {
-        newFmt = (CMFormatDescriptionRef)CFRetain(srcFmt);
+    if (is32) {
+        size_t w = CVPixelBufferGetWidth(pb);
+        size_t h = CVPixelBufferGetHeight(pb);
+        size_t rb = CVPixelBufferGetBytesPerRow(pb);
+        uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
+        if (base && w > 1) {
+            for (size_t y = 0; y < h; y++) {
+                uint8_t *row = base + y * rb;
+                for (size_t x = 0; x < w / 2; x++) {
+                    uint8_t *a = row + x * 4;
+                    uint8_t *b = row + (w - 1 - x) * 4;
+                    uint8_t t0 = a[0], t1 = a[1], t2 = a[2], t3 = a[3];
+                    a[0] = b[0]; a[1] = b[1]; a[2] = b[2]; a[3] = b[3];
+                    b[0] = t0; b[1] = t1; b[2] = t2; b[3] = t3;
+                }
+            }
+        }
     } else {
-        if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, dst, &newFmt) != noErr
-            || !newFmt) {
-            CVPixelBufferRelease(dst);
-            return NULL;
+        // 平面 0：Y，每像素 1 字节
+        uint8_t *p0 = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        size_t w0 = CVPixelBufferGetWidthOfPlane(pb, 0);
+        size_t h0 = CVPixelBufferGetHeightOfPlane(pb, 0);
+        size_t rb0 = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+        if (p0 && w0 > 1) {
+            for (size_t y = 0; y < h0; y++) {
+                uint8_t *row = p0 + y * rb0;
+                for (size_t x = 0; x < w0 / 2; x++) {
+                    uint8_t t = row[x];
+                    row[x] = row[w0 - 1 - x];
+                    row[w0 - 1 - x] = t;
+                }
+            }
+        }
+        // 平面 1：CbCr，每像素 2 字节
+        uint8_t *p1 = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        size_t w1 = CVPixelBufferGetWidthOfPlane(pb, 1);
+        size_t h1 = CVPixelBufferGetHeightOfPlane(pb, 1);
+        size_t rb1 = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+        if (p1 && w1 > 1) {
+            for (size_t y = 0; y < h1; y++) {
+                uint8_t *row = p1 + y * rb1;
+                for (size_t x = 0; x < w1 / 2; x++) {
+                    uint8_t *a = row + x * 2;
+                    uint8_t *b = row + (w1 - 1 - x) * 2;
+                    uint8_t t0 = a[0], t1 = a[1];
+                    a[0] = b[0]; a[1] = b[1];
+                    b[0] = t0; b[1] = t1;
+                }
+            }
         }
     }
 
-    // 时间戳必须原样带过去 —— 丢了它 writer 会按 0 写，整段视频时长就乱了。
-    CMSampleTimingInfo timing;
-    if (CMSampleBufferGetSampleTimingInfo(src, 0, &timing) != noErr) {
-        CFRelease(newFmt);
-        CVPixelBufferRelease(dst);
-        return NULL;
-    }
-
-    CMSampleBufferRef out = NULL;
-    OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, dst, newFmt,
-                                                           &timing, &out);
-    CFRelease(newFmt);
-    CVPixelBufferRelease(dst);
-    if (st != noErr || !out) return NULL;
-    return out;
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    return YES;
 }
+
 
 static BOOL SLVCamAppendSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
     if (!gSLAppendOrig) return NO;
@@ -942,10 +927,8 @@ static BOOL SLVCamAppendSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
 
     AVAssetWriterInput *inp = (AVAssetWriterInput *)self;
     CGAffineTransform t = CGAffineTransformIdentity;
-    NSDictionary *settings = nil;
     @try {
         t = inp.transform;
-        settings = inp.outputSettings;
     } @catch (NSException *e) { }
 
     // 宿主自己会转（普通视频录制）—— 不动。
@@ -957,57 +940,38 @@ static BOOL SLVCamAppendSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
 
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
     if (!pb) return gSLAppendOrig(self, _cmd, sb);
+
     size_t w = CVPixelBufferGetWidth(pb);
     size_t h = CVPixelBufferGetHeight(pb);
 
-    // 尺寸安全闸：writer 指定了尺寸就必须「转完正好等于它」。
-    if (settings) {
-        NSNumber *sw = settings[AVVideoWidthKey];
-        NSNumber *sh = settings[AVVideoHeightKey];
-        NSInteger tw = sw ? sw.integerValue : 0;
-        NSInteger th = sh ? sh.integerValue : 0;
-        if (tw > 0 && th > 0 && ((size_t)tw != h || (size_t)th != w)) {
-            sSLAppendSkippedFit++;
-            if (sSLAppendSkippedFit <= 3) {
-                SLVLog(@"方向: 跳过转帧 · buffer %zux%zu / writer 目标 %ldx%ld（转完 %zux%zu 对不上）",
-                       w, h, (long)tw, (long)th, h, w);
-            }
-            return gSLAppendOrig(self, _cmd, sb);
-        }
-    }
-
-    CMSampleBufferRef rotated = SLVCamRotate90SampleBuffer(sb);
-    if (!rotated) {
-        static BOOL loggedFail = NO;
-        if (!loggedFail) {
-            loggedFail = YES;
-            SLVLog(@"镜像: 翻转失败（buffer %zux%zu），本帧原样写", w, h);
+    // 0.3.38：原地翻转。不新建 buffer、不重建 sample buffer、不碰 fmt，
+    // 所以「尺寸对不上」「fmt 扩展丢了」这两类失败在结构上就不存在了。
+    if (!SLVCamMirrorPixelBufferInPlace(pb)) {
+        sSLAppendSkippedFit++;
+        if (sSLAppendSkippedFit <= 3) {
+            OSType pf = CVPixelBufferGetPixelFormatType(pb);
+            SLVLog(@"镜像: 格式不支持，跳过 · %zux%zu pf=%u(%c%c%c%c)",
+                   w, h, (unsigned)pf,
+                   (char)((pf >> 24) & 0xff), (char)((pf >> 16) & 0xff),
+                   (char)((pf >> 8) & 0xff), (char)(pf & 0xff));
         }
         return gSLAppendOrig(self, _cmd, sb);
     }
 
     sSLAppendRotated++;
     if (sSLAppendRotated == 1 || sSLAppendRotated % 90 == 0) {
-        SLVLog(@"镜像: 第 %d 帧水平翻转 · %zux%zu（writer transform=identity）",
-               sSLAppendRotated, w, h);
+        SLVLog(@"镜像: 第 %d 帧原地左右翻转 · %zux%zu", sSLAppendRotated, w, h);
     }
 
-    // 0.3.34：返回值必须看。
-    //
-    // 0.3.33 把这一行写成 `return gSLAppendOrig(...)`，失败也照样往下走 ——
-    // writer 一旦 failed，后面每一帧都写不进去，而日志里只有「转了 90°」，
-    // 看上去像「转了但没效果」。现在失败立刻记下来，带上 writer 的状态码。
-    BOOL ok = gSLAppendOrig(self, _cmd, rotated);
+    // 返回值还是要看：原地改像素不影响 append，但 writer 自己可能已经 failed。
+    BOOL ok = gSLAppendOrig(self, _cmd, sb);
     if (!ok) {
         sSLAppendFailed++;
         if (sSLAppendFailed <= 5) {
-            // AVAssetWriterInput 上没有公开的 writer 属性（0.3.34 第一次写就编译失败），
-            // 只打返回值 —— 有这一行就够判断「转帧到底进没进去」。
             SLVLog(@"镜像: append 被拒（第 %d 次）· %zux%zu · writer 不再接收这一帧",
                    sSLAppendFailed, w, h);
         }
     }
-    CFRelease(rotated);
     return ok;
 }
 
@@ -1150,6 +1114,32 @@ static NSInteger SLVCamPreviewRotationDeg(AVCaptureConnection *conn) {
 // 保留函数名是为了让下面的调用点读起来还有「有效角度」这层意思。
 static NSInteger SLVCamEffectivePreviewDeg(AVCaptureConnection *conn) {
     return SLVCamPreviewRotationDeg(conn);
+}
+
+/// 0.3.38：只判断「这一层还在视图树里、看得见」，**不管尺寸**。
+///
+/// 切换摄像头时 Swiftgram 会重建预览层，新层先 0x0，过一会儿才有尺寸。
+/// 原来 `SLVCamMountPreviewDisplay` 在 0x0 时直接 return，那段空档底下
+/// 就是原生预览 —— 用户看到的就是「切换摄像头闪一下」。
+/// 挂载要用这个宽松判据，喂帧过滤仍用下面那个带尺寸的。
+static BOOL SLVCamPreviewLayerAttached(AVCaptureVideoPreviewLayer *pl) {
+    if (!pl) return NO;
+    if (pl.isHidden) return NO;
+    if (pl.opacity < 0.01f) return NO;
+
+    id d = pl.delegate;
+    if ([d isKindOfClass:[UIView class]]) {
+        if (!((UIView *)d).window) return NO;
+    }
+
+    CALayer *p = pl.superlayer;
+    int guard = 0;
+    while (p && guard++ < 16) {
+        if (p.hidden) return NO;
+        if (p.opacity < 0.01f) return NO;
+        p = p.superlayer;
+    }
+    return YES;
 }
 
 // 0.3.23：这个预览层现在真的在屏幕上吗？
@@ -1324,13 +1314,16 @@ static void SLVCamSyncPreviewGeometry(AVCaptureVideoPreviewLayer *pl) {
 static void SLVCamMountPreviewDisplay(AVCaptureVideoPreviewLayer *pl) {
     if (!pl || !pl.superlayer) return;
 
-    // 0.3.22：尺寸还没定下来（0x0）就别挂。Swiftgram 的日志里就有
-    // 「挂上显示层 预览=0x0 会话=有」—— 一块零面积的层，白建一套渲染面。
-    // 等它有了尺寸，下一帧自然会再进来一次。
-    if (pl.bounds.size.width < 8.0 || pl.bounds.size.height < 8.0) return;
-
-    // 0.3.23：藏起来的预览层不挂。挂着它就会跟着喂帧，bounds 一变就重算裁切。
-    if (!SLVCamPreviewLayerVisible(pl)) return;
+    // 0.3.38：**不再因为 0x0 就不挂。**
+    //
+    // 0.3.22 的注释写的是「一块零面积的层，白建一套渲染面」。这话对普通情况没错，
+    // 但切换摄像头时 Swiftgram 会重建预览层：新层先 0x0，一秒后才长到 369x492。
+    // 这中间底下一直是原生预览 —— 就是用户说的「切换摄像头会闪」。
+    //
+    // 现在只要层已经进了视图树就立刻挂一块黑的盖住，几何等有尺寸了再对。
+    // 黑色背景在 0x0 时看不见，但层一旦长到有尺寸，`SLVCamPreviewSizeChanged`
+    // 会在同一帧把它铺满，中间不留空档。
+    if (!SLVCamPreviewLayerAttached(pl)) return;
 
     AVSampleBufferDisplayLayer *dl = objc_getAssociatedObject(pl, &kSLPreviewDisplayKey);
     if (!dl) {
@@ -1338,6 +1331,7 @@ static void SLVCamMountPreviewDisplay(AVCaptureVideoPreviewLayer *pl) {
         dl.videoGravity = AVLayerVideoGravityResizeAspectFill;
         dl.masksToBounds = YES;
         dl.backgroundColor = [UIColor blackColor].CGColor;
+        dl.hidden = NO;
         [pl addSublayer:dl];
         objc_setAssociatedObject(pl, &kSLPreviewDisplayKey, dl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         gSLPreviewMounted = YES;
@@ -1353,7 +1347,11 @@ static void SLVCamMountPreviewDisplay(AVCaptureVideoPreviewLayer *pl) {
                (long)SLVCamPreviewRotationDeg(conn),
                (conn && conn.isVideoMirrored) ? @"Y" : @"N");
     }
-    SLVCamSyncPreviewGeometry(pl);
+
+    // 几何只在有尺寸时才对 —— 0x0 时算出来的比例是 inf，会把层摆成一条线。
+    if (pl.bounds.size.width >= 8.0 && pl.bounds.size.height >= 8.0) {
+        SLVCamSyncPreviewGeometry(pl);
+    }
 }
 
 /// 复制一份 sample buffer 给显示层用。
@@ -1434,7 +1432,18 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb) {
 
     for (AVCaptureVideoPreviewLayer *pl in layers) {
         if (![pl isKindOfClass:[AVCaptureVideoPreviewLayer class]]) continue;
-        // 0.3.23：藏起来 / 透明的预览层一律跳过。
+
+        // 0.3.38：挂载走宽松判据 —— 只要层在视图树里就挂，哪怕还是 0x0。
+        // 切换摄像头时新层先 0x0，原来这里被 `SLVCamPreviewLayerVisible`
+        // （带尺寸检查）挡掉，那一秒底下露的就是原生预览。
+        if (!objc_getAssociatedObject(pl, &kSLPreviewDisplayKey) &&
+            SLVCamPreviewLayerAttached(pl)) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                SLVCamMountPreviewDisplay(pl);
+            });
+        }
+
+        // 0.3.23：藏起来 / 透明的预览层一律跳过喂帧。
         // 原来只判 superlayer，Swiftgram 那两层里被藏起来的那一层照样每帧喂，
         // 它的 bounds 一变，屏幕上正在显示的那层就跟着「放大一下」。
         if (!SLVCamPreviewLayerVisible(pl)) continue;
@@ -1443,10 +1452,7 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb) {
 
         AVSampleBufferDisplayLayer *dl = objc_getAssociatedObject(pl, &kSLPreviewDisplayKey);
         if (!dl) {
-            // 挂载动作丢到主线程，这一帧先跳过 —— 下一帧就能接上
-            dispatch_async(dispatch_get_main_queue(), ^{
-                SLVCamMountPreviewDisplay(pl);
-            });
+            // 挂载动作已经丢到主线程了，这一帧先跳过 —— 下一帧就能接上
             continue;
         }
         if (wantSync || SLVCamPreviewSizeChanged(pl)) {
