@@ -943,8 +943,16 @@ static void SLVShowMediaLibrary(void);
     // 0.3.13：点击主球进**设置**（原来进素材库）。
     // 素材库挪到「长按启用球」，设置页里也还有「当前素材」那一行，两条路都通。
     // 跟启用状态无关 —— 用户常常是「先改设置，再打开开关」，这里不能拦。
+    //
+    // 0.3.18：这条日志是「点球没反应」的唯一入口证据 ——
+    // 没有这行 = 触摸根本没到球（被上层窗口挡住）；
+    // 有这行但后面没有「面板弹出」= 呈现链路被拦了。
     UIViewController *host = SLVTopViewController();
+    SLVLog(@"SL-VCAM: 点球 → host=%@ 窗口=%@",
+           host ? NSStringFromClass([host class]) : @"(nil)",
+           NSStringFromClass([self.window class]) ?: @"(nil)");
     if (host) [SLVFloatPanelController presentSettingsFrom:host];
+    else SLVLog(@"SL-VCAM: 点球取消 —— 没找到能 present 的控制器");
 }
 
 - (void)sl_longPress:(UILongPressGestureRecognizer *)g {
@@ -1056,12 +1064,25 @@ static SLVFloatPanelController *sSLFloatPanel = nil;
 @implementation SLVFloatPanelController
 
 + (void)presentFrom:(UIViewController *)host root:(UIViewController *)root {
-    if (!host || !root) return;
+    if (!host || !root) {
+        SLVLog(@"SL-VCAM: 面板取消 —— host 或 root 为空");
+        return;
+    }
     // v0.4.55：设置已开时长按球，topViewController 返回的是设置页本身（它没再 present 东西），
     // 旧判断 host.presentedViewController 拦不住，会叠第二层。改用全局实例判断。
-    if (sSLFloatPanel && sSLFloatPanel.presentingViewController) return;
+    if (sSLFloatPanel && sSLFloatPanel.presentingViewController) {
+        SLVLog(@"SL-VCAM: 面板取消 —— 上一层面板还挂着（没被正常关闭）");
+        return;
+    }
     // 已经有浮窗开着就不叠第二层，避免连点两次出现两张卡片
-    if (host.presentedViewController) return;
+    if (host.presentedViewController) {
+        SLVLog(@"SL-VCAM: 面板取消 —— host 已经在 present 别的东西（%@）",
+               NSStringFromClass([host.presentedViewController class]));
+        return;
+    }
+    SLVLog(@"SL-VCAM: 面板弹出 host=%@ 窗口=%@",
+           NSStringFromClass([host class]),
+           NSStringFromClass([host.view.window class]) ?: @"(nil)");
     SLVFloatPanelController *vc = [[SLVFloatPanelController alloc] init];
     sSLFloatPanel = vc;
     vc.rootVC = root;
@@ -1372,6 +1393,19 @@ static BOOL SLVIsSystemOverlayWindow(UIWindow *w) {
         || [cn containsString:@"StatusBar"] || [cn containsString:@"Selection"];
 }
 
+// 0.3.18：这个窗口到底接不接触摸？
+//
+// 「球看得见但点不动」的元凶就是这类窗口：画面照常显示，但窗口本身把触摸放行了。
+// Turrit（Telegram 魔改版）里就有一层 `HitTransparentWindow` —— 类名直说了它让触摸
+// 穿透到下面的主窗口，`hitTest:` 恒返回 nil。球挂上去看着好好的，点、拖、长按全废。
+//
+// 不按类名过滤：名字谁都能起，而「问它接不接这个点」是运行时事实。
+static BOOL SLVWindowAcceptsTouch(UIWindow *w) {
+    if (!w || !w.isUserInteractionEnabled) return NO;
+    CGPoint p = CGPointMake(CGRectGetMidX(w.bounds), CGRectGetMidY(w.bounds));
+    return [w hitTest:p withEvent:nil] != nil;
+}
+
 // iOS15 SDK 起 -[UIApplication windows] 被弃用，工程开了 -Werror，这里局部抑制并优先走场景 API。
 // v0.4.37：不再只认 ForegroundActive + isKeyWindow。陌陌启动早期常是启动页 / 广告窗，
 // 球挂上去那窗一关就跟着没了；另一种是球被更高层的窗压住，viewWithTag 还能找到，
@@ -1404,6 +1438,16 @@ static UIWindow *SLVKeyWindow(void) {
         }
     }
 #pragma clang diagnostic pop
+
+    // 0.3.18：只在「真的能收到触摸」的窗口里挑。
+    // 一个都没有就退回原列表 —— 转场 / 启动早期可能有窗口暂时不接触摸，
+    // 这时候宁可先挂上去，也不要整个不挂。
+    NSMutableArray<UIWindow *> *touchable = [NSMutableArray array];
+    for (UIWindow *w in list) {
+        if (SLVWindowAcceptsTouch(w)) [touchable addObject:w];
+    }
+    if (touchable.count > 0) list = touchable;
+
     UIWindow *best = nil;
     for (UIWindow *w in list) {
         if (!best) { best = w; continue; }
@@ -1671,6 +1715,30 @@ void SLVEnsureFloatButton(void) {
         created = YES;
     }
     sSLFloatBtn = btn;
+
+    // 0.3.18：探一次「球心到底能不能收到触摸」。
+    //
+    // 「球看得见但点不动」只有两种可能：
+    //   ① 上面还压着一层窗口 / 视图，触摸被它吃掉了；
+    //   ② 触摸到了，但呈现链路静默失败（host 拿到 nil 之类）。
+    // 这条日志直接把 ① 排除掉：命中结果不是球自己，就说明有人挡着。
+    // 每个窗口只探一次，不会刷屏。
+    if (btn && btn.window) {
+        static NSMutableSet *sProbedWindows = nil;
+        UIWindow *bw = btn.window;
+        NSString *pk = NSStringFromClass([bw class]);
+        if (!sProbedWindows) sProbedWindows = [NSMutableSet set];
+        if (![sProbedWindows containsObject:pk]) {
+            [sProbedWindows addObject:pk];
+            CGPoint hitPt = [btn convertPoint:CGPointMake(CGRectGetMidX(btn.bounds),
+                                                          CGRectGetMidY(btn.bounds))
+                                       toView:bw];
+            UIView *hit = [bw hitTest:hitPt withEvent:nil];
+            SLVLog(@"SL-VCAM: 命中测试 窗口=%@ 交互=%@ 球心命中=%@",
+                   pk, bw.isUserInteractionEnabled ? @"开" : @"关",
+                   hit ? NSStringFromClass([hit class]) : @"nil");
+        }
+    }
 
     // 0.3.5：新建的球必须马上刷一次状态。
     //

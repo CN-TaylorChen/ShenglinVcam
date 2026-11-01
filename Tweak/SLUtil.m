@@ -102,24 +102,53 @@ void SLVToastLong(NSString *message) {
 }
 
 UIViewController *SLVTopViewController(void) {
-    UIWindow *win = nil;
+    // 0.3.18：先收集所有窗口，再挑一个**真的能 present** 的。
+    //
+    // 原来是「找到 isKeyWindow 就用它，然后拿 rootViewController」。问题是
+    // QQ 在通话/直播场景下 keyWindow 常常是 QQRTCWindow 这类浮层窗，
+    // 而浮层窗的 rootViewController 是 nil —— 于是 host 拿到 nil，
+    // 点击悬浮球走到 presentSettingsFrom: 第一行 `if (!host) return;` 就没了。
+    // 表现就是「点了完全没反应」，而且日志里一个字都不会有。
+    NSMutableArray<UIWindow *> *wins = [NSMutableArray array];
     for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
         if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)sc).windows) {
-            if (w.isKeyWindow) { win = w; break; }
-        }
-        if (win) break;
+        [wins addObjectsFromArray:((UIWindowScene *)sc).windows];
     }
     #pragma clang diagnostic push
     #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    if (!win) win = [UIApplication sharedApplication].keyWindow;
+    if (wins.count == 0) [wins addObjectsFromArray:[UIApplication sharedApplication].windows];
     #pragma clang diagnostic pop
+
+    // 1) 优先 key window —— 它一般是用户此刻正在操作的那个
+    UIWindow *win = nil;
+    for (UIWindow *w in wins) {
+        if (w.isKeyWindow && w.rootViewController) { win = w; break; }
+    }
+
+    // 2) key window 不可用（没根控制器 / 没有 key），按 windowLevel 从高到低找
+    //    第一个「有根控制器、可见」的。浮层窗因为没有根控制器会被自然跳过。
+    if (!win) {
+        for (UIWindow *w in wins) {
+            if (!w.rootViewController) continue;
+            if (w.isHidden || w.alpha < 0.01) continue;
+            if (!win || w.windowLevel > win.windowLevel) win = w;
+        }
+    }
+    if (!win) return nil;
+
     UIViewController *vc = win.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     if ([vc isKindOfClass:[UINavigationController class]]) {
         vc = ((UINavigationController *)vc).topViewController;
     } else if ([vc isKindOfClass:[UITabBarController class]]) {
         vc = ((UITabBarController *)vc).selectedViewController;
+    }
+
+    // 3) 已经脱离窗口的控制器不能拿来 present（会静默失败）。
+    //    用 viewIfLoaded 判断，不去强制加载宿主那些很重的视图。
+    //    一路往上退，直到找到一个真的挂在窗口上的祖先。
+    while (vc && vc.viewIfLoaded && !vc.viewIfLoaded.window && vc.parentViewController) {
+        vc = vc.parentViewController;
     }
     return vc;
 }

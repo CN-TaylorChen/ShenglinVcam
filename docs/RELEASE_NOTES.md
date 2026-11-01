@@ -1,3 +1,64 @@
+## 0.3.18 —— 修「悬浮球看得见但点不动」
+
+### 现场
+
+Turrit（Telegram 魔改版，`com.seastar.turrit`）里悬浮球正常显示，但点、拖、长按全都没反应，
+而且日志里一个字都不打 —— 典型的「静默失败」。
+
+### 两处静默失败，都堵上了
+
+**① 挂到了「不接触摸」的窗口上**
+
+Turrit 自带一套浮窗体系，二进制里能直接看到这些类：
+
+```
+TtC11SwiftTweaks11TweakWindow            TweakWindow
+TtC11SwiftTweaks20HitTransparentWindow   HitTransparentWindow
+TweakGroupUIWindow / InFloatingTweakGroupWindow / TopWindow
+```
+
+`HitTransparentWindow` 顾名思义是**让触摸穿透**的窗口，`hitTest:` 恒返回 nil，
+好让触摸落到下面的主窗口去。球挂上去画面完全正常，但永远收不到点击。
+
+`SLVKeyWindow()` 原来只看「windowLevel 最高 + 可见 + 不是系统浮层」，挡不住它。
+现在加了一道运行时判断 —— 不按类名（名字谁都能起），直接问窗口「这个点你接不接」：
+
+```objc
+CGPoint p = CGPointMake(CGRectGetMidX(w.bounds), CGRectGetMidY(w.bounds));
+return [w hitTest:p withEvent:nil] != nil;
+```
+
+优先只在能收到触摸的窗口里挑；一个都没有才退回原列表（转场期间不至于整个不挂球）。
+
+**② `SLVTopViewController()` 拿到 nil 就直接返回**
+
+原来只认 `isKeyWindow` 的那个窗口，然后取 `rootViewController`。Turrit 这类 App 的
+keyWindow 经常是浮层窗，**`rootViewController` 是 nil** —— 于是 `host` 是 nil，
+`presentSettingsFrom:` 第一行 `if (!host) return;` 直接吞掉，什么都不发生。
+
+现在：
+- 先找 key window，但**要求它有根控制器**；
+- 没有就按 windowLevel 从高到低，挑第一个「有根控制器且可见」的；
+- 最后再确认这个控制器**真的挂在窗口上**（用 `viewIfLoaded` 判断，不强制加载宿主的重视图），
+  脱离窗口就一路往父控制器退。
+
+### 加了三条定位日志
+
+以后再「点了没反应」，日志能直接指到哪一步：
+
+```
+SL-VCAM: 命中测试 窗口=TweakWindow 交互=开 球心命中=SLVFloatButton   ← 触摸能不能到球
+SL-VCAM: 点球 → host=TGViewController 窗口=TweakWindow              ← 点击事件有没有来
+SL-VCAM: 面板弹出 host=TGViewController 窗口=TweakWindow            ← 呈现有没有成功
+```
+
+三行缺哪一行，就知道断在哪：
+- 没有「点球」→ 触摸没到球（被上层窗口挡了）
+- 有「点球」但没有「面板弹出」→ 呈现链路被拦，日志会写明原因
+  （上一层面板没关 / host 已在 present 别的东西）
+
+---
+
 ## 0.3.17 —— 修「替换的视频整片发蓝」
 
 ### 现象
