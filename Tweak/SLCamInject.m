@@ -67,8 +67,6 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb);
 static void SLVCamTeardownPreview(void);
 static void SLVCamTeardownPreviewIfStale(void);
 static NSInteger SLVCamPreviewRotationDeg(AVCaptureConnection *conn);
-/// 0.3.29：竖采集的兜底，定义在会话那一段，注入主流程第一帧要用。
-static void SLVCamEnsurePortraitForOutput(id output);
 
 /// 音视频输出可能各自重写了 _processSampleBuffer:，必须按 Method 分别保存原始 IMP，
 /// 否则音频会走到视频的原始实现上去（表现为只有画面变、声音还在）。
@@ -512,10 +510,6 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
     // 宿主写文件时会不会再转一次，取决于它自己的 connection 角度 ——
     // 这个数跟预览层的角度一对比，就知道「文件歪」是不是差在这里。
     if (mediaType == kCMMediaType_Video) {
-        // 0.3.29：兜底。不管宿主怎么把这个输出加进会话的，第一帧一定从它手里出来。
-        // 之前没接住的那条路（视频消息），在这里补上。
-        SLVCamEnsurePortraitForOutput(self);
-
         static BOOL sLoggedOutConn = NO;
         if (!sLoggedOutConn) {
             sLoggedOutConn = YES;
@@ -618,98 +612,25 @@ static void SLVCamDumpCandidates(const char *className) {
           hits.count ? [hits componentsJoinedByString:@", "] : @"(无)");
 }
 
-#pragma mark - 竖采集（0.3.28 引入，0.3.30 关闭）
+#pragma mark - 竖采集（0.3.28 引入，0.3.31 彻底移除）
 
+// 这条路的完整经过，留给以后别再试：
+//
 // Swiftgram 的视频消息是 **400x400 正方形**。正方形上挂 90° 旋转矩阵，
 // 转了跟没转在取景上完全一样，只有内容朝向差 90° —— 而它的播放端不认
 // track transform（0.3.27 的日志已经把 transform 写进文件了，成品照样歪）。
 //
-// 当时的想法：让采集连接直接交出竖的 buffer，像素本身是正的，transform 保持 identity。
+// 于是想：让采集连接直接交出竖的 buffer，像素本身是正的，transform 保持 identity。
 //
 // **0.3.30 实测结论：这条路不能走。**
-//   - 视频消息的方向**还是不对**（缓冲已经变竖 1080x1920、transform 已经是 identity，
-//     发出去照样歪）；
+//   - 视频消息的方向**还是不对**（buffer 已经变竖 1080x1920、transform 已经是
+//     identity，发出去照样歪）；
 //   - 更糟的是把**拍照和普通视频录制一起带坏了** —— 整条采集链路的基准都变了。
 //
-// 收益为零、代价是整个采集管线，所以整体关掉，行为退回 0.3.27。
+// 收益为零、代价是整个采集管线。0.3.31 起代码整体删除，不再留开关。
 //
-// 代码先留着不删：思路本身没错，错在**层面**。真要再试，只能换成
-// 「只在写文件前转帧」（挂 appendSampleBuffer:），绝不能再动 AVCaptureSession。
-static const BOOL kSLPortraitCaptureEnabled = NO;
-
-static NSInteger const SLVPortraitDeg = 90;
-
-/// 竖采集走这条的 App。
-///
-/// Swiftgram：视频消息是 400x400 正方形，transform 走不通（0.3.27 已证）。
-/// Turrit：同一个 Telegram 内核，同样的毛病，用户要求一起加。
-///
-/// 抖音 / 陌陌 / QQ 现在都是好的，不能因为这两个 App 把它们的采集管线一起改了。
-static BOOL SLVCamPortraitCapture(void) {
-    if (!kSLPortraitCaptureEnabled) return NO;
-
-    static BOOL on = NO;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        on = [bid isEqualToString:@"app.swiftgram.ios"]      // Swiftgram
-          || [bid isEqualToString:@"com.seastar.turrit"];    // Turrit（Telegram 魔改）
-    });
-    return on;
-}
-
-/// 这条连接是不是视频数据输出。预览层的 connection `output` 是 nil，
-/// 拍照输出是 AVCapturePhotoOutput —— 后者绝对不能碰，照片方向现在是对的。
-static BOOL SLVCamIsVideoDataConnection(AVCaptureConnection *conn) {
-    if (!conn) return NO;
-    id out = nil;
-    @try { out = conn.output; } @catch (NSException *e) { }
-    return [out isKindOfClass:[AVCaptureVideoDataOutput class]];
-}
-
-/// 把一条视频数据输出连接掰成竖的。已经是竖的就什么都不做。
-static void SLVCamForcePortraitConnection(AVCaptureConnection *conn, const char *why) {
-    if (!conn || !SLVCamIsVideoDataConnection(conn)) return;
-
-    if (@available(iOS 17.0, *)) {
-        if (fabs(conn.videoRotationAngle - (double)SLVPortraitDeg) < 0.5) return;
-        conn.videoRotationAngle = (CGFloat)SLVPortraitDeg;
-    } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        if (conn.videoOrientation == AVCaptureVideoOrientationPortrait) return;
-        conn.videoOrientation = AVCaptureVideoOrientationPortrait;
-#pragma clang diagnostic pop
-    }
-    SLVLog(@"竖采集: %s → 视频输出连接改成 %ld°（让 buffer 本身就是竖的）",
-           why ? why : "?", (long)SLVPortraitDeg);
-}
-
-/// 宿主自己会设 0°，设完我们的就没了 —— 所以把 setter 也接住。
-typedef void (*SLVSetRotAngleFn)(id, SEL, CGFloat);
-static SLVSetRotAngleFn gSLSetRotAngleOrig = NULL;
-
-static void SLVCamSetVideoRotationAngle(id self, SEL _cmd, CGFloat angle) {
-    CGFloat use = angle;
-    if (SLVCamPortraitCapture() && SLVCamIsVideoDataConnection((AVCaptureConnection *)self)) {
-        use = (CGFloat)SLVPortraitDeg;
-    }
-    if (gSLSetRotAngleOrig) gSLSetRotAngleOrig(self, _cmd, use);
-}
-
-typedef void (*SLVSetOrientationFn)(id, SEL, NSInteger);
-static SLVSetOrientationFn gSLSetOrientationOrig = NULL;
-
-static void SLVCamSetVideoOrientation(id self, SEL _cmd, NSInteger orientation) {
-    NSInteger use = orientation;
-    if (SLVCamPortraitCapture() && SLVCamIsVideoDataConnection((AVCaptureConnection *)self)) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        use = AVCaptureVideoOrientationPortrait;
-#pragma clang diagnostic pop
-    }
-    if (gSLSetOrientationOrig) gSLSetOrientationOrig(self, _cmd, use);
-}
+// 真要再试，只能换成「只在写文件前转帧」（挂 appendSampleBuffer:），
+// 绝不能再动 AVCaptureSession。
 
 #pragma mark - 会话输出探测
 
@@ -724,17 +645,6 @@ static void SLVCamAddOutput(id self, SEL _cmd, id output) {
     }
     if (gSLAddOutputOrig) {
         ((SLVAddOutputFn)gSLAddOutputOrig)(self, _cmd, output);
-    }
-
-    // 0.3.28：刚加进来的视频输出立刻掰成竖的，别等第一帧。
-    // 晚一步的代价是第一帧还是横的，宿主的 writer 可能就按横的定下来了。
-    if (output && SLVCamPortraitCapture() &&
-        [output isKindOfClass:[AVCaptureVideoDataOutput class]]) {
-        @try {
-            AVCaptureConnection *c =
-                [(AVCaptureOutput *)output connectionWithMediaType:AVMediaTypeVideo];
-            SLVCamForcePortraitConnection(c, "addOutput");
-        } @catch (NSException *e) { }
     }
 
     // 会话开始装配输出，往往意味着 RTC / 录音 SDK 已经加载完了，
@@ -764,77 +674,23 @@ static void SLVCamAddOutputNoConnections(id self, SEL _cmd, id output) {
     SLVCamInstallAudioUnitHook();
 }
 
-static IMP gSLAddConnectionOrig = NULL;
-
-static void SLVCamAddConnection(id self, SEL _cmd, AVCaptureConnection *conn) {
-    if (gSLAddConnectionOrig) {
-        ((void (*)(id, SEL, id))gSLAddConnectionOrig)(self, _cmd, conn);
-    }
-    if (SLVCamPortraitCapture() && SLVCamIsVideoDataConnection(conn)) {
-        SLVCamForcePortraitConnection(conn, "addConnection");
-    }
-}
-
-// 0.3.29：最后的兜底 —— 不管宿主用哪条路把输出加进来的，
-// 第一帧视频从它手里出来的时候我们一定知道是谁。在这里补一刀。
-static char kSLPortraitTriedKey;
-
-static void SLVCamEnsurePortraitForOutput(id output) {
-    if (!SLVCamPortraitCapture()) return;
-    if (![output isKindOfClass:[AVCaptureVideoDataOutput class]]) return;
-    if (objc_getAssociatedObject(output, &kSLPortraitTriedKey)) return;
-    objc_setAssociatedObject(output, &kSLPortraitTriedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    // 不在采集回调线程上直接改连接属性 —— 那会触发会话重配，
-    // 万一宿主正在等这一帧，就容易卡住。丢到后台去。
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        @try {
-            AVCaptureConnection *c =
-                [(AVCaptureOutput *)output connectionWithMediaType:AVMediaTypeVideo];
-            SLVCamForcePortraitConnection(c, "首帧兜底");
-        } @catch (NSException *e) {
-            SLVLog(@"竖采集: 首帧兜底失败（%@）", e.reason ?: @"?");
-        }
-    });
-}
-
 static void SLVCamHookSessionOutputs(void) {
     Class cls = objc_getClass("AVCaptureSession");
-
-    // 0.3.28：连接的旋转角 setter 先接住 —— 宿主每次设 0° 都会走到这里，
-    // 我们在它落地之前换回竖的。放在下面的 return 之前，免得早退漏挂。
-    Class connCls = objc_getClass("AVCaptureConnection");
-    if (connCls && SLVCamPortraitCapture()) {
-        Method mAngle = class_getInstanceMethod(connCls, NSSelectorFromString(@"setVideoRotationAngle:"));
-        if (mAngle && !gSLSetRotAngleOrig) {
-            gSLSetRotAngleOrig = (SLVSetRotAngleFn)method_getImplementation(mAngle);
-            method_setImplementation(mAngle, (IMP)SLVCamSetVideoRotationAngle);
-        }
-        Method mOrient = class_getInstanceMethod(connCls, NSSelectorFromString(@"setVideoOrientation:"));
-        if (mOrient && !gSLSetOrientationOrig) {
-            gSLSetOrientationOrig = (SLVSetOrientationFn)method_getImplementation(mOrient);
-            method_setImplementation(mOrient, (IMP)SLVCamSetVideoOrientation);
-        }
-    }
-
     if (!cls) return;
+
     Method m = class_getInstanceMethod(cls, @selector(addOutput:));
     if (m && !gSLAddOutputOrig) {
         gSLAddOutputOrig = method_getImplementation(m);
         method_setImplementation(m, (IMP)SLVCamAddOutput);
     }
 
-    // 0.3.29：手工连线那条路也要接。Swiftgram 的视频消息会话走的就是它
-    // （0.3.28 日志里没有 `会话加输出: AVCaptureVideoDataOutput`，但帧在流）。
+    // `addOutput:` 不是唯一的加输出方式：Swiftgram 的视频消息会话走的是
+    // `addOutputWithNoConnections:`，日志里只有 `会话加输出(手工连线)` 那一行。
+    // 两条都接住，只为了把「会话加了什么」打全 —— 注入本身不依赖它。
     Method mNoConn = class_getInstanceMethod(cls, NSSelectorFromString(@"addOutputWithNoConnections:"));
     if (mNoConn && !gSLAddOutputNoConnOrig) {
         gSLAddOutputNoConnOrig = method_getImplementation(mNoConn);
         method_setImplementation(mNoConn, (IMP)SLVCamAddOutputNoConnections);
-    }
-    Method mConn = class_getInstanceMethod(cls, NSSelectorFromString(@"addConnection:"));
-    if (mConn && !gSLAddConnectionOrig) {
-        gSLAddConnectionOrig = method_getImplementation(mConn);
-        method_setImplementation(mConn, (IMP)SLVCamAddConnection);
     }
 }
 
@@ -851,7 +707,6 @@ static void SLVCamHookSessionOutputs(void) {
 // 两套接管方式完全不同 —— 没确认走哪条就写，大概率白做。
 static void (*gSLTapOrig)(id, SEL, NSUInteger, AVAudioFrameCount, AVAudioFormat *, id);
 static BOOL (*gSLRecorderOrig)(id, SEL);
-static void (*gSLMovieStartOrig)(id, SEL, NSURL *, id);
 
 static void SLVCamAudioTapProbe(id self, SEL _cmd, NSUInteger bus, AVAudioFrameCount frames,
                                AVAudioFormat *fmt, id block) {
@@ -877,247 +732,15 @@ static BOOL SLVCamRecorderProbe(id self, SEL _cmd) {
     return gSLRecorderOrig ? gSLRecorderOrig(self, _cmd) : NO;
 }
 
-static void SLVCamMovieStartProbe(id self, SEL _cmd, NSURL *url, id delegate) {
-    static BOOL logged = NO;
-    if (!logged) {
-        logged = YES;
-        SLVLog(@"音频: 命中 AVCaptureMovieFileOutput 录制（%@）· 画面会绕过 VideoDataOutput",
-              url.lastPathComponent ?: @"?");
-
-        // 0.3.23：把这条 connection 的旋转角打出来。
-        // 「预览是正的、文件是歪的」只可能有两种原因：这条 connection 的角度跟
-        // 预览层不一致，或者宿主根本没把角度写进文件。先把这个数拿到手。
-        @try {
-            AVCaptureConnection *c =
-                [(AVCaptureMovieFileOutput *)self connectionWithMediaType:AVMediaTypeVideo];
-            if (c) {
-                SLVLog(@"录制: MovieFileOutput 连接 旋转=%ld 镜像=%@",
-                       (long)SLVCamPreviewRotationDeg(c), c.isVideoMirrored ? @"Y" : @"N");
-            } else {
-                SLVLog(@"录制: MovieFileOutput 拿不到 video 连接");
-            }
-        } @catch (NSException *e) {
-            SLVLog(@"录制: MovieFileOutput 读连接失败（%@）", e.reason ?: @"?");
-        }
-    }
-    if (gSLMovieStartOrig) gSLMovieStartOrig(self, _cmd, url, delegate);
-}
-
-// 0.3.24：AVAssetWriter 这条路写文件时的 transform。
+// 0.3.31：录制方向的三条路（setTransform / markAsFinished / startWriting 兜底）
+// 和成品 transform 探针全部移除，原因写在 docs/RELEASE_NOTES.md 的 0.3.31 一节：
 //
-// 宿主如果在这里设了旋转，文件播放时就会转；设成 identity 就不转 ——
-// 我们塞进去的「躺着」的像素会原样播出来，也就是「发送后歪 90°」。
+//   · 0.3.27 的探针已经证明 transform 确实进了文件的 tkhd，播放端就是不认；
+//   · 0.3.29 的竖采集证明「让 buffer 变竖」也没用，而且会带坏拍照和普通录制。
 //
-// Swiftgram 的实测（13:18~13:19 两段日志）：
-//   13:19:01 transform = [a=0 b=1 c=-1 d=0]   ← 90°，这条是对的
-//   13:19:40 transform = [a=1 b=0 c=0 d=1]    ← identity，这条就是「视频消息发送后歪」
-//
-// 同一个 App 两条录制链路给的值不一样，说明它按场景自己算，而视频消息那条算漏了
-// （或者它以为 buffer 已经是竖的 —— 但 `VideoDataOutput 连接 旋转=0` 证明不是，
-// 1920x1440 横着进来的）。
-//
-// 所以：宿主设 identity 时，只要「宿主帧是横的」就补一个 90°。
-// 不判断屏幕方向，只看 buffer 本身 —— 横 buffer + 不转 = 文件一定躺。
-static void (*gSLWriterTransformOrig)(id, SEL, CGAffineTransform);
-static int sSLWriterTransformCalls = 0;
+// 结论：这两条路对「视频消息」都是死的。0.3.31 起不再碰 AVAssetWriter，
+// 录制完全交回宿主，本 tweak 只负责把采集帧换成素材。
 
-static void SLVCamWriterSetTransform(id self, SEL _cmd, CGAffineTransform t) {
-    CGAffineTransform use = t;
-    BOOL weFix = NO;
-
-    BOOL isIdentity = (fabs(t.a - 1.0) < 0.01 && fabs(t.b) < 0.01 &&
-                       fabs(t.c) < 0.01 && fabs(t.d - 1.0) < 0.01);
-
-    if (SLVCamPortraitCapture()) {
-        // 0.3.28：竖采集模式下 buffer 已经是竖的了。
-        // 宿主这时候再设 90°（普通视频录制会这么设），文件反而会被转歪；
-        // 设 identity 才是对的。所以这一路**一律**按 identity 交上去。
-        use = CGAffineTransformIdentity;
-        weFix = !isIdentity;
-    } else if (isIdentity && SLVCamInjecting()) {
-        CGSize hs = [[SLVCamFeed shared] latestHostFrameSize];
-        if (hs.width > hs.height) {
-            use = CGAffineTransformMakeRotation(M_PI_2);
-            weFix = YES;
-        }
-    }
-
-    // 0.3.25：每次调用都记（前 8 次 + 之后每 20 次）。
-    // 0.3.24 只在第一次打，结果日志里「补完 90° 转头 startWriting 又读到 identity」，
-    // 看不出到底是另一个 input 还是被宿主覆盖了。现在每次都给宿主值 → 实际值。
-    sSLWriterTransformCalls++;
-    if (sSLWriterTransformCalls <= 8 || sSLWriterTransformCalls % 20 == 0) {
-        SLVLog(@"录制: setTransform #%d 宿主=[%.2f %.2f %.2f %.2f] → 实际=[%.2f %.2f %.2f %.2f]%@",
-               sSLWriterTransformCalls,
-               t.a, t.b, t.c, t.d, use.a, use.b, use.c, use.d,
-               weFix ? (SLVCamPortraitCapture() ? @" （竖采集：压成 identity）" : @" （补 90°）") : @"");
-    }
-
-    if (gSLWriterTransformOrig) gSLWriterTransformOrig(self, _cmd, use);
-}
-
-// 0.3.25：写完的那一刻读回 transform。
-// 如果这里还是 identity，说明我们的设置被宿主覆盖了 —— 那 transform 这条路就没救，
-// 得改成「让 buffer 本身是竖的」（动 AVCaptureConnection）。
-static void (*gSLWriterMarkFinishedOrig)(id, SEL);
-
-static void SLVCamWriterMarkFinished(id self, SEL _cmd) {
-    @try {
-        AVAssetWriterInput *vi = (AVAssetWriterInput *)self;
-        if ([vi.mediaType isEqualToString:AVMediaTypeVideo]) {
-            CGAffineTransform t = vi.transform;
-            BOOL idt = (fabs(t.a - 1.0) < 0.01 && fabs(t.b) < 0.01 &&
-                        fabs(t.c) < 0.01 && fabs(t.d - 1.0) < 0.01);
-            SLVLog(@"录制: markAsFinished 时 video transform = [%.2f %.2f %.2f %.2f]%@",
-                   t.a, t.b, t.c, t.d, idt ? @" （还是 identity！）" : @"");
-        }
-    } @catch (NSException *e) { }
-    if (gSLWriterMarkFinishedOrig) gSLWriterMarkFinishedOrig(self, _cmd);
-}
-
-// 0.3.24：兜底。有些宿主压根不调 `setTransform:`，默认就是 identity ——
-// 那样上面那个 hook 一次都不会进。开始写之前扫一遍 inputs 补上。
-static void (*gSLWriterStartOrig)(id, SEL);
-
-static void SLVCamWriterStartWriting(id self, SEL _cmd) {
-    // 0.3.28：竖采集模式下 buffer 本身是竖的，identity 就是对的。
-    // 这里再补 90° 反而会把文件转歪，所以整段跳过。
-    if (SLVCamInjecting() && !SLVCamPortraitCapture()) {
-        @try {
-            CGSize hs = [[SLVCamFeed shared] latestHostFrameSize];
-            if (hs.width > hs.height && hs.width > 1.0) {
-                NSArray *inputs = [(AVAssetWriter *)self inputs];
-                for (id inp in inputs) {
-                    if (![inp respondsToSelector:@selector(transform)] ||
-                        ![inp respondsToSelector:@selector(setTransform:)] ||
-                        ![inp respondsToSelector:@selector(mediaType)]) continue;
-
-                    AVAssetWriterInput *vi = (AVAssetWriterInput *)inp;
-                    if (![vi.mediaType isEqualToString:AVMediaTypeVideo]) continue;
-
-                    CGAffineTransform t = vi.transform;
-                    BOOL idt = (fabs(t.a - 1.0) < 0.01 && fabs(t.b) < 0.01 &&
-                                fabs(t.c) < 0.01 && fabs(t.d - 1.0) < 0.01);
-                    if (idt) {
-                        vi.transform = CGAffineTransformMakeRotation(M_PI_2);
-                        SLVLog(@"录制: startWriting 兜底 · 给 video input 补 90°（宿主帧 %.0fx%.0f）",
-                               hs.width, hs.height);
-                    }
-                }
-            }
-        } @catch (NSException *e) {
-            SLVLog(@"录制: startWriting 兜底失败（%@）", e.reason ?: @"?");
-        }
-    }
-    if (gSLWriterStartOrig) gSLWriterStartOrig(self, _cmd);
-}
-
-// 0.3.27：写完把成品读回来，看 transform 到底有没有写进文件。
-//
-// 0.3.26 的日志已经证明「设置留住了」：setTransform 补了 90°，
-// startWriting 兜底一次都没触发（说明读回来就是 90°）。
-// 但文件还是歪，那就只剩两种可能：
-//   A. transform 压根没进文件的 tkhd matrix —— 那 setTransform 时机不对
-//   B. 进了，但 Telegram 转码时丢了 —— 那 transform 这条路彻底无效，
-//      只能让 buffer 本身变竖（动 AVCaptureConnection）
-//
-// 这条日志一次就能分开。
-
-// 把文件里视频轨的 transform 打出来。异步加载 tracks，最多等 2 秒。
-// 只做「读 + 打日志」，任何异常都咽掉 —— 这是探针，绝不能影响宿主写文件。
-static void SLVLogTrackTransformNow(NSURL *url, NSString *tag) {
-    if (!url) return;
-    @try {
-        AVURLAsset *a = [AVURLAsset URLAssetWithURL:url options:nil];
-
-        // tracks 在新系统上是异步加载的，同步读会拿到空数组 —— 等它加载完
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [a loadValuesAsynchronouslyForKeys:@[@"tracks"] completionHandler:^{
-            dispatch_semaphore_signal(sem);
-        }];
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
-                                                   (int64_t)(2 * NSEC_PER_SEC)));
-
-        NSArray *tracks = [a tracksWithMediaType:AVMediaTypeVideo];
-        if (tracks.count == 0) {
-            SLVLog(@"录制: %@ %@ 读不到视频轨（可能已删除）", tag, url.lastPathComponent);
-            return;
-        }
-        for (AVAssetTrack *t in tracks) {
-            CGAffineTransform tr = t.preferredTransform;
-            CGSize ns = t.naturalSize;
-            BOOL idt = (fabs(tr.a - 1.0) < 0.01 && fabs(tr.b) < 0.01 &&
-                        fabs(tr.c) < 0.01 && fabs(tr.d - 1.0) < 0.01);
-            SLVLog(@"录制: %@ %@ 视频 %.0fx%.0f transform=[%.2f %.2f %.2f %.2f]%@",
-                   tag, url.lastPathComponent, ns.width, ns.height,
-                   tr.a, tr.b, tr.c, tr.d,
-                   idt ? @" （identity）" : @"");
-        }
-    } @catch (NSException *e) {
-        SLVLog(@"录制: %@ 读失败（%@）", tag, e.reason ?: @"?");
-    }
-}
-
-// 上面那个函数里有个 2 秒的信号量。宿主调 finishWriting / export 很可能在**主线程**，
-// 直接跑会把界面卡住 —— 主线程上就丢后台队列（日志晚几十毫秒无所谓），
-// 已经在别的线程就当场跑，省得文件被宿主删掉之后再读不到。
-static void SLVLogTrackTransform(NSURL *url, NSString *tag) {
-    if (!url) return;
-    if ([NSThread isMainThread]) {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            SLVLogTrackTransformNow(url, tag);
-        });
-    } else {
-        SLVLogTrackTransformNow(url, tag);
-    }
-}
-
-static void (*gSLWriterFinishOrig)(id, SEL, void (^)(void));
-
-static void SLVCamWriterFinishWriting(id self, SEL _cmd, void (^handler)(void)) {
-    AVAssetWriter *w = (AVAssetWriter *)self;
-    NSURL *url = w.outputURL;
-
-    void (^wrapped)(void) = [^{
-        if (handler) handler();
-        SLVLogTrackTransform(url, @"成品");
-    } copy];
-
-    if (gSLWriterFinishOrig) gSLWriterFinishOrig(self, _cmd, wrapped);
-}
-
-// 0.3.27：Telegram 发视频消息时，会不会把刚录的文件再导一遍？
-// 如果会，transform 就算进了原文件，也可能在这一步丢掉 —— 那 transform 这条路就废了，
-// 只能改成「让 buffer 本身就是竖的」。
-// initWithAsset:presetName: 返回的是 instancetype，原始实现必须声明成返回 id。
-// 写成 void 会在 `self = ...` 那一行报 "assigning to '__strong id' from incompatible type 'void'"。
-static id (*gSLExportInitOrig)(id, SEL, id, id);
-
-static id SLVCamExportInit(id self, SEL _cmd, id asset, id preset) {
-    if (gSLExportInitOrig) self = gSLExportInitOrig(self, _cmd, asset, preset);
-    @try {
-        if ([asset isKindOfClass:[AVURLAsset class]]) {
-            NSURL *u = [(AVURLAsset *)asset URL];
-            SLVLog(@"录制: Telegram 开始导出 %@（preset=%@）", u.lastPathComponent, preset ?: @"?");
-            SLVLogTrackTransform(u, @"导出前");
-        }
-    } @catch (NSException *e) { }
-    return self;
-}
-
-static void (*gSLExportRunOrig)(id, SEL, void (^)(void));
-
-static void SLVCamExportRun(id self, SEL _cmd, void (^handler)(void)) {
-    NSURL *out = nil;
-    @try { out = [(AVAssetExportSession *)self outputURL]; } @catch (NSException *e) { }
-
-    void (^wrapped)(void) = [^{
-        if (handler) handler();
-        SLVLogTrackTransform(out, @"导出后");
-    } copy];
-
-    if (gSLExportRunOrig) gSLExportRunOrig(self, _cmd, wrapped);
-}
 
 // AVFAudio 是 iOS 14 起独立出来的框架，宿主不一定会主动加载。
 // objc_getClass 拿不到就 dlopen 一次再取。
@@ -1136,6 +759,13 @@ static void SLVCamHookSel(Class cls, SEL sel, IMP imp, IMP *origOut) {
     method_setImplementation(m, imp);
 }
 
+// 0.3.31：只剩音频探针。
+//
+// 原来这里还挂着 AVAssetWriterInput / AVAssetWriter / AVAssetExportSession 和
+// AVCaptureMovieFileOutput 的录制探针 —— 那是 0.3.23~0.3.27 为了查「录制方向」
+// 布的。方向问题两条路都证伪了，探针也跟着一起撤掉：少挂几个类，少一分风险。
+//
+// 音频这两条留着，麦克风替换出问题时还靠它们定位走的是哪条链路。
 static void SLVCamInstallRecordingProbes(void) {
     static BOOL done = NO;
     if (done) return;
@@ -1149,373 +779,23 @@ static void SLVCamInstallRecordingProbes(void) {
     Class rec = SLVCamLoadClass("AVAudioRecorder", avf);
     SLVCamHookSel(rec, @selector(record), (IMP)SLVCamRecorderProbe, (IMP *)&gSLRecorderOrig);
 
-    Class movie = objc_getClass("AVCaptureMovieFileOutput");
-    SLVCamHookSel(movie, NSSelectorFromString(@"startRecordingToOutputFileURL:recordingDelegate:"),
-                 (IMP)SLVCamMovieStartProbe, (IMP *)&gSLMovieStartOrig);
-
-    // 0.3.23：录制文件的朝向探针
-    Class writerInput = SLVCamLoadClass("AVAssetWriterInput", "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
-    SLVCamHookSel(writerInput, NSSelectorFromString(@"setTransform:"),
-                 (IMP)SLVCamWriterSetTransform, (IMP *)&gSLWriterTransformOrig);
-    // 0.3.25：写完时读回 transform，判断我们的设置有没有被覆盖
-    SLVCamHookSel(writerInput, NSSelectorFromString(@"markAsFinished"),
-                 (IMP)SLVCamWriterMarkFinished, (IMP *)&gSLWriterMarkFinishedOrig);
-
-    // 0.3.24：宿主不调 setTransform 时的兜底
-    Class writer = SLVCamLoadClass("AVAssetWriter", "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
-    SLVCamHookSel(writer, NSSelectorFromString(@"startWriting"),
-                 (IMP)SLVCamWriterStartWriting, (IMP *)&gSLWriterStartOrig);
-
-    // 0.3.27：写完把成品读回来，看 transform 到底有没有进文件
-    SLVCamHookSel(writer, NSSelectorFromString(@"finishWritingWithCompletionHandler:"),
-                 (IMP)SLVCamWriterFinishWriting, (IMP *)&gSLWriterFinishOrig);
-
-    // 0.3.27：Telegram 会不会拿这个文件再导一遍
-    Class exporter = SLVCamLoadClass("AVAssetExportSession",
-                                     "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
-    SLVCamHookSel(exporter, NSSelectorFromString(@"initWithAsset:presetName:"),
-                 (IMP)SLVCamExportInit, (IMP *)&gSLExportInitOrig);
-    SLVCamHookSel(exporter, NSSelectorFromString(@"exportAsynchronouslyWithCompletionHandler:"),
-                 (IMP)SLVCamExportRun, (IMP *)&gSLExportRunOrig);
-
-    SLVLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d writerInput=%d writer=%d export=%d",
-          inputNode != nil, rec != nil, movie != nil, writerInput != nil, writer != nil,
-          exporter != nil);
+    SLVLog(@"探测: 音频链路已布点 tap=%d recorder=%d", inputNode != nil, rec != nil);
 }
 
-#pragma mark - 拍照接管（0.2.15）
+#pragma mark - 拍照接管（0.2.15 引入，0.3.31 移除）
 
-// 拍照是另一条完全独立的路径。
+// 这里原来有两条拍照链路：
+//   · AVCaptureStillImageOutput 的 captureStillImageAsynchronouslyFromConnection:
+//     （QQ 走这条）—— 把 completionHandler 包一层，改传素材转出来的假 JPEG；
+//   · AVCapturePhoto 的 fileDataRepresentation / pixelBuffer
+//     （抖音 IESMMCaptureKit 走这条）—— 把素材帧原地画进宿主那个 buffer。
 //
-// 我们的注入是按「类名里凡是名字带 samplebuffer 且签名是单指针参数的方法」挂的，
-// 而 -[AVCaptureStillImageOutput captureStillImageAsynchronouslyFromConnection:completionHandler:]
-// 是「对象 + block」两个参数，被那条规则直接跳过 —— 所以拍照出来永远是真实画面。
-// QQ 的日志里明确有「会话加输出: AVCaptureStillImageOutput」，就是它。
+// 0.3.31 起整体移除：拍照不再是本 tweak 的目标功能，
+// 用户明确说「拍摄功能不需要了，只要虚拟摄像头对视频消息替换」。
 //
-// 接法：把 completionHandler 包一层，收到真 buffer 后不往下传，改传我们自己的
-// 假 JPEG。CMSampleBuffer 是只读的，替换只能新建一个 —— 拿素材当前帧转 JPEG，
-// 再按 JPEG 的宽高建 format description + block buffer 拼出来。
-static void (*gSLStillOrig)(id, SEL, id, id);
-
-static NSData *SLVCamJPEGFromPixelBuffer(CVPixelBufferRef pb, CGFloat quality) {
-    if (!pb) return nil;
-    CIImage *ci = [CIImage imageWithCVPixelBuffer:pb];
-    if (!ci) return nil;
-    static CIContext *ctx = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ ctx = [CIContext contextWithOptions:nil]; });
-    CGImageRef cg = [ctx createCGImage:ci fromRect:ci.extent];
-    if (!cg) return nil;
-    UIImage *img = [UIImage imageWithCGImage:cg];
-    CGImageRelease(cg);
-    return UIImageJPEGRepresentation(img, quality);
-}
-
-static CMSampleBufferRef SLVCamJPEGSampleBuffer(CVPixelBufferRef pb) {
-    NSData *jpeg = SLVCamJPEGFromPixelBuffer(pb, 0.92);
-    if (!jpeg.length) return NULL;
-
-    size_t len = jpeg.length;
-    CMBlockBufferRef block = NULL;
-    if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, len, kCFAllocatorDefault,
-                                           NULL, 0, len, kCMBlockBufferAssureMemoryNowFlag,
-                                           &block) != kCMBlockBufferNoErr || !block) {
-        return NULL;
-    }
-    if (CMBlockBufferReplaceDataBytes(jpeg.bytes, block, 0, len) != kCMBlockBufferNoErr) {
-        CFRelease(block);
-        return NULL;
-    }
-
-    // 宽高必须跟 JPEG 本身一致 —— QQ 是按 format description 摆图的，
-    // 尺寸对不上会拉伸变形。
-    CMVideoFormatDescriptionRef fmt = NULL;
-    OSStatus st = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_JPEG,
-                                                 (int32_t)CVPixelBufferGetWidth(pb),
-                                                 (int32_t)CVPixelBufferGetHeight(pb),
-                                                 NULL, &fmt);
-    if (st != noErr || !fmt) {
-        CFRelease(block);
-        return NULL;
-    }
-
-    CMSampleTimingInfo timing = { CMTimeMake(1, 30), kCMTimeZero, kCMTimeInvalid };
-    size_t sizes[1] = { len };
-    CMSampleBufferRef sbuf = NULL;
-    st = CMSampleBufferCreateReady(kCFAllocatorDefault, block, fmt, 1, 1, &timing, 1, sizes, &sbuf);
-    CFRelease(fmt);
-    CFRelease(block);
-    return (st == noErr) ? sbuf : NULL;
-}
-
-static void SLVCamCaptureStill(id self, SEL _cmd, id connection,
-                              void (^handler)(CMSampleBufferRef, NSError *)) {
-    if (!gSLStillOrig) return;
-    if (!SLVCamInjecting() || !SLVCamArmed() || ![[SLVCamFeed shared] isReady]) {
-        // block 本身就是对象，直接当 id 传，不要加 __bridge ——
-        // 对 block 类型做 __bridge 转 id 是编译错误（clang 会直接 segfault）。
-        gSLStillOrig(self, _cmd, connection, handler);
-        return;
-    }
-
-    void (^wrapped)(CMSampleBufferRef, NSError *) = ^(CMSampleBufferRef buf, NSError *err) {
-        if (!handler) return;
-        // 0.2.16：这里原来用 copyNextFrame，拿的是解码器吐的**原始帧** ——
-        // 既没转角度也没镜像，所以预览里画面已经转正了，拍出来还是歪的。
-        // 改用拍照专用出帧：按当前旋转/镜像摆好，但不碰预览管线。
-        CVPixelBufferRef pb = [[SLVCamFeed shared]
-            copyOrientedFrameForPixelFormat:kCVPixelFormatType_32BGRA size:CGSizeZero];
-        CMSampleBufferRef fake = pb ? SLVCamJPEGSampleBuffer(pb) : NULL;
-        if (pb) CVPixelBufferRelease(pb);
-        if (fake) {
-            static BOOL logged = NO;
-            if (!logged) {
-                logged = YES;
-                SLVLog(@"注入: 拍照已接管 · 返回素材画面（已按 %ld° / 镜像%@）",
-                      (long)([SLVCamFeed shared].rotation % 360),
-                      [SLVCamFeed shared].mirrorEnabled ? @"开" : @"关");
-            }
-            handler(fake, err);
-            CFRelease(fake);
-        } else {
-            handler(buf, err);   // 素材这一帧没解出来，宁可给真画面也不给黑图
-        }
-    };
-    gSLStillOrig(self, _cmd, connection, [wrapped copy]);
-}
-
-static void SLVCamInstallStillImageHook(void) {
-    static BOOL done = NO;
-    if (done) return;
-    done = YES;
-    Class cls = objc_getClass("AVCaptureStillImageOutput");
-    if (!cls) {
-        SLVLog(@"注入: AVCaptureStillImageOutput 不存在，拍照跳过");
-        return;
-    }
-    SLVCamHookSel(cls, NSSelectorFromString(@"captureStillImageAsynchronouslyFromConnection:completionHandler:"),
-                 (IMP)SLVCamCaptureStill, (IMP *)&gSLStillOrig);
-    SLVLog(@"注入: 拍照链路已布点 still=%d", gSLStillOrig != nil);
-}
-
-#pragma mark - 拍照接管之二：AVCapturePhotoOutput（抖音走这条）
-
-// QQ 用 AVCaptureStillImageOutput，抖音用 AVCapturePhotoOutput —— 两条完全独立的路径。
-// 抖音日志里那句「会话加输出: AVCapturePhotoOutput」就是它，只挂 StillImageOutput
-// 对它一点作用都没有，所以拍出来还是真实画面。
-//
-// 接法不走 delegate：delegate 是宿主私有类，每次启动可能不同，还得处理中途被替换。
-// 改成直接挂在 -[AVCapturePhoto fileDataRepresentation] 上 —— 宿主不管怎么拍、
-// 委托给谁、要 HEIC 还是 JPEG，最后总得向 AVCapturePhoto 要字节，那一刻换成我们的。
-// 一个方法覆盖所有调用方式，也不用管它内部编码格式。
-
-static NSData *(*gSLPhotoDataOrig)(id, SEL);
-static NSData *(*gSLPhotoDataCustomOrig)(id, SEL, id);
-static void   (*gSLPhotoCaptureOrig)(id, SEL, id, id);
-static CVPixelBufferRef (*gSLPhotoPBOrig)(id, SEL);
-
-// 0.3.23：拍照要「摆正」，需要两个数 —— 转多少度、最终多大。
-//
-// 为什么补的角度要跟用户设的旋转**相加**：
-//   用户设的 rotation 是**对着预览调**出来的 —— 他转到「预览看着正」为止。
-//   而预览正不正，是「素材转 userRot」再叠上「预览层转 connection」的结果。
-//   所以素材本身的朝向偏差 = -(userRot + connection)。
-//   拍照要把它摆回正，就得转 +(userRot + connection)。
-//
-// 竖拍后摄：EXIF 6（要顺时针 90 才正），预览层 connection 通常也是 90，
-// 用户把 rotation 调到 270 → 270 + 90 = 360 = 0 → 素材原样输出，正好是正的。
-// 这就是日志里「返回素材画面 270°」那个值的真正含义。
-//
-// 尺寸同样要摆正：`AVCapturePhoto` 的 buffer 是传感器原始方向（4032x3024 横），
-// 摆正之后是 3024x4032 竖，宽高必须跟着换 —— 否则出来的是张横图。
-static NSInteger SLVCamPhotoUprightRotation(id photo, CGSize rawSize, CGSize *outSize) {
-    NSInteger cw = 90;   // 拿不到 EXIF 就按最常见的竖拍后摄（EXIF 6）处理
-    @try {
-        NSDictionary *meta = [(AVCapturePhoto *)photo metadata];
-        NSNumber *v = meta[(NSString *)kCGImagePropertyOrientation];
-        switch (v ? v.integerValue : 6) {
-            case 1: case 2: cw = 0;   break;
-            case 3: case 4: cw = 180; break;
-            case 5: case 7: cw = 90;  break;   // 带镜像的那几个按旋转部分算
-            case 6:         cw = 90;  break;
-            case 8:         cw = 270; break;
-            default:        cw = 90;  break;
-        }
-    } @catch (NSException *e) { }
-
-    if (outSize) {
-        if ((cw == 90 || cw == 270) && rawSize.width >= 1 && rawSize.height >= 1) {
-            *outSize = CGSizeMake(rawSize.height, rawSize.width);
-        } else {
-            *outSize = rawSize;
-        }
-    }
-    return cw;
-}
-
-/// 从素材取一帧、按当前旋转/镜像摆好、转成 JPEG。
-/// 条件不满足返回 nil，调用方原样放行真照片。
-static void SLVCamPhotoLogOnce(CGSize raw, CGSize out, NSInteger cw);
-
-static NSData *SLVCamPhotoJPEG(id photo) {
-    if (!SLVCamInjecting() || !SLVCamArmed()) return nil;
-
-    // 0.3.23：尺寸必须跟**真照片**走。
-    //
-    // 原来传的是 CGSizeZero，输出尺寸就取「素材旋转后的尺寸」—— 素材 1080x1920
-    // 转 270 变成 1920x1080，于是照片是 16:9 横图，而预览是 4:3 竖屏。
-    // 一个横一个竖，这就是「拍照和录制方向不一样」的直接原因。
-    CGSize raw = CGSizeZero;
-    if (gSLPhotoPBOrig) {
-        CVPixelBufferRef real = gSLPhotoPBOrig(photo, NSSelectorFromString(@"pixelBuffer"));
-        if (real) raw = CGSizeMake(CVPixelBufferGetWidth(real), CVPixelBufferGetHeight(real));
-    }
-
-    CGSize outSize = CGSizeZero;
-    NSInteger cw = SLVCamPhotoUprightRotation(photo, raw, &outSize);
-
-    CVPixelBufferRef pb = [[SLVCamFeed shared]
-        copyOrientedFrameForPixelFormat:kCVPixelFormatType_32BGRA
-                                   size:outSize
-                          extraRotation:cw];
-    if (!pb) return nil;
-    NSData *jpeg = SLVCamJPEGFromPixelBuffer(pb, 0.92);
-    CVPixelBufferRelease(pb);
-    if (jpeg.length) SLVCamPhotoLogOnce(raw, outSize, cw);
-    return jpeg.length ? jpeg : nil;
-}
-
-static void SLVCamPhotoLogOnce(CGSize raw, CGSize out, NSInteger cw) {
-    static BOOL logged = NO;
-    if (logged) return;
-    logged = YES;
-    SLVLog(@"注入: 拍照已接管（AVCapturePhotoOutput）· 照片 %.0fx%.0f → 摆正 %.0fx%.0f · "
-          @"设置 %ld° + 补偿 %ld° = %ld° / 镜像%@",
-          raw.width, raw.height, out.width, out.height,
-          (long)([SLVCamFeed shared].rotation % 360), (long)cw,
-          (long)((([SLVCamFeed shared].rotation % 360) + cw) % 360),
-          [SLVCamFeed shared].mirrorEnabled ? @"开" : @"关");
-}
-
-static NSData *SLVCamPhotoFileData(id self, SEL _cmd) {
-    NSData *fake = SLVCamPhotoJPEG(self);
-    if (fake) return fake;
-    return gSLPhotoDataOrig ? gSLPhotoDataOrig(self, _cmd) : nil;
-}
-
-static NSData *SLVCamPhotoFileDataCustom(id self, SEL _cmd, id customizer) {
-    NSData *fake = SLVCamPhotoJPEG(self);
-    if (fake) return fake;
-    return gSLPhotoDataCustomOrig ? gSLPhotoDataCustomOrig(self, _cmd, customizer) : nil;
-}
-
-// 只做一次探针：记录宿主到底调不调 capturePhotoWithSettings:delegate:，
-// 以及 delegate 是什么类。下次再出「拍了没换」的日志，一眼就知道走到哪一步了。
-static void SLVCamPhotoCapture(id self, SEL _cmd, id settings, id delegate) {
-    static BOOL logged = NO;
-    if (!logged) {
-        logged = YES;
-        SLVLog(@"注入: 命中 AVCapturePhotoOutput 拍照 · delegate=%@",
-              delegate ? NSStringFromClass([delegate class]) : @"(nil)");
-    }
-    if (gSLPhotoCaptureOrig) gSLPhotoCaptureOrig(self, _cmd, settings, delegate);
-}
-
-// 照片缓冲的「方向类别」可能跟预览缓冲不一样：
-// 视频输出那条路拿到的缓冲已经带上了 connection 的朝向（Swiftgram 日志里是
-// 1920x1440 横的，Turrit 是 1712x1284 横的），而 AVCapturePhoto 给的是
-// **传感器原始方向**，两者可能差 90°。
-// 不补这一下，素材就被塞进一个转了 90° 的框里 —— 预览正、拍出来歪。
-//
-// 补哪个方向由照片自己的 EXIF 方向决定：EXIF 说「要顺时针转 90° 才正」（=6），
-// 我们就先逆时针转 90°（=270°），等宿主/系统把它转回来正好抵消。
-//
-// 0.3.23 备注：这条路（`-[AVCapturePhoto pixelBuffer]`）只有抖音在走，
-// Swiftgram 走的是 `fileDataRepresentation`，用的是另一套（见
-// SLVCamPhotoUprightRotation）。两套不能合并 —— pixelBuffer 那条路是
-// **原地改写宿主的原始 buffer**，尺寸动不了，只能靠角度补偿；JPEG 那条路
-// 是我们自己出图，尺寸和角度都能自己定。
-static NSInteger SLVCamPhotoExtraRotation(id photo, CGSize dstSize) {
-    CGSize vs = [[SLVCamFeed shared] latestFrameSize];
-    if (vs.width < 1 || vs.height < 1 || dstSize.width < 1 || dstSize.height < 1) return 0;
-
-    BOOL videoPortrait = vs.height > vs.width;
-    BOOL photoPortrait = dstSize.height > dstSize.width;
-    if (videoPortrait == photoPortrait) return 0;   // 方向类别一致，不用补
-
-    NSInteger cw = 90;   // 拿不到 EXIF 就按最常见的竖拍后摄（EXIF 6）处理
-    @try {
-        NSDictionary *meta = [(AVCapturePhoto *)photo metadata];
-        NSNumber *v = meta[(NSString *)kCGImagePropertyOrientation];
-        switch (v ? v.integerValue : 6) {
-            case 1: case 2: cw = 0;   break;
-            case 3: case 4: cw = 180; break;
-            case 5: case 7: cw = 90;  break;   // 带镜像的那几个按旋转部分算
-            case 6:         cw = 90;  break;
-            case 8:         cw = 270; break;
-            default:        cw = 90;  break;
-        }
-    } @catch (NSException *e) { }
-    return (360 - cw) % 360;
-}
-
-// 抖音（IESMMCaptureKit）读的是 -[AVCapturePhoto pixelBuffer]，不是
-// fileDataRepresentation —— 0.2.16 的日志里「命中 AVCapturePhotoOutput 拍照」有了，
-// 「拍照已接管（AVCapturePhotoOutput）」一行没有，就是证据：它压根没来要文件字节。
-//
-// 这条路上不能返回我们自己 new 的 buffer：
-//   · pixelBuffer 返回的是**借用**引用，调用方不会 CFRelease → 每次拍照泄 8MB；
-//   · 尺寸/格式跟真照片对不上，宿主按 resolvedSettings 算出的宽高会跟 buffer 打架。
-// 所以改成「拿宿主那个 buffer，把素材帧原地画进去」—— 指针、尺寸、格式全是它熟悉的。
-static CVPixelBufferRef SLVCamPhotoPixelBuffer(id self, SEL _cmd) {
-    CVPixelBufferRef real = gSLPhotoPBOrig ? gSLPhotoPBOrig(self, _cmd) : NULL;
-    if (!real) return real;
-    if (!SLVCamInjecting() || !SLVCamArmed()) return real;
-
-    CGSize sz = CGSizeMake(CVPixelBufferGetWidth(real), CVPixelBufferGetHeight(real));
-    NSInteger extra = SLVCamPhotoExtraRotation(self, sz);
-    if (![[SLVCamFeed shared] renderIntoPixelBuffer:real extraRotation:extra]) return real;
-
-    static BOOL logged = NO;
-    if (!logged) {
-        logged = YES;
-        CGSize vs = [[SLVCamFeed shared] latestFrameSize];
-        SLVLog(@"注入: 拍照已接管（pixelBuffer 原地改写）· 照片 %zux%zu / 预览 %zux%zu · "
-              @"设置 %ld° + 补偿 %ld° / 镜像%@",
-              CVPixelBufferGetWidth(real), CVPixelBufferGetHeight(real),
-              (size_t)vs.width, (size_t)vs.height,
-              (long)([SLVCamFeed shared].rotation % 360), (long)extra,
-              [SLVCamFeed shared].mirrorEnabled ? @"开" : @"关");
-    }
-    return real;
-}
-
-static void SLVCamInstallPhotoOutputHook(void) {
-    static BOOL done = NO;
-    if (done) return;
-    done = YES;
-
-    Class photo = objc_getClass("AVCapturePhoto");
-    Class output = objc_getClass("AVCapturePhotoOutput");
-    if (!photo || !output) {
-        SLVLog(@"注入: AVCapturePhoto/PhotoOutput 不存在，拍照跳过 photo=%d output=%d",
-              photo != nil, output != nil);
-        return;
-    }
-
-    SLVCamHookSel(photo, NSSelectorFromString(@"fileDataRepresentation"),
-                 (IMP)SLVCamPhotoFileData, (IMP *)&gSLPhotoDataOrig);
-    SLVCamHookSel(photo, NSSelectorFromString(@"fileDataRepresentationWithCustomizer:"),
-                 (IMP)SLVCamPhotoFileDataCustom, (IMP *)&gSLPhotoDataCustomOrig);
-    SLVCamHookSel(photo, NSSelectorFromString(@"pixelBuffer"),
-                 (IMP)SLVCamPhotoPixelBuffer, (IMP *)&gSLPhotoPBOrig);
-    SLVCamHookSel(output, NSSelectorFromString(@"capturePhotoWithSettings:delegate:"),
-                 (IMP)SLVCamPhotoCapture, (IMP *)&gSLPhotoCaptureOrig);
-
-    SLVLog(@"注入: 拍照链路已布点 photo=%d custom=%d pb=%d capture=%d",
-          gSLPhotoDataOrig != nil, gSLPhotoDataCustomOrig != nil,
-          gSLPhotoPBOrig != nil, gSLPhotoCaptureOrig != nil);
-}
+// 移除的收益不只是少两块代码 —— 这两条链路跟录制方向修复搅在一起过
+// （0.3.28 的竖采集把拍照方向一起带歪），拆掉之后采集链路回到最朴素的状态：
+// 只改 _processSampleBuffer: 交出去的那一帧。
 
 #pragma mark - 预览层接管（0.3.21）
 
@@ -1618,30 +898,14 @@ static NSInteger SLVCamPreviewRotationDeg(AVCaptureConnection *conn) {
     return ((deg % 360) + 360) % 360;
 }
 
-// 0.3.28：竖采集模式下，采集连接被我们掰成了竖的（+90°），
-// 而预览层的 connection 还停在宿主自己的角度上（没动它）。
-// 所以「这一帧真实的摆法」= 预览层角度 - 90°。
+// 0.3.31：这个包装函数只剩一句了。
 //
-// 举例：预览层 90°、采集 90° → 实际 0°，显示层不用转，竖帧直接铺满竖窗口。
-//
-// 0.3.29 修正：**不能无条件减**。
-// 0.3.28 的日志里，视频消息那条连接压根没被我们接住（宿主用 addOutputWithNoConnections:
-// 加的），帧还是 1920x1440 横的，可我们照样把角度减了 90° ——
-// 结果横帧配 9:16 的窗口还不转，画面被 ResizeAspectFill 裁成一条，看着就是「又闪又歪」。
-//
-// 所以「减不减」要看**帧本身**：帧是竖的才说明连接真的被掰过来了。
-// 这是唯一可靠的判据，不依赖我们哪条 hook 有没有命中。
-static NSInteger SLVCamEffectivePreviewDeg(AVCaptureConnection *conn, BOOL framePortrait) {
-    NSInteger deg = SLVCamPreviewRotationDeg(conn);
-    if (SLVCamPortraitCapture() && framePortrait) {
-        deg = (deg - SLVPortraitDeg) % 360;
-        if (deg < 0) deg += 360;
-    }
-    return deg;
+// 0.3.28/0.3.29 时它还要处理「竖采集模式下角度要减 90°」—— 竖采集整体移除后，
+// 预览层的 connection 角度就是唯一真相，直接用它。
+// 保留函数名是为了让下面的调用点读起来还有「有效角度」这层意思。
+static NSInteger SLVCamEffectivePreviewDeg(AVCaptureConnection *conn) {
+    return SLVCamPreviewRotationDeg(conn);
 }
-
-/// 最近一帧是竖的吗。几何同步那边拿不到帧，靠这个全局。
-static BOOL gSLLastFramePortrait = NO;
 
 // 0.3.23：这个预览层现在真的在屏幕上吗？
 //
@@ -1744,7 +1008,7 @@ static void SLVCamSyncPreviewGeometry(AVCaptureVideoPreviewLayer *pl) {
     NSInteger deg = 0;
 
     if (!connGone) {
-        deg = SLVCamEffectivePreviewDeg(conn, gSLLastFramePortrait);
+        deg = SLVCamEffectivePreviewDeg(conn);
         // 记下最后一次拿到的角度。会话重配时 connection 会短暂变 nil，
         // 那时候就用这个缓存值继续摆 —— 角度没变，画面不会歪。
         objc_setAssociatedObject(pl, &kSLPreviewDegKey, @(deg), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1884,11 +1148,8 @@ static BOOL SLVCamFrameFitsLayer(CMSampleBufferRef sb, AVCaptureVideoPreviewLaye
     CGFloat fh = (CGFloat)CVPixelBufferGetHeight(img);
     if (fw < 1.0 || fh < 1.0) return NO;
 
-    // 0.3.28：这里要用「有效角度」。竖采集模式下帧本身已经是竖的，
-    // 预览层 connection 那个 90° 不再代表真实摆法 —— 拿它去换宽高会把比例算反。
-    // 0.3.29：判据直接用这一帧自己的朝向，不靠「我们改没改成」。
-    BOOL framePortrait = (fh > fw);
-    NSInteger deg = SLVCamEffectivePreviewDeg(pl.connection, framePortrait);
+    // 角度直接用预览层 connection 自己的值 —— 竖采集移除后没有第二套角度了。
+    NSInteger deg = SLVCamEffectivePreviewDeg(pl.connection);
     if (deg == 90 || deg == 270) { CGFloat t = fw; fw = fh; fh = t; }
 
     CGRect b = pl.bounds;
@@ -1907,10 +1168,6 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb) {
 
     NSArray *layers = SLVCamPreviewLayerSnapshot();
     if (layers.count == 0) return;
-
-    // 0.3.29：这一帧是竖是横，几何那边要靠它决定「角度要不要减 90°」。
-    CVImageBufferRef fimg = CMSampleBufferGetImageBuffer(sb);
-    gSLLastFramePortrait = (CVPixelBufferGetHeight(fimg) > CVPixelBufferGetWidth(fimg));
 
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     BOOL wantSync = (now - gSLPreviewLastSync) > 0.25;   // 几何变化（转屏 / 换布局）不需要每帧对
@@ -2077,23 +1334,11 @@ void SLVCamInstallHooks(void) {
     SLVCamDumpCandidates("AVCaptureAudioPreviewOutput");
     SLVCamHookSessionOutputs();
 
-    // 0.3.30：竖采集已关闭（0.3.28/0.3.29 试过，会连带弄坏拍照和普通录制）。
-    // 留一行日志，免得下次看日志还以为它开着。
-    if (!SLVCamPortraitCapture()) {
-        SLVLog(@"竖采集: 已关闭（0.3.30 回退，采集链路不动）");
-    }
-
     // 第二条链路：不经过 AVCapture 的麦克风（QQ 这类自建音频栈的 App）
     SLVCamInstallAudioUnitHook();
 
-    // 第三条：QQ 拍摄页录制走的第四条路 —— 先布点确认是哪条
+    // 音频探针（AVAudioEngine tap / AVAudioRecorder）
     SLVCamInstallRecordingProbes();
-
-    // 拍照（AVCaptureStillImageOutput）走的是另一条路，上面那套启发式挂不到
-    SLVCamInstallStillImageHook();
-
-    // 抖音拍照走 AVCapturePhotoOutput，又是另一条 —— 两条都要挂
-    SLVCamInstallPhotoOutputHook();
 
     // 第四条：预览层。Turrit 这类 App 的预览直连采集设备，不走任何 data output，
     // 上面几条全都碰不到它。

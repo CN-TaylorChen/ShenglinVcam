@@ -1,3 +1,77 @@
+## 0.3.31 —— 砍掉拍摄，只留视频消息替换
+
+0.3.23 ~ 0.3.30 这八版一直在追「录制方向」，代价是代码里堆了一层又一层补丁：
+拍照接管两条、writer transform 三条、竖采集一整套、还有一堆探针。
+追到最后两条路都证伪了，而副作用反而把本来正常的拍照和普通录制弄坏了。
+
+**这一版不再追了。** 按用户的要求：拍摄功能（拍照 / 普通视频录制）整体不要了，
+tweak 只做一件事 —— **把采集帧换成素材，让视频消息发出去是素材画面。**
+
+### 删掉的东西
+
+| 删掉的 | 原来干什么 | 为什么删 |
+|---|---|---|
+| `SLVCamInstallStillImageHook` | 接管 `AVCaptureStillImageOutput` 拍照（QQ 走这条） | 拍照不是目标功能 |
+| `SLVCamInstallPhotoOutputHook` | 接管 `AVCapturePhoto.fileDataRepresentation` / `pixelBuffer`（抖音走这条） | 同上 |
+| `SLVCamWriterSetTransform` | 宿主设 identity 时补 90° | 0.3.27 已证明 transform 进了文件播放端也不认 |
+| `SLVCamWriterStartWriting` | 宿主不调 setTransform 时兜底补 90° | 同上，且会把普通录制转歪 |
+| `SLVCamWriterMarkFinished` | 探针：读回 transform | 探针跟着撤 |
+| `SLVCamWriterFinishWriting` / `SLVCamExportInit` / `SLVCamExportRun` | 探针：成品 / 导出前后的 transform | 同上 |
+| `SLVCamMovieStartProbe` | 探针：`AVCaptureMovieFileOutput` 录制 | 同上 |
+| 竖采集整套（`SLVCamPortraitCapture` 等 8 个函数） | 把采集连接掰成 90° | 0.3.30 已证伪，0.3.31 连代码一起删 |
+| `AVCaptureConnection` 的 `setVideoRotationAngle:` / `setVideoOrientation:` hook | 按住宿主的 0° | 竖采集的配套，一起走 |
+| `AVCaptureSession` 的 `addConnection:` hook | 竖采集最后兜底 | 同上 |
+
+净减约 **760 行**（`SLCamInject.m` 从 2130 行降到 1375 行）。
+
+### 留下的东西
+
+- **`_processSampleBuffer:` 通用注入** —— 视频消息的画面就是从这儿换的，核心中的核心。
+- **预览层接管**（0.3.21）：在 `AVCaptureVideoPreviewLayer` 上盖 `AVSampleBufferDisplayLayer`。
+  没有它，Turrit / Swiftgram 的预览还是真实摄像头。
+- **0.3.29 的预览几何跟随**（`SLVCamSyncPreviewGeometry` + `SLVCamPreviewSizeChanged`）：
+  connection 掉线时用缓存角度继续摆、取景框尺寸一变立刻同步 ——
+  修的是「录制时下方露出真实摄像头」，跟方向无关，是独立的好改动。
+- **音频链路**（AudioUnit / AudioDataOutput / AudioQueue）和两条音频探针，一个字没动。
+
+### 现在的状态
+
+| 功能 | 状态 |
+|---|---|
+| 视频消息：画面替换 | **生效** |
+| 视频消息：预览是素材 | **生效** |
+| 视频消息：录制时露真实摄像头 | 已修 |
+| 视频消息：**预览与成品的朝向仍差 90°** | **未解决** |
+| 拍照 | 不接管，出真实画面（符合预期） |
+| 普通视频录制 | 不接管，出真实画面（符合预期） |
+
+### 关于那个 90°
+
+必须说清楚：这一版**没有**修好它。
+
+已经被实测排除的两条路：
+
+1. **track transform**（0.3.27）—— transform 确实写进了文件的 tkhd matrix，播放端不认。
+2. **竖采集 / 动 `AVCaptureConnection`**（0.3.28 / 0.3.29）——
+   buffer 变成 `1080x1920` 竖的、transform 变成 identity，发出去还是歪；
+   而且把拍照和普通录制一起带坏。
+
+剩下唯一没试过的是 **`-[AVAssetWriterInput appendSampleBuffer:]` 里转帧** ——
+不碰采集、不碰 transform，只在写文件那一刻把像素转 90°。
+这条路要等以后单独做，不在这一版里。
+
+### 日志里会看到
+
+```
+注入: 共 hook 7 个方法
+探测: 音频链路已布点 tap=1 recorder=1
+预览: 预览层接管已布点 init=1 setSession=1
+```
+
+不会再有 `竖采集:`、`录制: setTransform`、`录制: 成品 ... transform=` 这些行。
+
+---
+
 ## 0.3.30 —— 回退竖采集
 
 0.3.28 / 0.3.29 想用「把采集连接掰成竖的」来治视频消息的方向。**实测不行，整体回退。**
