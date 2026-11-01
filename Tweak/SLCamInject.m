@@ -881,7 +881,9 @@ static void SLVCamWriterFinishWriting(id self, SEL _cmd, void (^handler)(void)) 
 // 0.3.27：Telegram 发视频消息时，会不会把刚录的文件再导一遍？
 // 如果会，transform 就算进了原文件，也可能在这一步丢掉 —— 那 transform 这条路就废了，
 // 只能改成「让 buffer 本身就是竖的」。
-static void (*gSLExportInitOrig)(id, SEL, id, id);
+// initWithAsset:presetName: 返回的是 instancetype，原始实现必须声明成返回 id。
+// 写成 void 会在 `self = ...` 那一行报 "assigning to '__strong id' from incompatible type 'void'"。
+static id (*gSLExportInitOrig)(id, SEL, id, id);
 
 static id SLVCamExportInit(id self, SEL _cmd, id asset, id preset) {
     if (gSLExportInitOrig) self = gSLExportInitOrig(self, _cmd, asset, preset);
