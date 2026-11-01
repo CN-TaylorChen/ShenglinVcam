@@ -67,6 +67,8 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb);
 static void SLVCamTeardownPreview(void);
 static void SLVCamTeardownPreviewIfStale(void);
 static NSInteger SLVCamPreviewRotationDeg(AVCaptureConnection *conn);
+/// 0.3.29：竖采集的兜底，定义在会话那一段，注入主流程第一帧要用。
+static void SLVCamEnsurePortraitForOutput(id output);
 
 /// 音视频输出可能各自重写了 _processSampleBuffer:，必须按 Method 分别保存原始 IMP，
 /// 否则音频会走到视频的原始实现上去（表现为只有画面变、声音还在）。
@@ -510,6 +512,10 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
     // 宿主写文件时会不会再转一次，取决于它自己的 connection 角度 ——
     // 这个数跟预览层的角度一对比，就知道「文件歪」是不是差在这里。
     if (mediaType == kCMMediaType_Video) {
+        // 0.3.29：兜底。不管宿主怎么把这个输出加进会话的，第一帧一定从它手里出来。
+        // 之前没接住的那条路（视频消息），在这里补上。
+        SLVCamEnsurePortraitForOutput(self);
+
         static BOOL sLoggedOutConn = NO;
         if (!sLoggedOutConn) {
             sLoggedOutConn = YES;
@@ -517,8 +523,11 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
                 AVCaptureConnection *c =
                     [(AVCaptureVideoDataOutput *)self connectionWithMediaType:AVMediaTypeVideo];
                 if (c) {
-                    SLVLog(@"录制: VideoDataOutput 连接 旋转=%ld 镜像=%@",
-                           (long)SLVCamPreviewRotationDeg(c), c.isVideoMirrored ? @"Y" : @"N");
+                    CVImageBufferRef first = CMSampleBufferGetImageBuffer(sbuf);
+                    SLVLog(@"录制: VideoDataOutput 连接 旋转=%ld 镜像=%@ 帧=%zux%zu",
+                           (long)SLVCamPreviewRotationDeg(c), c.isVideoMirrored ? @"Y" : @"N",
+                           first ? (size_t)CVPixelBufferGetWidth(first) : 0,
+                           first ? (size_t)CVPixelBufferGetHeight(first) : 0);
                 } else {
                     SLVLog(@"录制: VideoDataOutput 拿不到 video 连接");
                 }
@@ -622,14 +631,19 @@ static void SLVCamDumpCandidates(const char *className) {
 // 所以「预览层角度」要减掉这 90°，才等于现在这一帧真实的摆法。
 static NSInteger const SLVPortraitDeg = 90;
 
-/// 只有 Swiftgram 走这条。别的 App（抖音 / 陌陌 / QQ / Turrit）现在都是好的，
-/// 不能因为一个 App 的问题把它们的采集管线一起改了。
+/// 竖采集走这条的 App。
+///
+/// Swiftgram：视频消息是 400x400 正方形，transform 走不通（0.3.27 已证）。
+/// Turrit：同一个 Telegram 内核，同样的毛病，用户要求一起加。
+///
+/// 抖音 / 陌陌 / QQ 现在都是好的，不能因为这两个 App 把它们的采集管线一起改了。
 static BOOL SLVCamPortraitCapture(void) {
     static BOOL on = NO;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        on = [bid isEqualToString:@"app.swiftgram.ios"];
+        on = [bid isEqualToString:@"app.swiftgram.ios"]      // Swiftgram
+          || [bid isEqualToString:@"com.seastar.turrit"];    // Turrit（Telegram 魔改）
     });
     return on;
 }
@@ -718,6 +732,62 @@ static void SLVCamAddOutput(id self, SEL _cmd, id output) {
     SLVCamInstallAudioUnitHook();
 }
 
+// 0.3.29：`addOutput:` 不是唯一的加输出方式。
+//
+// 0.3.28 的日志里，Swiftgram 的视频消息会话**只有** `会话加输出: AVCaptureAudioDataOutput`
+// 这一行 —— 视频输出压根没走 addOutput:，可帧照样在流
+// （`录制: VideoDataOutput 连接 旋转=0` 就是它）。所以那一路的连接我们没接住，
+// 竖采集对它等于没开。
+//
+// AVFoundation 里还有另一条公开路径：`addOutputWithNoConnections:` + `addConnection:`。
+// 两个都挂上。
+static IMP gSLAddOutputNoConnOrig = NULL;
+
+static void SLVCamAddOutputNoConnections(id self, SEL _cmd, id output) {
+    if (output) {
+        SLVLog(@"会话加输出(手工连线): %s", class_getName([output class]));
+    }
+    if (gSLAddOutputNoConnOrig) {
+        ((SLVAddOutputFn)gSLAddOutputNoConnOrig)(self, _cmd, output);
+    }
+    // 这条路径下 output 还没有任何连接，真正要等 addConnection: —— 见下面。
+    SLVCamInstallAudioUnitHook();
+}
+
+static IMP gSLAddConnectionOrig = NULL;
+
+static void SLVCamAddConnection(id self, SEL _cmd, AVCaptureConnection *conn) {
+    if (gSLAddConnectionOrig) {
+        ((void (*)(id, SEL, id))gSLAddConnectionOrig)(self, _cmd, conn);
+    }
+    if (SLVCamPortraitCapture() && SLVCamIsVideoDataConnection(conn)) {
+        SLVCamForcePortraitConnection(conn, "addConnection");
+    }
+}
+
+// 0.3.29：最后的兜底 —— 不管宿主用哪条路把输出加进来的，
+// 第一帧视频从它手里出来的时候我们一定知道是谁。在这里补一刀。
+static char kSLPortraitTriedKey;
+
+static void SLVCamEnsurePortraitForOutput(id output) {
+    if (!SLVCamPortraitCapture()) return;
+    if (![output isKindOfClass:[AVCaptureVideoDataOutput class]]) return;
+    if (objc_getAssociatedObject(output, &kSLPortraitTriedKey)) return;
+    objc_setAssociatedObject(output, &kSLPortraitTriedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // 不在采集回调线程上直接改连接属性 —— 那会触发会话重配，
+    // 万一宿主正在等这一帧，就容易卡住。丢到后台去。
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @try {
+            AVCaptureConnection *c =
+                [(AVCaptureOutput *)output connectionWithMediaType:AVMediaTypeVideo];
+            SLVCamForcePortraitConnection(c, "首帧兜底");
+        } @catch (NSException *e) {
+            SLVLog(@"竖采集: 首帧兜底失败（%@）", e.reason ?: @"?");
+        }
+    });
+}
+
 static void SLVCamHookSessionOutputs(void) {
     Class cls = objc_getClass("AVCaptureSession");
 
@@ -739,10 +809,23 @@ static void SLVCamHookSessionOutputs(void) {
 
     if (!cls) return;
     Method m = class_getInstanceMethod(cls, @selector(addOutput:));
-    if (!m) return;
-    if (gSLAddOutputOrig) return;
-    gSLAddOutputOrig = method_getImplementation(m);
-    method_setImplementation(m, (IMP)SLVCamAddOutput);
+    if (m && !gSLAddOutputOrig) {
+        gSLAddOutputOrig = method_getImplementation(m);
+        method_setImplementation(m, (IMP)SLVCamAddOutput);
+    }
+
+    // 0.3.29：手工连线那条路也要接。Swiftgram 的视频消息会话走的就是它
+    // （0.3.28 日志里没有 `会话加输出: AVCaptureVideoDataOutput`，但帧在流）。
+    Method mNoConn = class_getInstanceMethod(cls, NSSelectorFromString(@"addOutputWithNoConnections:"));
+    if (mNoConn && !gSLAddOutputNoConnOrig) {
+        gSLAddOutputNoConnOrig = method_getImplementation(mNoConn);
+        method_setImplementation(mNoConn, (IMP)SLVCamAddOutputNoConnections);
+    }
+    Method mConn = class_getInstanceMethod(cls, NSSelectorFromString(@"addConnection:"));
+    if (mConn && !gSLAddConnectionOrig) {
+        gSLAddConnectionOrig = method_getImplementation(mConn);
+        method_setImplementation(mConn, (IMP)SLVCamAddConnection);
+    }
 }
 
 #pragma mark - 录制音频链路探测（0.2.15）
@@ -1530,14 +1613,25 @@ static NSInteger SLVCamPreviewRotationDeg(AVCaptureConnection *conn) {
 // 所以「这一帧真实的摆法」= 预览层角度 - 90°。
 //
 // 举例：预览层 90°、采集 90° → 实际 0°，显示层不用转，竖帧直接铺满竖窗口。
-static NSInteger SLVCamEffectivePreviewDeg(AVCaptureConnection *conn) {
+//
+// 0.3.29 修正：**不能无条件减**。
+// 0.3.28 的日志里，视频消息那条连接压根没被我们接住（宿主用 addOutputWithNoConnections:
+// 加的），帧还是 1920x1440 横的，可我们照样把角度减了 90° ——
+// 结果横帧配 9:16 的窗口还不转，画面被 ResizeAspectFill 裁成一条，看着就是「又闪又歪」。
+//
+// 所以「减不减」要看**帧本身**：帧是竖的才说明连接真的被掰过来了。
+// 这是唯一可靠的判据，不依赖我们哪条 hook 有没有命中。
+static NSInteger SLVCamEffectivePreviewDeg(AVCaptureConnection *conn, BOOL framePortrait) {
     NSInteger deg = SLVCamPreviewRotationDeg(conn);
-    if (SLVCamPortraitCapture()) {
+    if (SLVCamPortraitCapture() && framePortrait) {
         deg = (deg - SLVPortraitDeg) % 360;
         if (deg < 0) deg += 360;
     }
     return deg;
 }
+
+/// 最近一帧是竖的吗。几何同步那边拿不到帧，靠这个全局。
+static BOOL gSLLastFramePortrait = NO;
 
 // 0.3.23：这个预览层现在真的在屏幕上吗？
 //
@@ -1578,6 +1672,25 @@ static BOOL SLVCamPreviewLayerVisible(AVCaptureVideoPreviewLayer *pl) {
 // 但大幅度变化（换方向、换层、从 0x0 变成有尺寸）必须立刻生效，否则会一直卡在旧尺寸。
 static char kSLPreviewPendingSizeKey;
 
+// 0.3.29：预览层自己的尺寸变没变。
+//
+// 原来几何同步固定 0.25 秒一次 —— 录制一开始取景框要长到全屏，那是段动画，
+// 每帧尺寸都不一样，0.25 秒只跟得上四步，剩下的时间覆盖层比取景框小，
+// 底下就是真实摄像头。现在只要尺寸变了就立刻对一次。
+static char kSLPreviewSeenSizeKey;
+static char kSLPreviewUrgentKey;
+
+static BOOL SLVCamPreviewSizeChanged(AVCaptureVideoPreviewLayer *pl) {
+    CGRect b = pl.bounds;
+    NSString *cur = [NSString stringWithFormat:@"%.1fx%.1f", b.size.width, b.size.height];
+    NSString *last = objc_getAssociatedObject(pl, &kSLPreviewSeenSizeKey);
+    if ([last isEqualToString:cur]) return NO;
+    objc_setAssociatedObject(pl, &kSLPreviewSeenSizeKey, cur, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // 顺带告诉几何同步：这一次别走「两次确认」，直接跟。
+    objc_setAssociatedObject(pl, &kSLPreviewUrgentKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return YES;
+}
+
 static BOOL SLVCamPreviewSizeStable(AVCaptureVideoPreviewLayer *pl, CGFloat lw, CGFloat lh) {
     NSString *cur = [NSString stringWithFormat:@"%.1fx%.1f", lw, lh];
     NSString *last = objc_getAssociatedObject(pl, &kSLPreviewPendingSizeKey);
@@ -1610,12 +1723,18 @@ static void SLVCamSyncPreviewGeometry(AVCaptureVideoPreviewLayer *pl) {
     CGFloat pw = pb.size.width, ph = pb.size.height;
     if (pw < 8.0 || ph < 8.0) return;
 
+    // 0.3.29：取景框这一帧刚变过尺寸 → 别走「两次确认」，立刻跟。
+    BOOL urgent = [objc_getAssociatedObject(pl, &kSLPreviewUrgentKey) boolValue];
+    if (urgent) {
+        objc_setAssociatedObject(pl, &kSLPreviewUrgentKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
     AVCaptureConnection *conn = pl.connection;
     BOOL connGone = (conn == nil);
     NSInteger deg = 0;
 
     if (!connGone) {
-        deg = SLVCamEffectivePreviewDeg(conn);
+        deg = SLVCamEffectivePreviewDeg(conn, gSLLastFramePortrait);
         // 记下最后一次拿到的角度。会话重配时 connection 会短暂变 nil，
         // 那时候就用这个缓存值继续摆 —— 角度没变，画面不会歪。
         objc_setAssociatedObject(pl, &kSLPreviewDegKey, @(deg), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1651,7 +1770,7 @@ static void SLVCamSyncPreviewGeometry(AVCaptureVideoPreviewLayer *pl) {
         BOOL big = (cw0 < 1.0 || ch0 < 1.0)
                 || (fabs(cw0 - lw) / MAX(lw, 1.0) > 0.15)
                 || (fabs(ch0 - lh) / MAX(lh, 1.0) > 0.15);
-        if (big || connGone || SLVCamPreviewSizeStable(pl, lw, lh)) {
+        if (big || urgent || connGone || SLVCamPreviewSizeStable(pl, lw, lh)) {
             dl.bounds = CGRectMake(0.0, 0.0, lw, lh);
         }
     }
@@ -1757,7 +1876,9 @@ static BOOL SLVCamFrameFitsLayer(CMSampleBufferRef sb, AVCaptureVideoPreviewLaye
 
     // 0.3.28：这里要用「有效角度」。竖采集模式下帧本身已经是竖的，
     // 预览层 connection 那个 90° 不再代表真实摆法 —— 拿它去换宽高会把比例算反。
-    NSInteger deg = SLVCamEffectivePreviewDeg(pl.connection);
+    // 0.3.29：判据直接用这一帧自己的朝向，不靠「我们改没改成」。
+    BOOL framePortrait = (fh > fw);
+    NSInteger deg = SLVCamEffectivePreviewDeg(pl.connection, framePortrait);
     if (deg == 90 || deg == 270) { CGFloat t = fw; fw = fh; fh = t; }
 
     CGRect b = pl.bounds;
@@ -1776,6 +1897,10 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb) {
 
     NSArray *layers = SLVCamPreviewLayerSnapshot();
     if (layers.count == 0) return;
+
+    // 0.3.29：这一帧是竖是横，几何那边要靠它决定「角度要不要减 90°」。
+    CVImageBufferRef fimg = CMSampleBufferGetImageBuffer(sb);
+    gSLLastFramePortrait = (CVPixelBufferGetHeight(fimg) > CVPixelBufferGetWidth(fimg));
 
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     BOOL wantSync = (now - gSLPreviewLastSync) > 0.25;   // 几何变化（转屏 / 换布局）不需要每帧对
@@ -1812,7 +1937,7 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb) {
             });
             continue;
         }
-        if (wantSync) {
+        if (wantSync || SLVCamPreviewSizeChanged(pl)) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 SLVCamSyncPreviewGeometry(pl);
             });
