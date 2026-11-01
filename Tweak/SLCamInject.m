@@ -867,7 +867,9 @@ static CMSampleBufferRef SLVCamRotate90SampleBuffer(CMSampleBufferRef src) {
         .rowBytes = CVPixelBufferGetBytesPerRow(dst),
     };
     uint8_t back[4] = { 0, 0, 0, 0 };
-    vImage_Error err = vImageRotate90_ARGB8888(&sv, &dv, kRotateClockwise,
+    // 注意常量名：vImage 这套用的是 kRotate90DegreesClockwise（值 1），
+    // 不是别的库里的 kRotateClockwise —— 写错会直接编译不过。
+    vImage_Error err = vImageRotate90_ARGB8888(&sv, &dv, kRotate90DegreesClockwise,
                                                back, kvImageNoFlags);
 
     CVPixelBufferUnlockBaseAddress(dst, 0);
