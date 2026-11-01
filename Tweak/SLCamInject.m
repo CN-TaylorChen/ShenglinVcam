@@ -719,33 +719,54 @@ static void SLVCamMovieStartProbe(id self, SEL _cmd, NSURL *url, id delegate) {
 // 所以：宿主设 identity 时，只要「宿主帧是横的」就补一个 90°。
 // 不判断屏幕方向，只看 buffer 本身 —— 横 buffer + 不转 = 文件一定躺。
 static void (*gSLWriterTransformOrig)(id, SEL, CGAffineTransform);
+static int sSLWriterTransformCalls = 0;
 
 static void SLVCamWriterSetTransform(id self, SEL _cmd, CGAffineTransform t) {
     CGAffineTransform use = t;
+    BOOL weFix = NO;
 
     BOOL isIdentity = (fabs(t.a - 1.0) < 0.01 && fabs(t.b) < 0.01 &&
                        fabs(t.c) < 0.01 && fabs(t.d - 1.0) < 0.01);
-
-    static BOOL logged = NO;
-    if (!logged) {
-        logged = YES;
-        SLVLog(@"录制: AVAssetWriterInput.transform = [a=%.2f b=%.2f c=%.2f d=%.2f tx=%.0f ty=%.0f]",
-               t.a, t.b, t.c, t.d, t.tx, t.ty);
-    }
 
     if (isIdentity && SLVCamInjecting()) {
         CGSize hs = [[SLVCamFeed shared] latestHostFrameSize];
         if (hs.width > hs.height) {
             use = CGAffineTransformMakeRotation(M_PI_2);
-            static BOOL loggedFix = NO;
-            if (!loggedFix) {
-                loggedFix = YES;
-                SLVLog(@"录制: 宿主设了 identity，按宿主帧 %.0fx%.0f（横）补 90°", hs.width, hs.height);
-            }
+            weFix = YES;
         }
     }
 
+    // 0.3.25：每次调用都记（前 8 次 + 之后每 20 次）。
+    // 0.3.24 只在第一次打，结果日志里「补完 90° 转头 startWriting 又读到 identity」，
+    // 看不出到底是另一个 input 还是被宿主覆盖了。现在每次都给宿主值 → 实际值。
+    sSLWriterTransformCalls++;
+    if (sSLWriterTransformCalls <= 8 || sSLWriterTransformCalls % 20 == 0) {
+        SLVLog(@"录制: setTransform #%d 宿主=[%.2f %.2f %.2f %.2f] → 实际=[%.2f %.2f %.2f %.2f]%@",
+               sSLWriterTransformCalls,
+               t.a, t.b, t.c, t.d, use.a, use.b, use.c, use.d,
+               weFix ? @" （补 90°）" : @"");
+    }
+
     if (gSLWriterTransformOrig) gSLWriterTransformOrig(self, _cmd, use);
+}
+
+// 0.3.25：写完的那一刻读回 transform。
+// 如果这里还是 identity，说明我们的设置被宿主覆盖了 —— 那 transform 这条路就没救，
+// 得改成「让 buffer 本身是竖的」（动 AVCaptureConnection）。
+static void (*gSLWriterMarkFinishedOrig)(id, SEL);
+
+static void SLVCamWriterMarkFinished(id self, SEL _cmd) {
+    @try {
+        AVAssetWriterInput *vi = (AVAssetWriterInput *)self;
+        if ([vi.mediaType isEqualToString:AVMediaTypeVideo]) {
+            CGAffineTransform t = vi.transform;
+            BOOL idt = (fabs(t.a - 1.0) < 0.01 && fabs(t.b) < 0.01 &&
+                        fabs(t.c) < 0.01 && fabs(t.d - 1.0) < 0.01);
+            SLVLog(@"录制: markAsFinished 时 video transform = [%.2f %.2f %.2f %.2f]%@",
+                   t.a, t.b, t.c, t.d, idt ? @" （还是 identity！）" : @"");
+        }
+    } @catch (NSException *e) { }
+    if (gSLWriterMarkFinishedOrig) gSLWriterMarkFinishedOrig(self, _cmd);
 }
 
 // 0.3.24：兜底。有些宿主压根不调 `setTransform:`，默认就是 identity ——
@@ -821,6 +842,9 @@ static void SLVCamInstallRecordingProbes(void) {
     Class writerInput = SLVCamLoadClass("AVAssetWriterInput", "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
     SLVCamHookSel(writerInput, NSSelectorFromString(@"setTransform:"),
                  (IMP)SLVCamWriterSetTransform, (IMP *)&gSLWriterTransformOrig);
+    // 0.3.25：写完时读回 transform，判断我们的设置有没有被覆盖
+    SLVCamHookSel(writerInput, NSSelectorFromString(@"markAsFinished"),
+                 (IMP)SLVCamWriterMarkFinished, (IMP *)&gSLWriterMarkFinishedOrig);
 
     // 0.3.24：宿主不调 setTransform 时的兜底
     Class writer = SLVCamLoadClass("AVAssetWriter", "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
@@ -1426,6 +1450,37 @@ static CMSampleBufferRef SLVCamMakeDisplayBuffer(CMSampleBufferRef src) {
     return out;
 }
 
+// 0.3.25：帧要喂给「比例对得上」的那个预览层。
+//
+// Swiftgram 同时挂两路 video data output 和两个预览层：
+//   1920x1440（4:3）  ↔ 369x492（4:3）
+//   1920x1080（16:9） ↔ 369x656（16:9）
+//
+// 0.3.22~0.3.24 是每一帧广播给**所有**层。于是 4:3 的帧被喂进 16:9 的层、
+// 16:9 的帧被喂进 4:3 的层，ResizeAspectFill 只能大幅裁切；两路交替喂，
+// 画面就在两种裁切之间来回跳 —— 这才是「录制时还在闪」真正剩下的那一半。
+//
+// 判据：把帧按 connection 的角度转正之后，宽高比跟预览层差 12% 以内算匹配。
+// 12% 是留给 428x571 / 1440x1920 这种「同一比例但取整不同」的余量。
+static BOOL SLVCamFrameFitsLayer(CMSampleBufferRef sb, AVCaptureVideoPreviewLayer *pl) {
+    CVImageBufferRef img = CMSampleBufferGetImageBuffer(sb);
+    if (!img) return NO;
+
+    CGFloat fw = (CGFloat)CVPixelBufferGetWidth(img);
+    CGFloat fh = (CGFloat)CVPixelBufferGetHeight(img);
+    if (fw < 1.0 || fh < 1.0) return NO;
+
+    NSInteger deg = SLVCamPreviewRotationDeg(pl.connection);
+    if (deg == 90 || deg == 270) { CGFloat t = fw; fw = fh; fh = t; }
+
+    CGRect b = pl.bounds;
+    if (b.size.width < 1.0 || b.size.height < 1.0) return NO;
+
+    CGFloat fr = fw / fh;
+    CGFloat lr = b.size.width / b.size.height;
+    return fabs(fr - lr) / MAX(lr, 0.0001) < 0.12;
+}
+
 /// 把这一帧也喂给预览层（如果有的话）。采集线程调用。
 static void SLVCamFeedPreview(CMSampleBufferRef sb) {
     if (!gSLPreviewLayers) return;
@@ -1439,6 +1494,16 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb) {
     BOOL wantSync = (now - gSLPreviewLastSync) > 0.25;   // 几何变化（转屏 / 换布局）不需要每帧对
     if (wantSync) gSLPreviewLastSync = now;
 
+    // 0.3.25：先数一遍「有几层比例对得上」。一个都没有就不做过滤，退回「全喂」——
+    // 否则只挂一层、但比例特殊的 App（抖音的 9:16 预览之类）会一帧都收不到。
+    NSUInteger fitCount = 0;
+    for (AVCaptureVideoPreviewLayer *pl in layers) {
+        if (![pl isKindOfClass:[AVCaptureVideoPreviewLayer class]]) continue;
+        if (!SLVCamPreviewLayerVisible(pl)) continue;
+        if (SLVCamFrameFitsLayer(sb, pl)) fitCount++;
+    }
+    BOOL filterByRatio = (fitCount > 0);
+
     // 0.3.22：一帧只复制一次，几个预览层共用。
     // 原来是在循环里各复制一份，两个预览层就多一次 3MB 的元数据拷贝 + 一次 retain。
     CMSampleBufferRef disp = NULL;
@@ -1449,6 +1514,8 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb) {
         // 原来只判 superlayer，Swiftgram 那两层里被藏起来的那一层照样每帧喂，
         // 它的 bounds 一变，屏幕上正在显示的那层就跟着「放大一下」。
         if (!SLVCamPreviewLayerVisible(pl)) continue;
+        // 0.3.25：比例对不上的层也跳过（只在有匹配层时才过滤）
+        if (filterByRatio && !SLVCamFrameFitsLayer(sb, pl)) continue;
 
         AVSampleBufferDisplayLayer *dl = objc_getAssociatedObject(pl, &kSLPreviewDisplayKey);
         if (!dl) {
