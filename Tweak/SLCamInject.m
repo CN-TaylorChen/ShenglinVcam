@@ -703,19 +703,84 @@ static void SLVCamMovieStartProbe(id self, SEL _cmd, NSURL *url, id delegate) {
     if (gSLMovieStartOrig) gSLMovieStartOrig(self, _cmd, url, delegate);
 }
 
-// 0.3.23：AVAssetWriter 这条路写文件时的 transform。
-// 宿主如果在这里设了旋转，文件播放时就会转；没设（或者设成 identity）就不转 ——
-// 我们塞进去的「躺着」的像素就会原样播出来，也就是「发送后歪 90°」。
+// 0.3.24：AVAssetWriter 这条路写文件时的 transform。
+//
+// 宿主如果在这里设了旋转，文件播放时就会转；设成 identity 就不转 ——
+// 我们塞进去的「躺着」的像素会原样播出来，也就是「发送后歪 90°」。
+//
+// Swiftgram 的实测（13:18~13:19 两段日志）：
+//   13:19:01 transform = [a=0 b=1 c=-1 d=0]   ← 90°，这条是对的
+//   13:19:40 transform = [a=1 b=0 c=0 d=1]    ← identity，这条就是「视频消息发送后歪」
+//
+// 同一个 App 两条录制链路给的值不一样，说明它按场景自己算，而视频消息那条算漏了
+// （或者它以为 buffer 已经是竖的 —— 但 `VideoDataOutput 连接 旋转=0` 证明不是，
+// 1920x1440 横着进来的）。
+//
+// 所以：宿主设 identity 时，只要「宿主帧是横的」就补一个 90°。
+// 不判断屏幕方向，只看 buffer 本身 —— 横 buffer + 不转 = 文件一定躺。
 static void (*gSLWriterTransformOrig)(id, SEL, CGAffineTransform);
 
 static void SLVCamWriterSetTransform(id self, SEL _cmd, CGAffineTransform t) {
+    CGAffineTransform use = t;
+
+    BOOL isIdentity = (fabs(t.a - 1.0) < 0.01 && fabs(t.b) < 0.01 &&
+                       fabs(t.c) < 0.01 && fabs(t.d - 1.0) < 0.01);
+
     static BOOL logged = NO;
     if (!logged) {
         logged = YES;
         SLVLog(@"录制: AVAssetWriterInput.transform = [a=%.2f b=%.2f c=%.2f d=%.2f tx=%.0f ty=%.0f]",
                t.a, t.b, t.c, t.d, t.tx, t.ty);
     }
-    if (gSLWriterTransformOrig) gSLWriterTransformOrig(self, _cmd, t);
+
+    if (isIdentity && SLVCamInjecting()) {
+        CGSize hs = [[SLVCamFeed shared] latestHostFrameSize];
+        if (hs.width > hs.height) {
+            use = CGAffineTransformMakeRotation(M_PI_2);
+            static BOOL loggedFix = NO;
+            if (!loggedFix) {
+                loggedFix = YES;
+                SLVLog(@"录制: 宿主设了 identity，按宿主帧 %.0fx%.0f（横）补 90°", hs.width, hs.height);
+            }
+        }
+    }
+
+    if (gSLWriterTransformOrig) gSLWriterTransformOrig(self, _cmd, use);
+}
+
+// 0.3.24：兜底。有些宿主压根不调 `setTransform:`，默认就是 identity ——
+// 那样上面那个 hook 一次都不会进。开始写之前扫一遍 inputs 补上。
+static void (*gSLWriterStartOrig)(id, SEL);
+
+static void SLVCamWriterStartWriting(id self, SEL _cmd) {
+    if (SLVCamInjecting()) {
+        @try {
+            CGSize hs = [[SLVCamFeed shared] latestHostFrameSize];
+            if (hs.width > hs.height && hs.width > 1.0) {
+                NSArray *inputs = [(AVAssetWriter *)self inputs];
+                for (id inp in inputs) {
+                    if (![inp respondsToSelector:@selector(transform)] ||
+                        ![inp respondsToSelector:@selector(setTransform:)] ||
+                        ![inp respondsToSelector:@selector(mediaType)]) continue;
+
+                    AVAssetWriterInput *vi = (AVAssetWriterInput *)inp;
+                    if (![vi.mediaType isEqualToString:AVMediaTypeVideo]) continue;
+
+                    CGAffineTransform t = vi.transform;
+                    BOOL idt = (fabs(t.a - 1.0) < 0.01 && fabs(t.b) < 0.01 &&
+                                fabs(t.c) < 0.01 && fabs(t.d - 1.0) < 0.01);
+                    if (idt) {
+                        vi.transform = CGAffineTransformMakeRotation(M_PI_2);
+                        SLVLog(@"录制: startWriting 兜底 · 给 video input 补 90°（宿主帧 %.0fx%.0f）",
+                               hs.width, hs.height);
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            SLVLog(@"录制: startWriting 兜底失败（%@）", e.reason ?: @"?");
+        }
+    }
+    if (gSLWriterStartOrig) gSLWriterStartOrig(self, _cmd);
 }
 
 // AVFAudio 是 iOS 14 起独立出来的框架，宿主不一定会主动加载。
@@ -757,8 +822,13 @@ static void SLVCamInstallRecordingProbes(void) {
     SLVCamHookSel(writerInput, NSSelectorFromString(@"setTransform:"),
                  (IMP)SLVCamWriterSetTransform, (IMP *)&gSLWriterTransformOrig);
 
-    SLVLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d writerInput=%d",
-          inputNode != nil, rec != nil, movie != nil, writerInput != nil);
+    // 0.3.24：宿主不调 setTransform 时的兜底
+    Class writer = SLVCamLoadClass("AVAssetWriter", "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
+    SLVCamHookSel(writer, NSSelectorFromString(@"startWriting"),
+                 (IMP)SLVCamWriterStartWriting, (IMP *)&gSLWriterStartOrig);
+
+    SLVLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d writerInput=%d writer=%d",
+          inputNode != nil, rec != nil, movie != nil, writerInput != nil, writer != nil);
 }
 
 #pragma mark - 拍照接管（0.2.15）

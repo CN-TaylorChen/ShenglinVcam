@@ -1,3 +1,60 @@
+## 0.3.24 —— 视频消息发送后歪 90°：宿主给 writer 设了 identity
+
+0.3.23 的探针一上来就把答案交出来了。
+
+### 日志
+
+```
+13:18:27 录制: VideoDataOutput 连接 旋转=0 镜像=N      ← 录制 output 根本不转
+13:18:27 预览: 挂上显示层 预览=142x285 ... 旋转=90     ← 预览层转 90
+13:19:01 录制: AVAssetWriterInput.transform = [a=0.00 b=1.00 c=-1.00 d=0.00]
+13:19:40 录制: AVAssetWriterInput.transform = [a=1.00 b=0.00 c=-0.00 d=1.00]
+```
+
+两条录制链路，宿主给了**两个不同的 transform**：
+
+- `13:19:01` 那条是 90°（`a=0 b=1 c=-1 d=0`），文件正 —— 普通视频录制走这条。
+- `13:19:40` 那条是 **identity**（`a=1 b=0 c=0 d=1`），不转 —— 视频消息走这条。
+
+而 `VideoDataOutput 连接 旋转=0` 说明宿主拿到的 buffer 是**原始横的**（1920x1440），
+它自己也**没有**在像素层面转。于是：
+
+```
+素材转 270°（躺着）→ 写进 1920x1440 横 buffer → writer transform = identity
+→ 文件里就是「躺着的素材」，播放不转 → 发送后歪 90°
+```
+
+预览为什么是正的？因为预览层自己转了 90°（`旋转=90`），替宿主补了那一下。
+
+### 改法
+
+**一、宿主设 identity 时补 90°**
+
+`-[AVAssetWriterInput setTransform:]` 里判断：如果传进来是 identity，且
+`latestHostFrameSize` 是横的（宽 > 高），就改成 `CGAffineTransformMakeRotation(M_PI_2)`
+—— 跟宿主自己在普通录制那条路上用的是同一个值。
+
+只看 buffer 本身是横是竖，不猜屏幕方向：横 buffer + 不转 = 文件一定躺。
+
+**二、`-[AVAssetWriter startWriting]` 兜底**
+
+有些宿主压根不调 `setTransform:`，默认就是 identity，上面那个 hook 一次都进不去。
+开始写之前扫一遍 `inputs`，把还是 identity 的 video input 补上 90°。
+
+### 另外
+
+0.3.23 的拍照修正确认生效：
+
+```
+13:18:30 注入: 拍照已接管（AVCapturePhotoOutput）· 设置 270° + 补偿 90° = 0°
+```
+
+`270 + 90 = 360 = 0` → 素材原样输出，竖图、人物正。照片尺寸那一栏是 `0x0`
+说明 Swiftgram 不生成 `pixelBuffer`（只走 JPEG），此时按素材原始尺寸出图，
+正好是 1080x1920 竖的。
+
+---
+
 ## 0.3.23 —— 修「拍照方向不对」和「录制中画面突然放大」
 
 0.3.22 把乱闪和卡顿修掉了（日志里 `撤掉显示层` 从一秒 3 次降到 0 次、
