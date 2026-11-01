@@ -1,3 +1,72 @@
+## 0.3.21 —— 接管预览层：Turrit 里预览也换成素材了
+
+0.3.20 之后 Turrit 里能选素材了，但出现一个很奇怪的现象：
+
+```
+录出来的视频 = 替换素材 ✓
+相机预览     = 真实摄像头 ✗
+```
+
+### 为什么只生效一半
+
+日志证明注入这条链路完全正常：
+
+```
+首帧 视频 1712x1284 pf=420v · fmt 1712x1284 420v · 自洽=Y
+feed 转换前 中心像素 B=192 G=194 R=196 A=255
+feed 期望   Y=183 Cb=127 Cr=129
+feed 转换后 中心 Y=183 Cb=127 Cr=129
+```
+
+期望值和实际值三个数完全一致 —— 帧确实被改写了，而且写的是宿主自己的 buffer。
+
+问题出在**谁读这一帧**。查 Turrit 的二进制（`TurritUIFramework`）能看到它用的是
+Telegram 那套老相机：
+
+```
+TGCameraController / TGCameraMainView / TGCameraShutterButton
+TGCameraPreviewView / TGCameraPreviewLayerWrapperView / TGCameraPreviewLayerView
+```
+
+而预览用的是 `AVCaptureVideoPreviewLayer` —— 它**直连 AVCaptureSession，从采集设备
+直接取画面**，压根不经过 `AVCaptureVideoDataOutput`。我们改的是交给 delegate 的那一帧，
+录制读它，预览层不读。
+
+### 只能盖住它
+
+预览层没有任何「喂帧」接口，改不了它显示什么。所以换一条路：在它上面挂一个
+`AVSampleBufferDisplayLayer`，把我们每一帧也 enqueue 进去。
+
+- **抓到实例**：hook `-[AVCaptureVideoPreviewLayer initWithSession:]` 和 `-setSession:`，
+  弱引用记下来（预览层归 App 持有，不延长它的命）。
+- **盖一层**：`AVSampleBufferDisplayLayer` 作为预览层的 sublayer，几何天然跟随，
+  不用去追 App 自己的旋转/缩放。
+- **喂帧**：复用注入那条链路已经算好的帧，`CMSampleBufferCreateCopy` 之后加上
+  `kCMSampleAttachmentKey_DisplayImmediately` 再 enqueue。不另起定时器 ——
+  相机来一帧我们喂一帧，节奏天然对齐。
+- **方向**：旋转角度直接读预览层自己的 `connection.videoRotationAngle`，
+  镜像读 `connection.isVideoMirrored`，不按「竖屏该转 90」这类经验猜。
+  90/270 时把显示层 bounds 宽高互换再整体转 —— 直接拿竖屏矩形排版会让 4:3 的
+  画面被当成 3:4 来裁，人脸直接出画。
+- **兜底**：关掉替换、或这一帧拿不到假帧，立刻把显示层摘掉恢复原生预览，
+  不会卡在最后一帧上。
+
+不影响其它 App：没有 `AVCaptureVideoPreviewLayer` 的进程（抖音 / QQ / 陌陌都走
+data output）这条链路全程空转，一次都不会触发。
+
+### 新日志
+
+```
+预览: 预览层接管已布点 init=1 setSession=1
+预览: 抓到 AVCaptureVideoPreviewLayer 尺寸=428x926 会话=有
+预览: 挂上显示层 预览=428x926 会话=有 连接=有 旋转=90 镜像=N
+预览: 开始喂帧 帧=1712x1284 预览=428x926 状态=0
+```
+
+要是画面方向不对，看「旋转=」和「镜像=」这两个值就能直接判断，不用再猜。
+
+---
+
 ## 0.3.20 —— 「点不动」第三刀：给球单开一层窗口
 
 0.3.18 改窗口选择、0.3.19 改按球心那个点探测，都没解决。日志把话说死了：

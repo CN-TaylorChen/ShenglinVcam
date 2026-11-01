@@ -15,9 +15,11 @@
 #import <ImageIO/ImageIO.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>   // 0.3.21：预览层接管里的 CATransform3D
 #import <objc/runtime.h>
 #import <os/lock.h>
 #import <dlfcn.h>
+#include <math.h>   // 0.3.21：预览层接管里用 fabs / M_PI
 
 typedef void (*SLVProcessSampleBufferFn)(id, SEL, CMSampleBufferRef);
 
@@ -59,6 +61,10 @@ static NSString *SLVFourCC(OSType v) {
     }
     return @(c);
 }
+
+/// 0.3.21：预览层接管。定义在文件后半段，这里先声明 —— 注入主流程要用。
+static void SLVCamFeedPreview(CMSampleBufferRef sb);
+static void SLVCamTeardownPreview(void);
 
 /// 音视频输出可能各自重写了 _processSampleBuffer:，必须按 Method 分别保存原始 IMP，
 /// 否则音频会走到视频的原始实现上去（表现为只有画面变、声音还在）。
@@ -265,6 +271,9 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
     SLVCamFeed *feed = [SLVCamFeed shared];
 
     if (!sbuf || !sSLCamInjecting || ![feed isReady]) {
+        // 0.3.21：替换没开（或还没就绪）时，预览层那边也必须退回原生画面，
+        // 否则会一直停在我们喂的最后一帧上 —— 看起来就是「相机卡死了」。
+        SLVCamTeardownPreview();
         ((SLVProcessSampleBufferFn)orig)(self, _cmd, sbuf);
         return;
     }
@@ -496,9 +505,14 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
     }
 
     if (fake) {
+        // 0.3.21：同一帧也喂给预览层。
+        // Turrit 的预览是 AVCaptureVideoPreviewLayer，直连采集设备、不读 data output ——
+        // 只改上面那一帧的话，录制是对的、预览还是真实摄像头。
+        SLVCamFeedPreview(fake);
         ((SLVProcessSampleBufferFn)orig)(self, _cmd, fake);
         CFRelease(fake);
     } else {
+        SLVCamTeardownPreview();
         ((SLVProcessSampleBufferFn)orig)(self, _cmd, sbuf);   // 拿不到假帧就放真帧，绝不黑屏
     }
 }
@@ -946,6 +960,272 @@ static void SLVCamInstallPhotoOutputHook(void) {
           gSLPhotoPBOrig != nil, gSLPhotoCaptureOrig != nil);
 }
 
+#pragma mark - 预览层接管（0.3.21）
+
+// 为什么需要这一层：
+//
+// Turrit（Telegram 魔改，com.seastar.turrit）的相机预览是 AVCaptureVideoPreviewLayer，
+// 它直连 AVCaptureSession，从**采集设备**直接取画面 —— 完全不经过 AVCaptureVideoDataOutput。
+// 所以会出现「录出来的视频是替换素材、预览还是真实摄像头」这种一半生效的怪现象：
+// 我们改的是交给 delegate 的那一帧，录制读它，预览层不读。
+//
+// 预览层没有任何「喂帧」接口，改不了它显示什么。唯一的路是盖住它：
+// 在它上面挂一个 AVSampleBufferDisplayLayer，把我们每一帧 enqueue 进去。
+//
+// 几何不自己算，全部照抄预览层自己的 connection（videoRotationAngle / isVideoMirrored）——
+// 猜错一次就是整幅画面歪 90° 或左右反，而这种错在日志里看不出来，只能靠试。
+
+static char kSLPreviewDisplayKey;
+
+static NSHashTable *gSLPreviewLayers = nil;   // 弱引用：预览层归 App 持有，我们不延长它的命
+static os_unfair_lock gSLPreviewLock = OS_UNFAIR_LOCK_INIT;   // 建层在主线程、喂帧在采集线程
+static IMP gSLPreviewInitOrig = NULL;
+static IMP gSLPreviewSetSessionOrig = NULL;
+static BOOL gSLPreviewMounted = NO;
+static BOOL gSLPreviewFedLogged = NO;
+static CFAbsoluteTime gSLPreviewLastSync = 0.0;
+
+static void SLVCamRegisterPreviewLayer(id layer);
+
+/// App 建预览层只有两个入口：initWithSession: 和 setSession:。
+/// 两个都挂 —— 有的版本先 init 空会话、拿到设备后再 setSession:。
+static id SLVCamPreviewInitWithSession(id self, SEL _cmd, AVCaptureSession *session) {
+    id (*fn)(id, SEL, id) = (id (*)(id, SEL, id))gSLPreviewInitOrig;
+    id r = fn ? fn(self, _cmd, session) : nil;
+    if (r) SLVCamRegisterPreviewLayer(r);
+    return r;
+}
+
+static void SLVCamPreviewSetSession(id self, SEL _cmd, AVCaptureSession *session) {
+    void (*fn)(id, SEL, AVCaptureSession *) =
+        (void (*)(id, SEL, AVCaptureSession *))gSLPreviewSetSessionOrig;
+    if (fn) fn(self, _cmd, session);
+    SLVCamRegisterPreviewLayer(self);
+}
+
+static void SLVCamRegisterPreviewLayer(id layer) {
+    if (![layer isKindOfClass:[AVCaptureVideoPreviewLayer class]]) return;
+
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gSLPreviewLayers = [NSHashTable weakObjectsHashTable];
+    });
+
+    BOOL added = NO;
+    os_unfair_lock_lock(&gSLPreviewLock);
+    if (![gSLPreviewLayers containsObject:layer]) {
+        [gSLPreviewLayers addObject:layer];
+        added = YES;
+    }
+    os_unfair_lock_unlock(&gSLPreviewLock);
+    if (!added) return;
+
+    AVCaptureVideoPreviewLayer *pl = (AVCaptureVideoPreviewLayer *)layer;
+    SLVLog(@"预览: 抓到 AVCaptureVideoPreviewLayer 尺寸=%.0fx%.0f 会话=%@",
+           pl.bounds.size.width, pl.bounds.size.height,
+           pl.session ? @"有" : @"无");
+}
+
+/// 取一份预览层的快照。弱表会在对象释放时自动剔除，但读的时候要加锁。
+static NSArray *SLVCamPreviewLayerSnapshot(void) {
+    if (!gSLPreviewLayers) return @[];
+    os_unfair_lock_lock(&gSLPreviewLock);
+    NSArray *snap = gSLPreviewLayers.allObjects;
+    os_unfair_lock_unlock(&gSLPreviewLock);
+    return snap ?: @[];
+}
+
+/// 预览层怎么转，我们就怎么转。
+/// 一律读它自己的 connection，不按「竖屏应该转 90」这类经验猜。
+static NSInteger SLVCamPreviewRotationDeg(AVCaptureConnection *conn) {
+    if (!conn) return 0;
+    NSInteger deg = 0;
+    if (@available(iOS 17.0, *)) {
+        deg = (NSInteger)(conn.videoRotationAngle + 0.5);
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        switch (conn.videoOrientation) {
+            case AVCaptureVideoOrientationPortrait:           deg = 90;  break;
+            case AVCaptureVideoOrientationPortraitUpsideDown: deg = 270; break;
+            case AVCaptureVideoOrientationLandscapeRight:     deg = 180; break;
+            case AVCaptureVideoOrientationLandscapeLeft:      deg = 0;   break;
+            default:                                          deg = 0;   break;
+        }
+#pragma clang diagnostic pop
+    }
+    return ((deg % 360) + 360) % 360;
+}
+
+/// 把显示层的几何对齐到预览层。
+///
+/// 90/270 度时把显示层的 bounds 宽高互换：内容先按「横过来的那个矩形」排版，
+/// 再由 transform 整体转 90° —— 转完正好铺满预览层的竖屏矩形。
+/// 直接拿竖屏矩形去排版会让 4:3 的画面被当成 3:4 来裁，人脸直接出画。
+static void SLVCamSyncPreviewGeometry(AVCaptureVideoPreviewLayer *pl) {
+    AVSampleBufferDisplayLayer *dl = objc_getAssociatedObject(pl, &kSLPreviewDisplayKey);
+    if (!dl) return;
+
+    CGRect pb = pl.bounds;
+    CGFloat pw = pb.size.width, ph = pb.size.height;
+    if (pw < 8.0 || ph < 8.0) return;
+
+    AVCaptureConnection *conn = pl.connection;
+    NSInteger deg = SLVCamPreviewRotationDeg(conn);
+    BOOL swap = (deg == 90 || deg == 270);
+    CGFloat lw = swap ? ph : pw;
+    CGFloat lh = swap ? pw : ph;
+
+    if (fabs(dl.bounds.size.width - lw) > 0.5 || fabs(dl.bounds.size.height - lh) > 0.5) {
+        dl.bounds = CGRectMake(0.0, 0.0, lw, lh);
+    }
+    CGPoint pos = CGPointMake(CGRectGetMidX(pb), CGRectGetMidY(pb));
+    if (!CGPointEqualToPoint(dl.position, pos)) dl.position = pos;
+
+    CATransform3D t = CATransform3DMakeRotation(deg * M_PI / 180.0, 0.0, 0.0, 1.0);
+    if (conn.isVideoMirrored) {
+        // 镜像要作用在「转完之后」的画面上，所以左乘 —— 右乘会变成上下翻。
+        t = CATransform3DConcat(CATransform3DMakeScale(-1.0, 1.0, 1.0), t);
+    }
+    dl.transform = t;
+}
+
+/// 挂载 + 对齐几何。**必须在主线程**：CALayer 的属性改动不能从采集线程直接来。
+static void SLVCamMountPreviewDisplay(AVCaptureVideoPreviewLayer *pl) {
+    if (!pl || !pl.superlayer) return;
+
+    AVSampleBufferDisplayLayer *dl = objc_getAssociatedObject(pl, &kSLPreviewDisplayKey);
+    if (!dl) {
+        dl = [[AVSampleBufferDisplayLayer alloc] init];
+        dl.videoGravity = AVLayerVideoGravityResizeAspectFill;
+        dl.masksToBounds = YES;
+        dl.backgroundColor = [UIColor blackColor].CGColor;
+        [pl addSublayer:dl];
+        objc_setAssociatedObject(pl, &kSLPreviewDisplayKey, dl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        gSLPreviewMounted = YES;
+
+        AVCaptureConnection *conn = pl.connection;
+        SLVLog(@"预览: 挂上显示层 预览=%.0fx%.0f 会话=%@ 连接=%@ 旋转=%ld 镜像=%@",
+               pl.bounds.size.width, pl.bounds.size.height,
+               pl.session ? @"有" : @"无",
+               conn ? @"有" : @"无",
+               (long)SLVCamPreviewRotationDeg(conn),
+               (conn && conn.isVideoMirrored) ? @"Y" : @"N");
+    }
+    SLVCamSyncPreviewGeometry(pl);
+}
+
+/// 复制一份 sample buffer 给显示层用。
+///
+/// 不复用原帧直接 enqueue 是有意的：显示层会一直持有那个 buffer 直到画完，
+/// 而原帧是宿主采集池里的 —— 池子通常只有三五个，被我们扣住一个，
+/// 采集管线就可能开始丢帧。复制的是元数据、像素仍是共享的，代价可以忽略。
+static CMSampleBufferRef SLVCamMakeDisplayBuffer(CMSampleBufferRef src) {
+    CMSampleBufferRef out = NULL;
+    if (CMSampleBufferCreateCopy(kCFAllocatorDefault, src, &out) != noErr || !out) return NULL;
+
+    // 显示层默认按 PTS 排期。相机帧的 PTS 是真实时间，通常没问题；
+    // 但一切换前后摄、一重开会话，PTS 就可能跳一大截，画面会卡在上一帧干等。
+    // 加这一条让它「拿到就画」。
+    CMSetAttachment(out, kCMSampleAttachmentKey_DisplayImmediately,
+                    kCFBooleanTrue, kCMAttachmentMode_ShouldPropagate);
+    return out;
+}
+
+/// 把这一帧也喂给预览层（如果有的话）。采集线程调用。
+static void SLVCamFeedPreview(CMSampleBufferRef sb) {
+    if (!gSLPreviewLayers) return;
+    if (!sb) return;
+    if (!CMSampleBufferGetImageBuffer(sb)) return;   // 音频帧直接跳过
+
+    NSArray *layers = SLVCamPreviewLayerSnapshot();
+    if (layers.count == 0) return;
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    BOOL wantSync = (now - gSLPreviewLastSync) > 0.25;   // 几何变化（转屏 / 换布局）不需要每帧对
+    if (wantSync) gSLPreviewLastSync = now;
+
+    for (AVCaptureVideoPreviewLayer *pl in layers) {
+        if (![pl isKindOfClass:[AVCaptureVideoPreviewLayer class]]) continue;
+        // 已经离开视图树的预览层不用管：相机关掉之后 App 会把它丢掉，
+        // 我们再去挂显示层只是白占内存。
+        if (!pl.superlayer) continue;
+
+        AVSampleBufferDisplayLayer *dl = objc_getAssociatedObject(pl, &kSLPreviewDisplayKey);
+        if (!dl) {
+            // 挂载动作丢到主线程，这一帧先跳过 —— 下一帧就能接上
+            dispatch_async(dispatch_get_main_queue(), ^{
+                SLVCamMountPreviewDisplay(pl);
+            });
+            continue;
+        }
+        if (wantSync) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                SLVCamSyncPreviewGeometry(pl);
+            });
+        }
+
+        CMSampleBufferRef disp = SLVCamMakeDisplayBuffer(sb);
+        if (!disp) continue;
+
+        if (dl.status == AVQueuedSampleBufferRenderingStatusFailed) {
+            // 显示层一旦进入 failed 就再也不出画面，必须 flush 才能恢复
+            if (!gSLPreviewFedLogged) {
+                SLVLog(@"预览: 显示层失败（%@），已 flush 重来",
+                       dl.error.localizedDescription ?: @"?");
+            }
+            [dl flush];
+        }
+        [dl enqueueSampleBuffer:disp];
+        CFRelease(disp);
+
+        if (!gSLPreviewFedLogged) {
+            gSLPreviewFedLogged = YES;
+            CVImageBufferRef img = CMSampleBufferGetImageBuffer(sb);
+            SLVLog(@"预览: 开始喂帧 帧=%zux%zu 预览=%.0fx%.0f 状态=%ld",
+                   (size_t)CVPixelBufferGetWidth(img), (size_t)CVPixelBufferGetHeight(img),
+                   pl.bounds.size.width, pl.bounds.size.height, (long)dl.status);
+        }
+    }
+}
+
+/// 撤掉显示层，恢复原生预览。替换关掉、或这一帧拿不到假帧时调用。
+static void SLVCamTeardownPreview(void) {
+    if (!gSLPreviewMounted || !gSLPreviewLayers) return;
+    gSLPreviewMounted = NO;
+
+    NSArray *layers = SLVCamPreviewLayerSnapshot();
+    for (AVCaptureVideoPreviewLayer *pl in layers) {
+        if (![pl isKindOfClass:[AVCaptureVideoPreviewLayer class]]) continue;
+        AVSampleBufferDisplayLayer *dl = objc_getAssociatedObject(pl, &kSLPreviewDisplayKey);
+        if (!dl) continue;
+        objc_setAssociatedObject(pl, &kSLPreviewDisplayKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [dl removeFromSuperlayer];
+        });
+    }
+    gSLPreviewFedLogged = NO;
+    SLVLog(@"预览: 撤掉显示层，恢复原生预览");
+}
+
+static void SLVCamInstallPreviewLayerHook(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    Class cls = objc_getClass("AVCaptureVideoPreviewLayer");
+    if (!cls) {
+        SLVLog(@"预览: AVCaptureVideoPreviewLayer 不存在，跳过");
+        return;
+    }
+    SLVCamHookSel(cls, NSSelectorFromString(@"initWithSession:"),
+                  (IMP)SLVCamPreviewInitWithSession, &gSLPreviewInitOrig);
+    SLVCamHookSel(cls, NSSelectorFromString(@"setSession:"),
+                  (IMP)SLVCamPreviewSetSession, &gSLPreviewSetSessionOrig);
+    SLVLog(@"预览: 预览层接管已布点 init=%d setSession=%d",
+          gSLPreviewInitOrig != nil, gSLPreviewSetSessionOrig != nil);
+}
+
 void SLVCamInstallHooks(void) {
     if (sSLCamHooksInstalled) return;
     sSLCamHooksInstalled = YES;
@@ -1005,6 +1285,10 @@ void SLVCamInstallHooks(void) {
 
     // 抖音拍照走 AVCapturePhotoOutput，又是另一条 —— 两条都要挂
     SLVCamInstallPhotoOutputHook();
+
+    // 第四条：预览层。Turrit 这类 App 的预览直连采集设备，不走任何 data output，
+    // 上面几条全都碰不到它。
+    SLVCamInstallPreviewLayerHook();
 
     if (sSLCamHookCount == 0) {
         SLVLog(@"注入: 没找到 _processSampleBuffer: —— 该系统版本可能改了私有 API，"
