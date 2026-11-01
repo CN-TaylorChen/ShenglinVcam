@@ -1640,6 +1640,67 @@ static CGPoint SLVLoadFloatPos(CGSize size) {
     return CGPointMake(size.width - 36.0, size.height * 0.72);
 }
 
+// 0.3.20：必要时给球单开一层窗口。
+//
+// 为什么需要：Turrit（Telegram 魔改）的根视图是 Texture 的 `_ASDisplayView`，
+// 它把球所在的那个点整个盖住了 —— 日志里 `hitTest` 命中的是它，不是球。
+// 而且这不是偶发：宿主在渲染循环里反复重排自己的视图，我们在它的窗口里
+// `bringSubviewToFront` 也抢不过来（抢到了下一个 runloop 又被压回去）。
+//
+// 与其在宿主的窗口里跟它抢 z 序，不如自己起一层：球是那层里唯一的内容，
+// 没人能压住它，也不受宿主视图树的任何影响。
+//
+// 这层窗口必须「除球以外全部放行」，否则它会把整个 App 的触摸都吃掉：
+// hitTest 里把根视图（那层全屏透明的壳）返回 nil，触摸就穿透到下面的窗口去了。
+@interface SLVBallWindow : UIWindow
+@end
+
+static SLVBallWindow *sSLBallWindow = nil;
+
+@implementation SLVBallWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    if (!v || v == self) return nil;
+    if (v == self.rootViewController.view) return nil;   // 空白处一律放行，别吃掉 App 的触摸
+    return v;
+}
+@end
+
+static UIWindow *SLVBallWindowEnsure(void) {
+    if (sSLBallWindow && sSLBallWindow.windowScene) return sSLBallWindow;
+
+    UIWindowScene *ws = nil;
+    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        if (sc.activationState == UISceneActivationStateForegroundActive) {
+            ws = (UIWindowScene *)sc;
+            break;
+        }
+    }
+    if (!ws) {
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if ([sc isKindOfClass:[UIWindowScene class]]) { ws = (UIWindowScene *)sc; break; }
+        }
+    }
+    if (!ws) return nil;
+
+    SLVBallWindow *w = [[SLVBallWindow alloc] initWithWindowScene:ws];
+    // Alert + 1：压在宿主所有普通窗口之上。键盘窗层级更高，不受影响。
+    w.windowLevel = UIWindowLevelAlert + 1;
+    w.backgroundColor = [UIColor clearColor];
+    w.opaque = NO;
+
+    UIViewController *vc = [[UIViewController alloc] init];
+    vc.view.backgroundColor = [UIColor clearColor];
+    w.rootViewController = vc;
+    w.hidden = NO;
+
+    sSLBallWindow = w;
+    SLVLog(@"SL-VCAM: 起了独立窗口 level=%.0f 尺寸=%.0fx%.0f", w.windowLevel,
+           w.bounds.size.width, w.bounds.size.height);
+    return w;
+}
+
 // 0.3.19：这个窗口在**这个屏幕点**上接不接得住触摸。
 //
 // 关键一步是把球自己临时摘出去：球要是已经挂在这一层，hitTest 会命中球本身，
@@ -1648,6 +1709,14 @@ static BOOL SLVWindowAcceptsTouchAt(UIWindow *w, CGPoint pt) {
     if (!w || !w.isUserInteractionEnabled) return NO;
     CGPoint p = [w convertPoint:pt fromWindow:nil];   // 屏幕坐标 → 窗口坐标
     if (!CGRectContainsPoint(w.bounds, p)) return NO; // 球不在这个窗里，挂了也白挂
+
+    // 0.3.20：我们自己的球窗必须直接判「接得住」，不能走下面的 hitTest。
+    //
+    // 下面那套探测会先把球摘掉再问，而 SLVBallWindow 的设计就是「摘掉球之后
+    // 空白处一律返回 nil」（不放行的话整块屏幕的触摸都会被它吃掉）。
+    // 两者一撞就出事：球明明在自己窗里好好的，探测却读到 nil → 判成接不住 →
+    // 搬回宿主窗口 → 下一轮又被 0.3.20 的兜底搬回来，每 2 秒来回抖一次。
+    if ([w isKindOfClass:[SLVBallWindow class]]) return YES;
 
     UIView *ball = sSLFloatBtn;
     BOOL old = ball.userInteractionEnabled;
@@ -1835,6 +1904,33 @@ void SLVEnsureFloatButton(void) {
                    NSStringFromCGPoint(btn.center),
                    CGRectContainsPoint(bw.bounds, btn.center) ? @"Y" : @"N",
                    hit ? NSStringFromClass([hit class]) : @"nil");
+        }
+    }
+
+    // 0.3.20：最后一道保险 —— 球心命不中球自己，就搬进我们自己的窗口。
+    //
+    // 判据是「球心 hitTest 是不是球」，不是「窗口接不接得住触摸」：
+    // 宿主根视图盖住球的时候，窗口明明接得住触摸，只是接住的是它自己。
+    // Turrit 的 `_ASDisplayView` 就是这种 —— 每轮 bringSubviewToFront 都抢不过。
+    if (btn && btn.window) {
+        UIWindow *bw = btn.window;
+        CGPoint hp = [btn convertPoint:CGPointMake(CGRectGetMidX(btn.bounds),
+                                                   CGRectGetMidY(btn.bounds))
+                                toView:bw];
+        UIView *hit = [bw hitTest:hp withEvent:nil];
+        BOOL ok = (hit == btn) || (hit && [hit isDescendantOfView:btn]);
+        if (!ok && ![bw isKindOfClass:[SLVBallWindow class]]) {
+            UIWindow *own = SLVBallWindowEnsure();
+            if (own) {
+                // 两个窗口都是全屏，坐标空间一致；仍然夹一次，免得窗口尺寸不同时跑出边界
+                CGPoint keep = SLVClampFloatPos(btn.center, own.bounds.size);
+                [btn removeFromSuperview];
+                [own addSubview:btn];
+                btn.center = keep;
+                [own bringSubviewToFront:btn];
+                SLVLog(@"SL-VCAM: 球心命不中球自己（命中=%@）→ 搬进独立窗口",
+                       hit ? NSStringFromClass([hit class]) : @"nil");
+            }
         }
     }
 
