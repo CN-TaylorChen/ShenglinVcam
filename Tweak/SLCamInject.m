@@ -16,6 +16,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>   // 0.3.21：预览层接管里的 CATransform3D
+#import <Accelerate/Accelerate.h>  // 0.3.32：写文件时把像素转 90°（vImageRotate90）
 #import <objc/runtime.h>
 #import <os/lock.h>
 #import <dlfcn.h>
@@ -782,6 +783,213 @@ static void SLVCamInstallRecordingProbes(void) {
     SLVLog(@"探测: 音频链路已布点 tap=%d recorder=%d", inputNode != nil, rec != nil);
 }
 
+#pragma mark - 视频消息方向（0.3.32）
+
+// 这一版只做一件事：**在写文件的那一刻把像素转过来**。
+//
+// 为什么只剩这一条路 —— 前面两条都实测证伪了：
+//
+//   1. track transform（0.3.27）
+//      transform 确实写进了文件的 tkhd matrix（探针读回来了），播放端就是不认。
+//      400x400 的正方形视频，转了跟没转在几何上完全等价，转码器很可能直接丢掉。
+//
+//   2. 让采集连接交出竖 buffer（0.3.28 / 0.3.29）
+//      buffer 变成 1080x1920、transform 变成 identity，发出去还是歪。
+//      而且改的是整条采集链路的基准，把拍照和普通录制一起带坏了。
+//
+// 所以这一条：采集一个字节不碰，transform 一个字节不设，
+// 只在宿主往 writer 里 append 的那一帧上，把像素顺时针转 90°。
+//
+// ## 为什么不会误伤普通视频录制
+//
+// 宿主自己会转的场景（普通视频录制），它会给 `AVAssetWriterInput` 设一个 90° 的
+// transform，那种情况我们**一律不动**。
+//
+// 只有 transform 是 identity 的时候（视频消息就是这样，0.3.30 的日志：
+// `录制: setTransform 宿主=[1.00 0.00 -0.00 1.00]`），才说明宿主打算原样写，
+// 而我们的假帧是横的 —— 这一帧必须由我们转正。
+//
+// ## 尺寸安全
+//
+// append 的 buffer 尺寸一旦跟 writer 期望的对不上，writer 会直接进 failed 状态，
+// 整段录制就废了。所以转之前先算：
+//
+//   · writer 指定了输出尺寸（outputSettings 里有宽高）→ 只有「转完正好等于它」才转；
+//   · writer 没指定尺寸（passthrough）→ 尺寸自由，直接转。
+
+static BOOL (*gSLAppendOrig)(id, SEL, CMSampleBufferRef);
+static int sSLAppendRotated = 0;
+static int sSLAppendSkippedFit = 0;
+
+/// 把一帧 32BGRA 的图像顺时针转 90°，返回新的 sample buffer（调用方负责 CFRelease）。
+/// 任何一步不满足都返回 NULL —— 调用方拿到 NULL 就原样 append，绝不能影响录制。
+static CMSampleBufferRef SLVCamRotate90SampleBuffer(CMSampleBufferRef src) {
+    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(src);
+    if (!pb) return NULL;
+
+    OSType pf = CVPixelBufferGetPixelFormatType(pb);
+    if (pf != kCVPixelFormatType_32BGRA) return NULL;   // vImage 这条路只认 32 位
+
+    size_t w = CVPixelBufferGetWidth(pb);
+    size_t h = CVPixelBufferGetHeight(pb);
+    if (w < 2 || h < 2) return NULL;
+
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        return NULL;
+    }
+
+    CVPixelBufferRef dst = NULL;
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    if (CVPixelBufferCreate(kCFAllocatorDefault, h, w, pf,
+                            (__bridge CFDictionaryRef)attrs, &dst) != kCVReturnSuccess || !dst) {
+        CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        return NULL;
+    }
+
+    if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) {
+        CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        CVPixelBufferRelease(dst);
+        return NULL;
+    }
+
+    vImage_Buffer sv = {
+        .data     = CVPixelBufferGetBaseAddress(pb),
+        .height   = (vImagePixelCount)h,
+        .width    = (vImagePixelCount)w,
+        .rowBytes = CVPixelBufferGetBytesPerRow(pb),
+    };
+    vImage_Buffer dv = {
+        .data     = CVPixelBufferGetBaseAddress(dst),
+        .height   = (vImagePixelCount)w,
+        .width    = (vImagePixelCount)h,
+        .rowBytes = CVPixelBufferGetBytesPerRow(dst),
+    };
+    uint8_t back[4] = { 0, 0, 0, 0 };
+    vImage_Error err = vImageRotate90_ARGB8888(&sv, &dv, kRotateClockwise,
+                                               back, kvImageNoFlags);
+
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+
+    if (err != kvImageNoError) {
+        CVPixelBufferRelease(dst);
+        return NULL;
+    }
+
+    CMFormatDescriptionRef newFmt = NULL;
+    if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, dst, &newFmt) != noErr
+        || !newFmt) {
+        CVPixelBufferRelease(dst);
+        return NULL;
+    }
+
+    // 时间戳必须原样带过去 —— 丢了它 writer 会按 0 写，整段视频时长就乱了。
+    // 拿不到就干脆不转，交给宿主原帧（宁可歪，也不能把文件写坏）。
+    CMSampleTimingInfo timing;
+    if (CMSampleBufferGetSampleTimingInfo(src, 0, &timing) != noErr) {
+        CFRelease(newFmt);
+        CVPixelBufferRelease(dst);
+        return NULL;
+    }
+
+    CMSampleBufferRef out = NULL;
+    OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, dst, newFmt,
+                                                           &timing, &out);
+    CFRelease(newFmt);
+    CVPixelBufferRelease(dst);
+    if (st != noErr || !out) return NULL;
+    return out;
+}
+
+static BOOL SLVCamAppendSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
+    if (!gSLAppendOrig) return NO;
+    if (!sb) return gSLAppendOrig(self, _cmd, sb);
+
+    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sb);
+    if (!fmt || CMFormatDescriptionGetMediaType(fmt) != kCMMediaType_Video) {
+        return gSLAppendOrig(self, _cmd, sb);
+    }
+
+    // 没在替换、或者素材没就绪 —— 这一帧是宿主的真实画面，绝不能转。
+    if (!SLVCamInjecting() || !SLVCamArmed()) {
+        return gSLAppendOrig(self, _cmd, sb);
+    }
+
+    AVAssetWriterInput *inp = (AVAssetWriterInput *)self;
+    CGAffineTransform t = CGAffineTransformIdentity;
+    NSDictionary *settings = nil;
+    @try {
+        t = inp.transform;
+        settings = inp.outputSettings;
+    } @catch (NSException *e) { }
+
+    // 宿主自己会转（普通视频录制）—— 不动。
+    BOOL identity = (fabs(t.a - 1.0) < 0.01 && fabs(t.b) < 0.01 &&
+                     fabs(t.c) < 0.01 && fabs(t.d - 1.0) < 0.01);
+    if (!identity) {
+        return gSLAppendOrig(self, _cmd, sb);
+    }
+
+    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
+    if (!pb) return gSLAppendOrig(self, _cmd, sb);
+    size_t w = CVPixelBufferGetWidth(pb);
+    size_t h = CVPixelBufferGetHeight(pb);
+
+    // 尺寸安全闸：writer 指定了尺寸就必须「转完正好等于它」。
+    if (settings) {
+        NSNumber *sw = settings[AVVideoWidthKey];
+        NSNumber *sh = settings[AVVideoHeightKey];
+        NSInteger tw = sw ? sw.integerValue : 0;
+        NSInteger th = sh ? sh.integerValue : 0;
+        if (tw > 0 && th > 0 && ((size_t)tw != h || (size_t)th != w)) {
+            sSLAppendSkippedFit++;
+            if (sSLAppendSkippedFit <= 3) {
+                SLVLog(@"方向: 跳过转帧 · buffer %zux%zu / writer 目标 %ldx%ld（转完 %zux%zu 对不上）",
+                       w, h, (long)tw, (long)th, h, w);
+            }
+            return gSLAppendOrig(self, _cmd, sb);
+        }
+    }
+
+    CMSampleBufferRef rotated = SLVCamRotate90SampleBuffer(sb);
+    if (!rotated) {
+        static BOOL loggedFail = NO;
+        if (!loggedFail) {
+            loggedFail = YES;
+            SLVLog(@"方向: 转帧失败（buffer %zux%zu），本帧原样写", w, h);
+        }
+        return gSLAppendOrig(self, _cmd, sb);
+    }
+
+    sSLAppendRotated++;
+    if (sSLAppendRotated == 1 || sSLAppendRotated % 90 == 0) {
+        SLVLog(@"方向: 第 %d 帧顺时针转 90° · %zux%zu → %zux%zu（writer transform=identity）",
+               sSLAppendRotated, w, h, h, w);
+    }
+
+    BOOL ok = gSLAppendOrig(self, _cmd, rotated);
+    CFRelease(rotated);
+    return ok;
+}
+
+static void SLVCamInstallVideoMessageFix(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+
+    Class cls = SLVCamLoadClass("AVAssetWriterInput",
+                                "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
+    if (!cls) {
+        SLVLog(@"方向: AVAssetWriterInput 不存在，跳过");
+        return;
+    }
+    SLVCamHookSel(cls, NSSelectorFromString(@"appendSampleBuffer:"),
+                  (IMP)SLVCamAppendSampleBuffer, (IMP *)&gSLAppendOrig);
+    SLVLog(@"方向: 写文件转帧已布点 append=%d", gSLAppendOrig != nil);
+}
+
 #pragma mark - 拍照接管（0.2.15 引入，0.3.31 移除）
 
 // 这里原来有两条拍照链路：
@@ -1339,6 +1547,9 @@ void SLVCamInstallHooks(void) {
 
     // 音频探针（AVAudioEngine tap / AVAudioRecorder）
     SLVCamInstallRecordingProbes();
+
+    // 0.3.32：视频消息的方向 —— 只在写文件那一刻转帧，别的一概不碰
+    SLVCamInstallVideoMessageFix();
 
     // 第四条：预览层。Turrit 这类 App 的预览直连采集设备，不走任何 data output，
     // 上面几条全都碰不到它。
