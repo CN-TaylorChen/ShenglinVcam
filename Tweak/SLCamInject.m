@@ -820,6 +820,7 @@ static void SLVCamInstallRecordingProbes(void) {
 static BOOL (*gSLAppendOrig)(id, SEL, CMSampleBufferRef);
 static int sSLAppendRotated = 0;
 static int sSLAppendSkippedFit = 0;
+static int sSLAppendFailed = 0;
 
 /// 把一帧 32BGRA 的图像顺时针转 90°，返回新的 sample buffer（调用方负责 CFRelease）。
 /// 任何一步不满足都返回 NULL —— 调用方拿到 NULL 就原样 append，绝不能影响录制。
@@ -880,11 +881,26 @@ static CMSampleBufferRef SLVCamRotate90SampleBuffer(CMSampleBufferRef src) {
         return NULL;
     }
 
+    // 0.3.34：**format description 不能重建**。
+    //
+    // 0.3.33 在这里用 `CMVideoFormatDescriptionCreateForImageBuffer` 造了个新的 fmt，
+    // 结果把宿主原来那 5 项扩展全丢了（CVImageBufferYCbCrMatrix、
+    // CVImageBufferTransferFunction、CVImageBufferColorPrimaries、CVBytesPerRow…）。
+    // AVAssetWriterInput 对 fmt 是有要求的，缺了这些它可能直接拒收 ——
+    // 而 0.3.33 把 append 的返回值吞了，表现就是「日志说转了 90°，画面一点没变」。
+    //
+    // 正方形（视频消息就是 400x400）转 90° 之后宽高完全不变，fmt 可以原样复用。
+    // 非正方形才必须新建（尺寸变了，旧 fmt 描述不了）。
+    CMFormatDescriptionRef srcFmt = CMSampleBufferGetFormatDescription(src);
     CMFormatDescriptionRef newFmt = NULL;
-    if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, dst, &newFmt) != noErr
-        || !newFmt) {
-        CVPixelBufferRelease(dst);
-        return NULL;
+    if (w == h && srcFmt) {
+        newFmt = (CMFormatDescriptionRef)CFRetain(srcFmt);
+    } else {
+        if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, dst, &newFmt) != noErr
+            || !newFmt) {
+            CVPixelBufferRelease(dst);
+            return NULL;
+        }
     }
 
     // 时间戳必须原样带过去 —— 丢了它 writer 会按 0 写，整段视频时长就乱了。
@@ -971,7 +987,22 @@ static BOOL SLVCamAppendSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
                sSLAppendRotated, w, h, h, w);
     }
 
+    // 0.3.34：返回值必须看。
+    //
+    // 0.3.33 把这一行写成 `return gSLAppendOrig(...)`，失败也照样往下走 ——
+    // writer 一旦 failed，后面每一帧都写不进去，而日志里只有「转了 90°」，
+    // 看上去像「转了但没效果」。现在失败立刻记下来，带上 writer 的状态码。
     BOOL ok = gSLAppendOrig(self, _cmd, rotated);
+    if (!ok) {
+        sSLAppendFailed++;
+        if (sSLAppendFailed <= 5) {
+            AVAssetWriterStatus ws = AVAssetWriterStatusUnknown;
+            @try { ws = inp.writer.status; } @catch (NSException *e) { }
+            SLVLog(@"方向: append 被拒（第 %d 次）· %zux%zu · writer 状态=%ld %@",
+                   sSLAppendFailed, w, h, (long)ws,
+                   inp.writer.error ? inp.writer.error.localizedDescription : @"");
+        }
+    }
     CFRelease(rotated);
     return ok;
 }

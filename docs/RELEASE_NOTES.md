@@ -1,3 +1,87 @@
+## 0.3.34 —— 转帧其实被拒了：复用宿主的 format description
+
+0.3.33 的日志里有一行很关键：
+
+```
+方向: 第 1 帧顺时针转 90° · 400x400 → 400x400（writer transform=identity）
+```
+
+**`400x400 → 400x400`** —— 宿主 writer 收的就是正方形帧，转 90° 之后宽高完全不变。
+
+那为什么转了等于没转？
+
+### 原因：format description 被我重建了
+
+0.3.33 在 `SLVCamRotate90SampleBuffer` 里调了
+`CMVideoFormatDescriptionCreateForImageBuffer` 造了个全新的 fmt。
+
+宿主原来的 fmt 带 5 项扩展：
+
+```
+CVImageBufferYCbCrMatrix
+CVImageBufferTransferFunction
+CVImageBufferColorPrimaries
+CVBytesPerRow
+Version
+```
+
+新造的 fmt 一项都没有。`AVAssetWriterInput` 对 fmt 是有要求的，缺了这些它直接拒收。
+
+而 0.3.33 的结尾写的是：
+
+```objc
+BOOL ok = gSLAppendOrig(self, _cmd, rotated);
+CFRelease(rotated);
+return ok;          // ← 返回值没人看
+```
+
+**append 失败了也照样往下走**，日志里只有「转了 90°」，看着就像「转了但没效果」。
+
+### 这一版改了什么
+
+**一、正方形复用原 fmt。**
+
+视频消息是 400x400，转 90° 后宽高不变，fmt 可以原样复用 —— 色彩扩展、内参一项不少：
+
+```objc
+if (w == h && srcFmt) {
+    newFmt = (CMFormatDescriptionRef)CFRetain(srcFmt);
+} else {
+    CMVideoFormatDescriptionCreateForImageBuffer(...);   // 非正方形才必须新建
+}
+```
+
+**二、append 的返回值必须看。**
+
+失败立刻记下来，带上 writer 状态和错误描述：
+
+```
+方向: append 被拒（第 1 次）· 400x400 · writer 状态=3 写入失败：...
+```
+
+### 日志对照
+
+正常（转帧被接受）：
+
+```
+方向: 写文件转帧已布点 append=1
+方向: 第 1 帧顺时针转 90° · 400x400 → 400x400（writer transform=identity）
+方向: 第 91 帧顺时针转 90° · 400x400 → 400x400（writer transform=identity）
+```
+
+失败（这一版能看见）：
+
+```
+方向: append 被拒（第 1 次）· 400x400 · writer 状态=3 ...
+```
+
+### 如果还是歪
+
+只剩一个变量没排除：**转的方向**。现在是顺时针（`kRotate90DegreesClockwise`）。
+如果这一版装上去变成「反着歪」，说明该逆时针，下一版换 `kRotate270DegreesClockwise` 就行。
+
+---
+
 ## 0.3.33 —— 视频消息差 90°：换成「写文件时转像素」
 
 > 0.3.32 的提交只差一个常量名（`kRotateClockwise` 应为 `kRotate90DegreesClockwise`），
