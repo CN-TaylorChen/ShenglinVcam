@@ -825,7 +825,7 @@ static int sSLAppendFailed = 0;
 static void SLLogRotateFail(NSString *why, OSType pf, size_t w, size_t h) {
     static int n = 0;
     if (n++ >= 3) return;
-    SLVLog(@"方向: 转帧失败 · %@ · %zux%zu pf=%u(%c%c%c%c)", why, w, h, (unsigned)pf,
+    SLVLog(@"镜像: 翻转失败 · %@ · %zux%zu pf=%u(%c%c%c%c)", why, w, h, (unsigned)pf,
            (char)((pf >> 24) & 0xff), (char)((pf >> 16) & 0xff),
            (char)((pf >> 8) & 0xff), (char)(pf & 0xff));
 }
@@ -868,9 +868,19 @@ static CMSampleBufferRef SLVCamRotate90SampleBuffer(CMSampleBufferRef src) {
         return NULL;
     }
 
-    CIImage *rot = [ci imageByApplyingCGOrientation:kCGImagePropertyOrientationRight];
+    // 0.3.37：**只做水平镜像，不旋转。**
+    //
+    // 用户实测：0.3.35（转帧失败、原样写）的时候，「发送和预览是一个方向，
+    // 只是发送的被镜像了」。也就是说方向一直是对的 ——
+    // 前面几版拼命转 90°，转的其实是本来就不需要转的东西。
+    //
+    // 预览层是前置摄像头（isVideoMirrored=YES），它把假帧左右翻过来显示；
+    // 而 writer 那条路没有翻，所以成品跟预览比就「镜像」了。
+    //
+    // UpMirrored = 水平镜像（左右翻转），尺寸不变。
+    CIImage *rot = [ci imageByApplyingCGOrientation:kCGImagePropertyOrientationUpMirrored];
     if (!rot) {
-        SLLogRotateFail(@"应用朝向失败", pf, w, h);
+        SLLogRotateFail(@"应用镜像失败", pf, w, h);
         return NULL;
     }
 
@@ -886,11 +896,10 @@ static CMSampleBufferRef SLVCamRotate90SampleBuffer(CMSampleBufferRef src) {
 
     [ctx render:rot toCVPixelBuffer:dst bounds:CGRectMake(0, 0, h, w) colorSpace:NULL];
 
-    // format description：正方形（400x400）转 90° 后宽高不变，直接复用宿主的，
-    // 色彩扩展一项不少；非正方形才必须新建（尺寸变了，旧 fmt 描述不了）。
+    // 镜像不改变宽高，fmt 永远可以原样复用 —— 色彩扩展一项不少。
     CMFormatDescriptionRef srcFmt = CMSampleBufferGetFormatDescription(src);
     CMFormatDescriptionRef newFmt = NULL;
-    if (w == h && srcFmt) {
+    if (srcFmt) {
         newFmt = (CMFormatDescriptionRef)CFRetain(srcFmt);
     } else {
         if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, dst, &newFmt) != noErr
@@ -972,15 +981,15 @@ static BOOL SLVCamAppendSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
         static BOOL loggedFail = NO;
         if (!loggedFail) {
             loggedFail = YES;
-            SLVLog(@"方向: 转帧失败（buffer %zux%zu），本帧原样写", w, h);
+            SLVLog(@"镜像: 翻转失败（buffer %zux%zu），本帧原样写", w, h);
         }
         return gSLAppendOrig(self, _cmd, sb);
     }
 
     sSLAppendRotated++;
     if (sSLAppendRotated == 1 || sSLAppendRotated % 90 == 0) {
-        SLVLog(@"方向: 第 %d 帧顺时针转 90° · %zux%zu → %zux%zu（writer transform=identity）",
-               sSLAppendRotated, w, h, h, w);
+        SLVLog(@"镜像: 第 %d 帧水平翻转 · %zux%zu（writer transform=identity）",
+               sSLAppendRotated, w, h);
     }
 
     // 0.3.34：返回值必须看。
@@ -994,7 +1003,7 @@ static BOOL SLVCamAppendSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
         if (sSLAppendFailed <= 5) {
             // AVAssetWriterInput 上没有公开的 writer 属性（0.3.34 第一次写就编译失败），
             // 只打返回值 —— 有这一行就够判断「转帧到底进没进去」。
-            SLVLog(@"方向: append 被拒（第 %d 次）· %zux%zu · writer 不再接收这一帧",
+            SLVLog(@"镜像: append 被拒（第 %d 次）· %zux%zu · writer 不再接收这一帧",
                    sSLAppendFailed, w, h);
         }
     }
@@ -1010,7 +1019,7 @@ static void SLVCamInstallVideoMessageFix(void) {
     Class cls = SLVCamLoadClass("AVAssetWriterInput",
                                 "/System/Library/Frameworks/AVFoundation.framework/AVFoundation");
     if (!cls) {
-        SLVLog(@"方向: AVAssetWriterInput 不存在，跳过");
+        SLVLog(@"镜像: AVAssetWriterInput 不存在，跳过");
         return;
     }
     SLVCamHookSel(cls, NSSelectorFromString(@"appendSampleBuffer:"),
