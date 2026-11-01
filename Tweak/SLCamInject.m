@@ -618,17 +618,25 @@ static void SLVCamDumpCandidates(const char *className) {
           hits.count ? [hits componentsJoinedByString:@", "] : @"(无)");
 }
 
-#pragma mark - 竖采集（0.3.28）
+#pragma mark - 竖采集（0.3.28 引入，0.3.30 关闭）
 
 // Swiftgram 的视频消息是 **400x400 正方形**。正方形上挂 90° 旋转矩阵，
 // 转了跟没转在取景上完全一样，只有内容朝向差 90° —— 而它的播放端不认
 // track transform（0.3.27 的日志已经把 transform 写进文件了，成品照样歪）。
 //
-// 所以 transform 这条路对视频消息是死路。唯一能治本的办法：
-// **让采集连接直接交出竖的 buffer**，像素本身是正的，transform 保持 identity。
+// 当时的想法：让采集连接直接交出竖的 buffer，像素本身是正的，transform 保持 identity。
 //
-// 代价是预览层的 connection 还停在 90°（那个我们不动，宿主自己在用），
-// 所以「预览层角度」要减掉这 90°，才等于现在这一帧真实的摆法。
+// **0.3.30 实测结论：这条路不能走。**
+//   - 视频消息的方向**还是不对**（缓冲已经变竖 1080x1920、transform 已经是 identity，
+//     发出去照样歪）；
+//   - 更糟的是把**拍照和普通视频录制一起带坏了** —— 整条采集链路的基准都变了。
+//
+// 收益为零、代价是整个采集管线，所以整体关掉，行为退回 0.3.27。
+//
+// 代码先留着不删：思路本身没错，错在**层面**。真要再试，只能换成
+// 「只在写文件前转帧」（挂 appendSampleBuffer:），绝不能再动 AVCaptureSession。
+static const BOOL kSLPortraitCaptureEnabled = NO;
+
 static NSInteger const SLVPortraitDeg = 90;
 
 /// 竖采集走这条的 App。
@@ -638,6 +646,8 @@ static NSInteger const SLVPortraitDeg = 90;
 ///
 /// 抖音 / 陌陌 / QQ 现在都是好的，不能因为这两个 App 把它们的采集管线一起改了。
 static BOOL SLVCamPortraitCapture(void) {
+    if (!kSLPortraitCaptureEnabled) return NO;
+
     static BOOL on = NO;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -2067,11 +2077,10 @@ void SLVCamInstallHooks(void) {
     SLVCamDumpCandidates("AVCaptureAudioPreviewOutput");
     SLVCamHookSessionOutputs();
 
-    // 0.3.28：竖采集开关。只有 Swiftgram 会打开 —— 它的视频消息是 400x400 正方形，
-    // transform 那条路走不通，只能让采集连接直接交竖 buffer。
-    if (SLVCamPortraitCapture()) {
-        SLVLog(@"竖采集: 已开启（视频输出连接强制 %ld°，writer transform 一律 identity）",
-               (long)SLVPortraitDeg);
+    // 0.3.30：竖采集已关闭（0.3.28/0.3.29 试过，会连带弄坏拍照和普通录制）。
+    // 留一行日志，免得下次看日志还以为它开着。
+    if (!SLVCamPortraitCapture()) {
+        SLVLog(@"竖采集: 已关闭（0.3.30 回退，采集链路不动）");
     }
 
     // 第二条链路：不经过 AVCapture 的麦克风（QQ 这类自建音频栈的 App）
