@@ -65,6 +65,7 @@ static NSString *SLVFourCC(OSType v) {
 /// 0.3.21：预览层接管。定义在文件后半段，这里先声明 —— 注入主流程要用。
 static void SLVCamFeedPreview(CMSampleBufferRef sb);
 static void SLVCamTeardownPreview(void);
+static void SLVCamTeardownPreviewIfStale(void);
 
 /// 音视频输出可能各自重写了 _processSampleBuffer:，必须按 Method 分别保存原始 IMP，
 /// 否则音频会走到视频的原始实现上去（表现为只有画面变、声音还在）。
@@ -512,7 +513,13 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
         ((SLVProcessSampleBufferFn)orig)(self, _cmd, fake);
         CFRelease(fake);
     } else {
-        SLVCamTeardownPreview();
+        // 0.3.22：这一帧拿不到假帧，不等于「替换停了」。
+        //
+        // 音频帧、解码偶尔跟不上、宿主临时换格式，都会走到这里。0.3.21 是一帧
+        // 就拆一次显示层，结果预览在「素材 ↔ 真实摄像头」之间一秒闪三次 ——
+        // Swiftgram 的「乱闪」就是这么来的。
+        // 改成：只有连续两秒都没喂出去帧，才认为替换真的停了。
+        if (mediaType == kCMMediaType_Video) SLVCamTeardownPreviewIfStale();
         ((SLVProcessSampleBufferFn)orig)(self, _cmd, sbuf);   // 拿不到假帧就放真帧，绝不黑屏
     }
 }
@@ -984,6 +991,7 @@ static IMP gSLPreviewSetSessionOrig = NULL;
 static BOOL gSLPreviewMounted = NO;
 static BOOL gSLPreviewFedLogged = NO;
 static CFAbsoluteTime gSLPreviewLastSync = 0.0;
+static CFAbsoluteTime gSLPreviewLastFed = 0.0;   // 最后一次成功喂帧的时刻，用来判「替换是不是真停了」
 
 static void SLVCamRegisterPreviewLayer(id layer);
 
@@ -1071,6 +1079,18 @@ static void SLVCamSyncPreviewGeometry(AVCaptureVideoPreviewLayer *pl) {
     if (pw < 8.0 || ph < 8.0) return;
 
     AVCaptureConnection *conn = pl.connection;
+    if (!conn) {
+        // 0.3.22：会话重配那一刻（切前后摄、开始录制）connection 是 nil，拿不到旋转角。
+        // 绝不能当成「0 度」去改几何 —— 画面会当场歪一下，而这时候恰好在录制，
+        // 用户看到的就是「录制时画面跳一下」。
+        // 只在还没定过几何时给个兜底尺寸，其余一律保持原样等 connection 回来。
+        if (dl.bounds.size.width < 1.0 || dl.bounds.size.height < 1.0) {
+            dl.bounds = CGRectMake(0.0, 0.0, pw, ph);
+            dl.position = CGPointMake(CGRectGetMidX(pb), CGRectGetMidY(pb));
+        }
+        return;
+    }
+
     NSInteger deg = SLVCamPreviewRotationDeg(conn);
     BOOL swap = (deg == 90 || deg == 270);
     CGFloat lw = swap ? ph : pw;
@@ -1094,6 +1114,11 @@ static void SLVCamSyncPreviewGeometry(AVCaptureVideoPreviewLayer *pl) {
 static void SLVCamMountPreviewDisplay(AVCaptureVideoPreviewLayer *pl) {
     if (!pl || !pl.superlayer) return;
 
+    // 0.3.22：尺寸还没定下来（0x0）就别挂。Swiftgram 的日志里就有
+    // 「挂上显示层 预览=0x0 会话=有」—— 一块零面积的层，白建一套渲染面。
+    // 等它有了尺寸，下一帧自然会再进来一次。
+    if (pl.bounds.size.width < 8.0 || pl.bounds.size.height < 8.0) return;
+
     AVSampleBufferDisplayLayer *dl = objc_getAssociatedObject(pl, &kSLPreviewDisplayKey);
     if (!dl) {
         dl = [[AVSampleBufferDisplayLayer alloc] init];
@@ -1103,6 +1128,9 @@ static void SLVCamMountPreviewDisplay(AVCaptureVideoPreviewLayer *pl) {
         [pl addSublayer:dl];
         objc_setAssociatedObject(pl, &kSLPreviewDisplayKey, dl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         gSLPreviewMounted = YES;
+        // 刚挂上就起算「两秒宽限」：否则第一帧要是恰好没出图，
+        // 时间戳还停在 0，会被立刻判成「替换停了」而拆掉。
+        gSLPreviewLastFed = CFAbsoluteTimeGetCurrent();
 
         AVCaptureConnection *conn = pl.connection;
         SLVLog(@"预览: 挂上显示层 预览=%.0fx%.0f 会话=%@ 连接=%@ 旋转=%ld 镜像=%@",
@@ -1145,6 +1173,10 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb) {
     BOOL wantSync = (now - gSLPreviewLastSync) > 0.25;   // 几何变化（转屏 / 换布局）不需要每帧对
     if (wantSync) gSLPreviewLastSync = now;
 
+    // 0.3.22：一帧只复制一次，几个预览层共用。
+    // 原来是在循环里各复制一份，两个预览层就多一次 3MB 的元数据拷贝 + 一次 retain。
+    CMSampleBufferRef disp = NULL;
+
     for (AVCaptureVideoPreviewLayer *pl in layers) {
         if (![pl isKindOfClass:[AVCaptureVideoPreviewLayer class]]) continue;
         // 已经离开视图树的预览层不用管：相机关掉之后 App 会把它丢掉，
@@ -1165,8 +1197,8 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb) {
             });
         }
 
-        CMSampleBufferRef disp = SLVCamMakeDisplayBuffer(sb);
-        if (!disp) continue;
+        if (!disp) disp = SLVCamMakeDisplayBuffer(sb);
+        if (!disp) break;
 
         if (dl.status == AVQueuedSampleBufferRenderingStatusFailed) {
             // 显示层一旦进入 failed 就再也不出画面，必须 flush 才能恢复
@@ -1175,9 +1207,13 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb) {
                        dl.error.localizedDescription ?: @"?");
             }
             [dl flush];
+        } else if (!dl.isReadyForMoreMediaData) {
+            // 0.3.22：显示层还没画完上一帧就别再塞 —— 让它自己追上，
+            // 否则队列越积越长，画面延迟越来越大，采集池也会被扣住。
+            continue;
         }
         [dl enqueueSampleBuffer:disp];
-        CFRelease(disp);
+        gSLPreviewLastFed = now;
 
         if (!gSLPreviewFedLogged) {
             gSLPreviewFedLogged = YES;
@@ -1187,6 +1223,17 @@ static void SLVCamFeedPreview(CMSampleBufferRef sb) {
                    pl.bounds.size.width, pl.bounds.size.height, (long)dl.status);
         }
     }
+    if (disp) CFRelease(disp);
+}
+
+/// 0.3.22：只有「连续两秒都没喂出去帧」才认为替换真的停了。
+///
+/// 0.3.21 是「这一帧拿不到假帧就拆」，结果音频帧、解码偶尔跟不上都会触发，
+/// 预览就在「素材 ↔ 真实摄像头」之间一秒闪三次。拿不到帧不等于停了。
+static void SLVCamTeardownPreviewIfStale(void) {
+    if (!gSLPreviewMounted) return;
+    if (CFAbsoluteTimeGetCurrent() - gSLPreviewLastFed < 2.0) return;
+    SLVCamTeardownPreview();
 }
 
 /// 撤掉显示层，恢复原生预览。替换关掉、或这一帧拿不到假帧时调用。

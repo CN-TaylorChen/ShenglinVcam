@@ -331,6 +331,14 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
 #define SLV_AUDIO_HIGH_SEC   0.12
 #define SLV_AUDIO_HARD_SEC   0.60
 
+// 0.3.22：管线重建要连续这么多帧看到同一个新 key 才真的动手。
+//
+// 8 帧 ≈ 0.27 秒（30fps）。这个数要满足两件事：
+//   · 比「两个 output 逐帧交替」的周期长得多 —— 交替的 key 永远攒不到 8
+//   · 比「用户切前后摄」的收敛时间短 —— 新尺寸会一直出现，8 帧后一定重建
+// 调小了会退化成原来的每帧重建，调大了切换相机后画面会卡旧的尺寸太久。
+#define SLV_RECONFIG_STABLE_FRAMES 8
+
 @interface SLVCamFeed () {
     NSLock *_lock;
 
@@ -338,6 +346,19 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     CVPixelBufferRef _latestVideo;
     NSString *_pipelineKey;              // "875704422:1920x1080"，变了就要重建 reader
     BOOL _reconfigRequested;
+
+    // 0.3.22：管线重建去抖。
+    //
+    // Swiftgram 会同时挂两个 video data output，一个 1920x1080、一个 1920x1440，
+    // **逐帧交替**交给我们。key 里带尺寸，于是每帧都不一样 —— 原来的实现每帧都置
+    // _reconfigRequested，解码线程把 AVAssetReader 拆了又建，一秒六次。
+    // 重建期间 _latestVideo 是空的，那一帧只能放行真画面 —— 屏幕上就是「乱闪」。
+    //
+    // 现在 key 变了先记着，要连续 SLV_RECONFIG_STABLE_FRAMES 帧都是同一个新 key
+    // 才真的重建。交替的两个 key 永远攒不够 → 一次都不重建；真正的切换（切前后摄）
+    // 会稳定下来，几帧之后重建一次。
+    NSString *_pendingKey;
+    int _pendingCount;
     NSMutableData *_audioPCM;
     NSUInteger _audioReadCursor;
     AudioStreamBasicDescription _audioDstASBD;
@@ -496,6 +517,10 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     gen = ++_generation;
     _reconfigRequested = YES;
     _pipelineKey = nil;
+    // 0.3.22：换素材时去抖计数也得清 —— 否则上一轮攒到 7 帧的 key
+    // 会跟新素材的第一帧接上，白白提前一次重建。
+    _pendingKey = nil;
+    _pendingCount = 0;
     _stillLoaded = NO;
     _stillKey = nil;
     if (_latestVideo) { CVPixelBufferRelease(_latestVideo); _latestVideo = NULL; }
@@ -1058,9 +1083,35 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
                      (unsigned)hpf, hw, hh,
                      (self.squareCropEnabled && SLVCamIsMomoProcess()) ? 1 : 0];
     [_lock lock];
-    BOOL changed = ![_pipelineKey isEqualToString:key];
-    if (changed) { _pipelineKey = key; _reconfigRequested = YES; }
     BOOL hasFrame = (_latestVideo != NULL);
+    BOOL changed = NO;
+
+    if ([_pipelineKey isEqualToString:key]) {
+        // 还是当前管线，没有待办
+        _pendingKey = nil;
+        _pendingCount = 0;
+    } else if (!hasFrame) {
+        // 手里一帧都没有（冷启动 / 刚换素材）：没得挑，立刻按这个 key 建管线
+        _pipelineKey = key;
+        _reconfigRequested = YES;
+        _pendingKey = nil;
+        _pendingCount = 0;
+        changed = YES;
+    } else if ([_pendingKey isEqualToString:key]) {
+        // 同一个新 key 又来了，攒够帧数才动手
+        _pendingCount++;
+        if (_pendingCount >= SLV_RECONFIG_STABLE_FRAMES) {
+            _pipelineKey = key;
+            _reconfigRequested = YES;
+            _pendingKey = nil;
+            _pendingCount = 0;
+            changed = YES;
+        }
+    } else {
+        // 新 key 第一次出现：先记着，这一帧继续用现有管线顶着出图
+        _pendingKey = key;
+        _pendingCount = 1;
+    }
     [_lock unlock];
 
     // 目标格式刚变、手里还没有任何帧：放行这一帧真画面，让解码线程按新格式重建
