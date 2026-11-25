@@ -1667,7 +1667,12 @@ static SLVBallWindow *sSLBallWindow = nil;
 @end
 
 static UIWindow *SLVBallWindowEnsure(void) {
-    if (sSLBallWindow && sSLBallWindow.windowScene) return sSLBallWindow;
+    if (sSLBallWindow && sSLBallWindow.windowScene) {
+        // 口令隐藏时这层被 hidden 过，再要用必须显式放出来，
+        // 否则球挂进去是「挂上了但看不见」，会被当成挂球失败。
+        sSLBallWindow.hidden = NO;
+        return sSLBallWindow;
+    }
 
     UIWindowScene *ws = nil;
     for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
@@ -1699,6 +1704,52 @@ static UIWindow *SLVBallWindowEnsure(void) {
     SLVLog(@"SL-VCAM: 起了独立窗口 level=%.0f 尺寸=%.0fx%.0f", w.windowLevel,
            w.bounds.size.width, w.bounds.size.height);
     return w;
+}
+
+// ===================== 显隐（口令 #vcam 控制） =====================
+//
+// 「隐藏」不能只是 removeFromSuperview：下面还有一条每 2 秒跑一次的挂球轮询，
+// 球会在两秒内自己长回来。所以它是一个持久状态（写 NSUserDefaults），
+// 挂球入口看一眼就短路；独立球窗留着，只置 hidden —— 再显示时不用重建 scene。
+
+static NSString *const kSLVFloatHiddenKey = @"SLVFloatHidden";
+
+BOOL SLVFloatBallHidden(void) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:kSLVFloatHiddenKey];
+    return v ? [v boolValue] : NO;
+}
+
+// 把球从它现在待着的窗口里摘掉（宿主窗口 / 独立球窗都可能）。
+// sSLFloatBtn 是 __weak，摘下来没人持有就会自己释放，这里顺手置 nil，
+// 下次挂球走「新建」分支，图标和状态重新套一遍。
+static void SLVDetachFloatButton(void) {
+    SLVFloatButton *btn = sSLFloatBtn;
+    if (!btn) btn = (SLVFloatButton *)[SLVKeyWindow() viewWithTag:SLVBtnTag];
+    if (btn && ![btn isKindOfClass:[SLVFloatButton class]]) btn = nil;
+    [btn removeFromSuperview];
+    sSLFloatBtn = nil;
+}
+
+void SLVSetFloatBallHidden(BOOL hidden) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setBool:hidden forKey:kSLVFloatHiddenKey];
+    [d synchronize];
+
+    void (^apply)(void) = ^{
+        if (hidden) {
+            SLVDetachFloatButton();
+            // 独立球窗是 Alert+1 的一层：空白处本来就放行触摸，藏着也不会影响宿主，
+            // 但藏掉更干净 —— 录屏 / 截图里连这一层都不存在。
+            if (sSLBallWindow) sSLBallWindow.hidden = YES;
+        } else {
+            if (sSLBallWindow) sSLBallWindow.hidden = NO;
+            SLVEnsureFloatButton();
+        }
+        SLVLog(@"SL-VCAM: 悬浮球%@", hidden ? @"隐藏" : @"显示");
+    };
+
+    if ([NSThread isMainThread]) apply();
+    else dispatch_async(dispatch_get_main_queue(), apply);
 }
 
 // 0.3.19：这个窗口在**这个屏幕点**上接不接得住触摸。
@@ -1766,6 +1817,14 @@ static UIWindow *SLVTopWindowAcceptingTouchAt(CGPoint pt) {
 }
 
 void SLVEnsureFloatButton(void) {
+    // 口令把球关了：整条挂球链路直接短路。
+    // 必须放在最前面 —— 轮询、窗口通知都会走到这里，不短路的话球几分钟内就会自己回来。
+    if (SLVFloatBallHidden()) {
+        SLVDetachFloatButton();
+        if (sSLBallWindow) sSLBallWindow.hidden = YES;
+        return;
+    }
+
     UIWindow *w = SLVKeyWindow();
     if (!w) {
         // 一直拿不到窗口就静默失败了，下次再出现「没有球」根本查不到原因 —— 限频记一条

@@ -18,6 +18,14 @@ void SLVStartEntryWatcher(void);
 /// 改完设置后立刻刷新已挂载的按钮（图标、名字、颜色一起走）
 void SLVRefreshFloatButton(void);
 
+/// 球是不是被口令（#vcam）关掉了。持久值，冷启动也保持。
+BOOL SLVFloatBallHidden(void);
+
+/// 口令开关：写盘 + 立刻生效。
+/// 隐藏 = 摘球 + 藏掉独立球窗，挂球轮询随之短路（否则 2 秒内自己长回来）；
+/// 显示 = 当场重挂一颗。
+void SLVSetFloatBallHidden(BOOL hidden);
+
 /// 设置页右侧显示的当前图标摘要
 NSString *SLVFloatIconSummary(void);
 

@@ -21,6 +21,7 @@ ShenglinVcam_FILES = Tweak/SLCam.x \
 	Tweak/SLLogViewController.m \
 	Tweak/SLAlignBox.m \
 	Tweak/SLFloatingBall.m \
+	Tweak/SLCodeWord.m \
 	Tweak/SLFan.m \
 	Tweak/SLSettingsPanel.m \
 	Tweak/SLMediaStore.m \

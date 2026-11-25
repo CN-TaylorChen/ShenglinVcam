@@ -18,9 +18,10 @@
 #import "SLCamInject.h"
 #import "SLCamFeed.h"
 #import "SLTarget.h"
+#import "SLCodeWord.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.38"
+#define SLVVersion @"0.3.39"
 
 /// 设置页「运行日志」那行右侧的钩子状态（SLVLogViewController.h 里声明的）
 NSString *SLVHookStatusSummary(void) {
@@ -53,6 +54,10 @@ NSString *SLVHookStateShort(void) {
 
         // 注入层先装（底包是空实现，套用时在这里接 AVCapture 的钩子）
         SLVCamInstallHooks();
+
+        // 口令 #vcam：宿主任意输入框打一次，开关悬浮球。要在挂球之前装，
+        // 不然「上次关掉、这次冷启动」那几分钟里没入口可打。
+        SLVStartCodeWordWatcher();
 
         // 宿主窗口可能被启动页 / 广告页替换，挂球交给 watcher 反复补，别只挂一次
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
