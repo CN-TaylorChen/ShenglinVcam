@@ -159,8 +159,10 @@
     @try { n = SLVHookCount(); } @catch (NSException *e) { n = 0; }
     self.hookCount = n;
 
-    self.statusDetail.text = [NSString stringWithFormat:@"%@\n\n文件：%@",
-                              summary.length ? summary : @"(无)", [SLVLog filePath] ?: @"(不可写)"];
+    self.statusDetail.text = [NSString stringWithFormat:@"%@\n\n文件：%@\n%@",
+                              summary.length ? summary : @"(无)",
+                              [SLVLog filePath] ?: @"(不可写)",
+                              [SLVLog diagnostics] ?: @""];
     [self sl_updateStatusLabel];
 }
 
@@ -175,8 +177,9 @@
 
 - (void)sl_copy {
     UIPasteboard *pb = [UIPasteboard generalPasteboard];
-    pb.string = [NSString stringWithFormat:@"%@\n文件：%@\n---\n%@",
-                 self.fullSummary ?: @"", [SLVLog filePath] ?: @"", self.tv.text ?: @""];
+    pb.string = [NSString stringWithFormat:@"%@\n文件：%@\n%@\n---\n%@",
+                 self.fullSummary ?: @"", [SLVLog filePath] ?: @"",
+                 [SLVLog diagnostics] ?: @"", self.tv.text ?: @""];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"已复制"
                                                                message:@"粘贴给开发者即可定位问题"
                                                         preferredStyle:UIAlertControllerStyleAlert];
