@@ -1,3 +1,36 @@
+## 0.3.42 —— 口令改造：陌陌发送键的四条路
+
+### 0.3.41 为什么没生效
+
+日志里只有一行 `口令已就位，等发送（UIExpandingTextViewInternal）`，后面两条路一条都没响：
+
+| 原以为的路 | 实际情况 |
+|---|---|
+| 等 `-[UIApplication sendAction:to:from:forEvent:]` | 一次都没来 —— 陌陌的发送键不走 target-action |
+| 等「文本一步变空」 | 也没来 —— `UITextView.text` 被程序改写**不发** `TextDidChange` 通知，只有用户敲键盘才发 |
+
+所以「发送」这个动作整个是黑的，什么都没抓到。
+
+### 这一版铺了四条路
+
+按「能不能拦住消息」从强到弱：
+
+1. **触摸派发前**：hook `-[UIWindow sendEvent:]`。它比宿主自己的点击处理更早，
+   用 `hitTest` 拿到真正被点的 view（不管它是 UIButton、自绘 view 还是手势容器），
+   判定「输入框右边的小块」就**当场清空输入框**，宿主随后读到空串，消息发不出去。
+2. **拦 target-action**：`sendAction` 判定放宽，`action` 方法名里带 `send`/`submit`/`publish`
+   直接算发送。
+3. **程序性清空**：hook `-[UITextView setText:]` / `-[UITextField setText:]`，
+   并对输入框的**实际类**懒挂一次（陌陌是 `UIExpandingTextViewInternal`，自绘类若自己重写了
+   `setText:`，父类钩子会被绕过）。命中时打**调用栈**，下次日志能直接读出是谁在清空。
+4. **0.4 秒轮询**：pending 期间盯着文本，从口令变空就按已发送处理。兜一切未知路径。
+
+1 能拦住发送；2 视宿主的点击方式；3、4 拦不住 —— 那时宿主已经在消费口令了，
+球照样切，但聊天里会多出一条 `#vcam`。日志会写清楚走的是哪条：
+`点中发送候选 view=…` / `sendAction sender=…` / `宿主清空了口令（setText:…）` / `口令消失（轮询兜底）`。
+
+---
+
 ## 0.3.41 —— 回到 0.3.17 基线，只加口令（发送 #vcam 隐藏 / 显示悬浮球）
 
 ### 为什么退回 0.3.17
