@@ -101,6 +101,15 @@ BOOL SLVCamIsMomoProcess(void);
 - (nullable NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd
                            numBytes:(size_t)numBytes;
 
+/// 同上，但**按消费者各走各的读游标**（0.3.49）。
+///
+/// 视频通话里宿主常同时开两个 AudioUnit 拉麦克风（RTC 上行 + 本地电平/试音）。
+/// 共用一个游标等于「你一包我一包」，每个 unit 只拿到隔包的数据 ——
+/// 听感是跳字、语速翻倍，对端就是「听不清」。consumer 传 AudioUnit 指针即可。
+- (nullable NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd
+                           numBytes:(size_t)numBytes
+                           consumer:(const void *)consumer;
+
 /// 只登记宿主音频格式，不取数据。
 ///
 /// AudioQueue 那条链路（抖音拍摄）拿到格式的时刻远早于第一次回调，提前登记
@@ -112,6 +121,11 @@ BOOL SLVCamIsMomoProcess(void);
 /// 在宿主的音频回调里只能用它 —— 宁可漏一包，也不能把音频线程卡住。
 - (nullable NSData *)tryAudioForFormat:(const AudioStreamBasicDescription *)asbd
                               numBytes:(size_t)numBytes;
+
+/// 同上，按消费者分开读游标（AudioQueue 那条链只有一个消费者，传 NULL 即可）
+- (nullable NSData *)tryAudioForFormat:(const AudioStreamBasicDescription *)asbd
+                              numBytes:(size_t)numBytes
+                              consumer:(const void *)consumer;
 
 /// 回到第一帧（切换素材、重新打开相机时调）
 - (void)rewind;

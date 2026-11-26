@@ -331,6 +331,14 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
 #define SLV_AUDIO_HIGH_SEC   0.12
 #define SLV_AUDIO_HARD_SEC   0.60
 
+// 0.3.49：每个消费者一条独立游标。
+//
+// 视频通话里宿主经常同时开两个 AudioUnit（RTC 上行一个、本地电平/试音一个），
+// 两个都在 bus=1 上拉麦克风。以前它们共用一个读游标 —— 等于「你一包我一包」：
+// 每个 unit 每 20ms 只拿到一包 20ms，但内容往前跳了 40ms，听感是隔包跳、语速翻倍，
+// 在通话里就是「对方听不清 / 听不到声音」。日志上还看不出来：水位照常、丢 0 字节。
+#define SLV_AUDIO_CONSUMERS 4
+
 @interface SLVCamFeed () {
     NSLock *_lock;
 
@@ -339,7 +347,10 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     NSString *_pipelineKey;              // "875704422:1920x1080"，变了就要重建 reader
     BOOL _reconfigRequested;
     NSMutableData *_audioPCM;
-    NSUInteger _audioReadCursor;
+    NSUInteger _audioReadCursor;         // 0.3.49 起只作为「默认消费者」的游标保留
+    // 0.3.49：按消费者分开的游标（key 是 AudioUnit 指针，NULL = AVCapture/AudioQueue 那条链）
+    struct { const void *key; NSUInteger cursor; } _audioConsumers[SLV_AUDIO_CONSUMERS];
+    int _audioConsumerCount;
     AudioStreamBasicDescription _audioDstASBD;
     BOOL _hasAudioDstASBD;
     AVAudioConverter *_audioConverter;
@@ -384,7 +395,10 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
 - (void)sl_buildReaderForKey:(NSString *)key;
 - (BOOL)sl_pumpAudio;
 - (BOOL)sl_audioBelowHighWater;
-- (NSData *)sl_audioLocked:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes configure:(BOOL)configure;
+- (NSData *)sl_audioLocked:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes
+                configure:(BOOL)configure consumer:(const void *)consumer;
+- (int)sl_consumerSlotLocked:(const void *)key;
+- (NSUInteger)sl_bufferedLocked;
 - (NSData *)sl_convertAudio:(NSData *)input;
 - (NSInteger)sl_normalizedRotation;
 - (nullable CIImage *)sl_image:(CIImage *)img
@@ -504,6 +518,7 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     _hostStillKey = nil;
     [_audioPCM setLength:0];
     _audioReadCursor = 0;
+    for (int i = 0; i < _audioConsumerCount; i++) _audioConsumers[i].cursor = 0;
     _running = (_sourcePath.length > 0);
     BOOL run = _running;
     [_lock unlock];
@@ -754,10 +769,23 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     }
 }
 
+/// 池子里还剩多少（按最落后的那个消费者算）。
+/// 生产端只关心「最落后的消费者还缺多少」—— 用最靠前的会一直以为没人消费。
+/// 调用方必须已持有 _lock。
+- (NSUInteger)sl_bufferedLocked {
+    if (_audioConsumerCount == 0) return _audioPCM.length - _audioReadCursor;
+    NSUInteger min = _audioPCM.length;
+    for (int i = 0; i < _audioConsumerCount; i++) {
+        if (_audioConsumers[i].cursor < min) min = _audioConsumers[i].cursor;
+    }
+    if (min > _audioPCM.length) min = _audioPCM.length;
+    return _audioPCM.length - min;
+}
+
 /// 缓冲还没到高水位，可以继续补
 - (BOOL)sl_audioBelowHighWater {
     [_lock lock];
-    NSUInteger buffered = _audioPCM.length - _audioReadCursor;
+    NSUInteger buffered = [self sl_bufferedLocked];
     NSUInteger rate = _audioBytesPerSecond;
     [_lock unlock];
     if (rate == 0) return YES;      // 目标格式还没确定，先别停
@@ -767,7 +795,7 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
 /// 解码线程内调用：音频池没到高水位才继续解
 - (BOOL)sl_pumpAudio {
     [_lock lock];
-    NSUInteger buffered = _audioPCM.length - _audioReadCursor;
+    NSUInteger buffered = [self sl_bufferedLocked];
     NSUInteger limit = (NSUInteger)(_audioBytesPerSecond * SLV_AUDIO_HIGH_SEC);
     [_lock unlock];
     if (limit && buffered >= limit) return NO;
@@ -1528,8 +1556,40 @@ BOOL SLVCamIsMomoProcess(void) {
     [_lock unlock];
 }
 
+/// 找到（或新建）某个消费者的游标槽。调用方必须已持有 _lock。
+///
+/// 新建时起点跟「最靠前的那个消费者」对齐：它刚接上，不该先补 180ms 历史，
+/// 否则新 unit 一挂上就比别的链路慢半拍。
+- (int)sl_consumerSlotLocked:(const void *)key {
+    for (int i = 0; i < _audioConsumerCount; i++) {
+        if (_audioConsumers[i].key == key) return i;
+    }
+
+    NSUInteger start = 0;
+    for (int i = 0; i < _audioConsumerCount; i++) {
+        if (_audioConsumers[i].cursor > start) start = _audioConsumers[i].cursor;
+    }
+    if (start > _audioPCM.length) start = _audioPCM.length;
+
+    int slot;
+    if (_audioConsumerCount < SLV_AUDIO_CONSUMERS) {
+        slot = _audioConsumerCount++;
+    } else {
+        // 槽满了：抢最落后的那个（它已经跟不上，换人更划算）
+        slot = 0;
+        for (int i = 1; i < _audioConsumerCount; i++) {
+            if (_audioConsumers[i].cursor < _audioConsumers[slot].cursor) slot = i;
+        }
+    }
+    _audioConsumers[slot].key = key;
+    _audioConsumers[slot].cursor = start;
+    return slot;
+}
+
 /// 取一包 PCM。调用方必须已持有 _lock。
-- (NSData *)sl_audioLocked:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes configure:(BOOL)configure {
+/// consumer：谁在取（AudioUnit 指针；NULL = AVCapture / AudioQueue 那条链）。
+- (NSData *)sl_audioLocked:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes
+                configure:(BOOL)configure consumer:(const void *)consumer {
     if (!asbd || asbd->mBytesPerFrame == 0 || numBytes == 0) return nil;
 
     // 关掉「替换音频」= 静音。这里必须返回全零的 PCM，不能返回 nil：
@@ -1556,7 +1616,11 @@ BOOL SLVCamIsMomoProcess(void) {
 
     NSMutableData *chunk = [NSMutableData dataWithLength:numBytes];
     NSUInteger got = 0;
-    NSUInteger avail = _audioPCM.length - _audioReadCursor;
+
+    int slot = [self sl_consumerSlotLocked:consumer];
+    NSUInteger *cursor = &_audioConsumers[slot].cursor;
+    if (*cursor > _audioPCM.length) *cursor = _audioPCM.length;
+    NSUInteger avail = _audioPCM.length - *cursor;
 
     // 水位控制。
     //
@@ -1578,7 +1642,7 @@ BOOL SLVCamIsMomoProcess(void) {
 
         if (avail > hard) {
             NSUInteger drop = avail - target;
-            _audioReadCursor += drop;
+            *cursor += drop;
             avail -= drop;
             _audioDropped += drop;
             if (!_audioDropLogged) {
@@ -1593,21 +1657,30 @@ BOOL SLVCamIsMomoProcess(void) {
 
     if (avail > 0) {
         got = MIN(avail, numBytes);
-        memcpy(chunk.mutableBytes, (uint8_t *)_audioPCM.bytes + _audioReadCursor, got);
-        _audioReadCursor += got;
+        memcpy(chunk.mutableBytes, (uint8_t *)_audioPCM.bytes + *cursor, got);
+        *cursor += got;
+
+        // 池子按「最落后的那个消费者」剪前缀 —— 用最靠前的会把别人还没读的数据一起删掉。
+        NSUInteger minCursor = *cursor;
+        for (int i = 0; i < _audioConsumerCount; i++) {
+            if (_audioConsumers[i].cursor < minCursor) minCursor = _audioConsumers[i].cursor;
+        }
         NSUInteger trimAt = _audioBytesPerSecond ? _audioBytesPerSecond * 2 : (44100 * 32);
-        if (_audioReadCursor > trimAt) {
-            [_audioPCM replaceBytesInRange:NSMakeRange(0, _audioReadCursor) withBytes:NULL length:0];
-            _audioReadCursor = 0;
+        if (minCursor > trimAt) {
+            [_audioPCM replaceBytesInRange:NSMakeRange(0, minCursor) withBytes:NULL length:0];
+            for (int i = 0; i < _audioConsumerCount; i++) {
+                _audioConsumers[i].cursor -= minCursor;
+            }
         }
     }
 
     // 心跳：每 3000 包打一次水位，下次再出问题不用靠推算
     _audioCalls++;
     if (_audioCalls % 3000 == 0 && _audioBytesPerSecond > 0) {
-        SLVLog(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包",
-              (unsigned long)((_audioPCM.length - _audioReadCursor) * 1000 / _audioBytesPerSecond),
-              (unsigned long)_audioDropped, (unsigned long)_audioCalls);
+        NSUInteger mine = _audioPCM.length - *cursor;
+        SLVLog(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包 · 消费者 %d 个",
+              (unsigned long)(mine * 1000 / _audioBytesPerSecond),
+              (unsigned long)_audioDropped, (unsigned long)_audioCalls, _audioConsumerCount);
     }
 
     BOOL hasAudio = _assetHasAudio;
@@ -1636,18 +1709,28 @@ BOOL SLVCamIsMomoProcess(void) {
 }
 
 - (NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes {
+    return [self audioForFormat:asbd numBytes:numBytes consumer:NULL];
+}
+
+- (NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes
+                  consumer:(const void *)consumer {
     [_lock lock];
-    NSData *d = [self sl_audioLocked:asbd numBytes:numBytes configure:YES];
+    NSData *d = [self sl_audioLocked:asbd numBytes:numBytes configure:YES consumer:consumer];
     [_lock unlock];
     return d;
 }
 
 - (NSData *)tryAudioForFormat:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes {
+    return [self tryAudioForFormat:asbd numBytes:numBytes consumer:NULL];
+}
+
+- (NSData *)tryAudioForFormat:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes
+                     consumer:(const void *)consumer {
     // 实时音频线程专用：拿不到锁就放行这一包真麦克风，绝不阻塞宿主。
     // 锁只在解码线程 append 那一瞬间被持有，正常几乎不会撞上；
     // 一旦撞上，说明解码线程正在干重活，这时候卡住宿主才是灾难。
     if (![_lock tryLock]) return nil;
-    NSData *d = [self sl_audioLocked:asbd numBytes:numBytes configure:NO];
+    NSData *d = [self sl_audioLocked:asbd numBytes:numBytes configure:NO consumer:consumer];
     [_lock unlock];
     return d;
 }

@@ -13,6 +13,8 @@
 #import <AVFoundation/AVFoundation.h>
 #import <string.h>
 #import <stdlib.h>
+#import <math.h>
+#import <dlfcn.h>
 
 typedef OSStatus (*SLVAudioUnitRenderFn)(AudioUnit, AudioUnitRenderActionFlags *,
                                         const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
@@ -71,10 +73,21 @@ typedef struct {
     int  calls;                // 这条缓存被命中的次数（用于周期性补试）
     BOOL logged;               // 「unit 就绪」这行只打一次
     BOOL replacedLogged;       // 「已接管」按 unit 各打一次，不是全局只打一次
+    int  seq;                  // 0.3.49：最近一次调用序号，缓存满了按它踢最久未用的
+    int  levelLogs;            // 0.3.49：注入电平日志条数（首包 + 之后每 250 包）
+    BOOL silenceClearedLogged; // 0.3.49：「清掉 OutputIsSilence」只打一次
+    char caller[64];           // 0.3.49：谁在拉麦克风（调用方镜像名）
     AudioStreamBasicDescription asbd;
 } SLVUnitCache;
 
 #define SLV_UNIT_CACHE 8
+// 0.3.49：缓存满了不能再「跳过」。
+//
+// 以前是 `if (sUnitCacheCount >= 8) return NULL;` —— 宿主每换一次场景就新建一个
+// AudioUnit，攒够 8 个之后**新 unit 永远不接管**，而且新旧 unit 长得一模一样，
+// 日志上只留一行「跳过 —— unit 缓存已满」，后面心跳照样在涨，看着完全正常。
+// 视频通话里被跳过的很可能正是上行那个 unit，对方听到的就是真麦克风（安静房间＝无声）。
+// 现在满了就顶掉最久没被调用的那个。
 #define SLV_ASBD_MAX_TRIES 200
 // 格式重读间隔。10ms 一包，500 次约 5 秒 —— 切到拍摄页之后几秒内就能看到变化，
 // 又不至于每包都去查属性（AudioUnitGetProperty 内部是加锁的）。
@@ -82,6 +95,45 @@ typedef struct {
 
 static SLVUnitCache sUnitCache[SLV_UNIT_CACHE];
 static int sUnitCacheCount = 0;
+static int sUnitSeq = 0;
+
+/// 调用方是谁。视频通话里 RTC SDK 会在同一个进程里开好几个 unit，
+/// 光看 unit 指针分不出哪个是上行、哪个是本地电平表 —— 把镜像名打出来才看得见。
+static NSString *SLVCallerImageName(void *addr) {
+    if (!addr) return @"?";
+    Dl_info info;
+    if (dladdr(addr, &info) == 0 || !info.dli_fname) return @"?";
+    const char *slash = strrchr(info.dli_fname, '/');
+    const char *base = slash ? slash + 1 : info.dli_fname;
+    return @(base);
+}
+
+/// 一包 PCM 的电平（dBFS）。日志里一直只有「水位」「丢多少字节」，
+/// 全是「有多少数据」，没有一条是「数据响不响」—— 所以「注入进去了但内容其实是静音」
+/// 这种情况在日志上完全看不出来。这里补上。
+static double SLVPCMLeveldBFS(const void *bytes, size_t len, const AudioStreamBasicDescription *asbd) {
+    if (!bytes || !len || !asbd) return -120.0;
+    BOOL isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    double sum = 0;
+    size_t n = 0;
+
+    if (isFloat && asbd->mBitsPerChannel == 32) {
+        const float *f = (const float *)bytes;
+        size_t cnt = len / sizeof(float);
+        for (size_t i = 0; i < cnt; i++) { double v = f[i]; sum += v * v; n++; }
+    } else if (!isFloat && asbd->mBitsPerChannel == 16) {
+        const int16_t *s = (const int16_t *)bytes;
+        size_t cnt = len / sizeof(int16_t);
+        for (size_t i = 0; i < cnt; i++) { double v = s[i] / 32768.0; sum += v * v; n++; }
+    } else {
+        return -1.0;   // 不认识的采样格式，不瞎报
+    }
+    if (!n) return -120.0;
+    double rms = sqrt(sum / (double)n);
+    if (rms <= 1e-9) return -120.0;
+    double db = 20.0 * log10(rms);
+    return db < -120.0 ? -120.0 : db;
+}
 
 /// 查一次 StreamFormat。失败不缓存否定结论 —— unit 可能还没初始化完，下次再来。
 static void SLVTryASBD(SLVUnitCache *c) {
@@ -142,19 +194,37 @@ static void SLVRefreshASBD(SLVUnitCache *c) {
     c->asbd = a;
 }
 
-static SLVUnitCache *SLVCacheFor(AudioUnit unit, UInt32 bus, BOOL *isNew) {
+static SLVUnitCache *SLVCacheFor(AudioUnit unit, UInt32 bus, void *callerAddr, BOOL *isNew) {
     if (isNew) *isNew = NO;
     for (int i = 0; i < sUnitCacheCount; i++) {
-        if (sUnitCache[i].unit == unit && sUnitCache[i].bus == bus) return &sUnitCache[i];
+        if (sUnitCache[i].unit == unit && sUnitCache[i].bus == bus) {
+            sUnitCache[i].seq = ++sUnitSeq;
+            return &sUnitCache[i];
+        }
     }
-    if (sUnitCacheCount >= SLV_UNIT_CACHE) return NULL;
 
-    SLVUnitCache *c = &sUnitCache[sUnitCacheCount];
+    SLVUnitCache *c = NULL;
+    BOOL evicted = NO;
+    if (sUnitCacheCount < SLV_UNIT_CACHE) {
+        c = &sUnitCache[sUnitCacheCount++];
+    } else {
+        // 满了：顶掉最久没被调用的那个（0.3.49）
+        int victim = 0;
+        for (int i = 1; i < sUnitCacheCount; i++) {
+            if (sUnitCache[i].seq < sUnitCache[victim].seq) victim = i;
+        }
+        c = &sUnitCache[victim];
+        evicted = YES;
+    }
+
     memset(c, 0, sizeof(*c));
     c->unit = unit;
     c->bus = bus;
     c->enableSt = -1;
     c->asbdSt = -1;
+    c->seq = ++sUnitSeq;
+    NSString *img = SLVCallerImageName(callerAddr);
+    strlcpy(c->caller, img.UTF8String ?: "?", sizeof(c->caller));
 
     // EnableIO 只查一次、只用来解释日志：
     // 「App 有没有显式打开输入」是旁证，不是判据。
@@ -168,7 +238,15 @@ static SLVUnitCache *SLVCacheFor(AudioUnit unit, UInt32 bus, BOOL *isNew) {
     // ASBD 无条件查 —— 以前被 isInput 短路，连试都没试过，等于自断信息
     SLVTryASBD(c);
 
-    sUnitCacheCount++;
+    if (evicted) {
+        SLVLog(@"音频: unit 缓存已满，顶掉最久未用的那个（新 unit 0x%lx ← %@）",
+              (unsigned long)(uintptr_t)unit, img);
+    } else if (sUnitCacheCount > 1) {
+        // 第一个 unit 由下面的「unit 就绪」行负责，这里只补后来者的出身
+        SLVLog(@"音频: 新 unit 0x%lx bus=%u ← %@", (unsigned long)(uintptr_t)unit,
+              (unsigned)bus, img);
+    }
+
     if (isNew) *isNew = YES;
     return c;
 }
@@ -180,6 +258,9 @@ static OSStatus SLVCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags
                                      UInt32 frames, AudioBufferList *ioData) {
     SLVAudioUnitRenderFn orig = gSLRenderOrig;
     if (!orig) return -1;
+
+    // 0.3.49：调用方地址（谁的代码在拉麦克风）。这个值只在建缓存时用一次。
+    void *callerAddr = __builtin_return_address(0);
 
     // 先让宿主把麦克风数据拿到手，再就地替换 —— 这样无论它怎么处理
     // 时间戳、错误码、静音标志，我们都不改变行为，只换内容。
@@ -237,11 +318,11 @@ static OSStatus SLVCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags
         return st;
     }
 
-    SLVUnitCache *c = SLVCacheFor(unit, bus, NULL);
+    SLVUnitCache *c = SLVCacheFor(unit, bus, callerAddr, NULL);
     if (!c) {
         if (!sLoggedCacheFull) {
             sLoggedCacheFull = YES;
-            SLVLog(@"音频: 跳过 —— unit 缓存已满（上限 %d）", SLV_UNIT_CACHE);
+            SLVLog(@"音频: 跳过 —— unit 缓存拿不到条目（上限 %d）", SLV_UNIT_CACHE);
         }
         return st;
     }
@@ -288,11 +369,16 @@ static OSStatus SLVCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags
 
     SLVCamFeed *feed = [SLVCamFeed shared];
 
+    int replacedHere = 0;
+    double levelDB = -1.0;
     for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
         AudioBuffer *b = &ioData->mBuffers[i];
         if (!b->mData || b->mDataByteSize == 0) continue;
 
-        NSData *pcm = [feed audioForFormat:&c->asbd numBytes:b->mDataByteSize];
+        // 按 unit 分开取：同一个进程里可能有第二个 unit 也在拉麦克风，
+        // 共用一个游标会让两边各拿到隔包数据（0.3.49）。
+        NSData *pcm = [feed audioForFormat:&c->asbd numBytes:b->mDataByteSize
+                                  consumer:(const void *)unit];
         if (pcm.length != b->mDataByteSize) {
             // 拿不到素材 PCM → 这一包放行真麦克风。
             // 以前这里是完全静默的 continue，「录制时音频没被替换」在日志上
@@ -307,7 +393,38 @@ static OSStatus SLVCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags
         }
 
         memcpy(b->mData, pcm.bytes, pcm.length);
+        replacedHere++;
         gSLReplaceCount++;
+        if (levelDB < 0) levelDB = SLVPCMLeveldBFS(pcm.bytes, pcm.length, &c->asbd);
+    }
+
+    // 0.3.49：真把数据换进去了，就把「这一包是静音」的标志清掉。
+    //
+    // 系统（尤其语音处理单元）在麦克风被判成静音时会把
+    // kAudioUnitRenderAction_OutputIsSilence 置上；RTC SDK 看到这个标志会直接
+    // 把整包丢掉、不送去编码 —— 我们把 buffer 写满了素材，标志还在，等于白写。
+    if (replacedHere > 0 && flags && (*flags & kAudioUnitRenderAction_OutputIsSilence)) {
+        *flags &= ~kAudioUnitRenderAction_OutputIsSilence;
+        if (!c->silenceClearedLogged) {
+            c->silenceClearedLogged = YES;
+            SLVLog(@"音频: 清掉 OutputIsSilence 标志（bus=%u ← %s）—— 宿主原本会把这一包整包丢掉",
+                  (unsigned)c->bus, c->caller);
+        }
+    }
+
+    // 0.3.49：注入电平。首包 + 之后每 250 包一行。
+    // 只有「水位」看不出内容响不响 —— 水位 180ms 也可能是 180ms 的静音。
+    if (replacedHere > 0) {
+        c->levelLogs++;
+        if (c->levelLogs == 1 || c->levelLogs % 250 == 0) {
+            if (levelDB >= -0.5) {
+                SLVLog(@"音频: 注入电平 %.1f dBFS（bus=%u ← %s · 第 %d 包）",
+                      levelDB, (unsigned)c->bus, c->caller, c->levelLogs);
+            } else {
+                SLVLog(@"音频: 注入电平 = 静音（bus=%u ← %s · 第 %d 包）—— 素材音轨可能没解出来",
+                      (unsigned)c->bus, c->caller, c->levelLogs);
+            }
+        }
     }
 
     // 「已接管」改成按 unit 打：全局只打一次的话，第二个 unit（比如通话结束、
@@ -376,7 +493,8 @@ static void SLVCamAudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ,
         // 所以只能走 tryAudioForFormat: —— 抢不到锁就放行这一包真麦克风，
         // 绝不能在这里等锁，否则宿主整条音频链路（乃至界面）都会被拖住。
         NSData *pcm = [[SLVCamFeed shared] tryAudioForFormat:&ctx->asbd
-                                                   numBytes:inBuffer->mAudioDataByteSize];
+                                                   numBytes:inBuffer->mAudioDataByteSize
+                                                   consumer:(const void *)ctx];
         if (pcm.length == inBuffer->mAudioDataByteSize) {
             memcpy(inBuffer->mAudioData, pcm.bytes, pcm.length);
             ctx->replaced++;
