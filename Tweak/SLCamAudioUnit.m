@@ -111,8 +111,13 @@ static NSString *SLVCallerImageName(void *addr) {
 /// 一包 PCM 的电平（dBFS）。日志里一直只有「水位」「丢多少字节」，
 /// 全是「有多少数据」，没有一条是「数据响不响」—— 所以「注入进去了但内容其实是静音」
 /// 这种情况在日志上完全看不出来。这里补上。
+///
+/// 返回 NAN = 采样格式不认识（不是「静音」）。0.3.50 及以前用 -1.0 当「不认识」的
+/// 哨兵，又拿「>= -0.5 才算有声」去判 —— 两个错误叠在一起，结果是**任何正常音量
+/// 都被打成「静音」**：ASMR 这类轻声大约 -30 dBFS，-30 >= -0.5 不成立，直接走静音分支。
+/// 于是日志连续三分钟喊静音，池子里其实一直是好数据。
 static double SLVPCMLeveldBFS(const void *bytes, size_t len, const AudioStreamBasicDescription *asbd) {
-    if (!bytes || !len || !asbd) return -120.0;
+    if (!bytes || !len || !asbd) return NAN;
     BOOL isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
     double sum = 0;
     size_t n = 0;
@@ -125,8 +130,12 @@ static double SLVPCMLeveldBFS(const void *bytes, size_t len, const AudioStreamBa
         const int16_t *s = (const int16_t *)bytes;
         size_t cnt = len / sizeof(int16_t);
         for (size_t i = 0; i < cnt; i++) { double v = s[i] / 32768.0; sum += v * v; n++; }
+    } else if (!isFloat && asbd->mBitsPerChannel == 32) {
+        const int32_t *s = (const int32_t *)bytes;
+        size_t cnt = len / sizeof(int32_t);
+        for (size_t i = 0; i < cnt; i++) { double v = s[i] / 2147483648.0; sum += v * v; n++; }
     } else {
-        return -1.0;   // 不认识的采样格式，不瞎报
+        return NAN;   // 不认识的格式，别冒充「静音」
     }
     if (!n) return -120.0;
     double rms = sqrt(sum / (double)n);
@@ -309,11 +318,16 @@ static OSStatus SLVCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags
         return st;
     }
 
-    // 宿主音频已经走 AVCapture 了（比如陌陌），这条链路必须让路
-    if (SLVCamAVCaptureAudioSeen()) {
+    // 宿主音频此刻是不是正走 AVCapture / AudioQueue？
+    //
+    // 以前这里看的是「曾经见过 AVCapture 音频」这种一票否决标志，置上就永不清除。
+    // 于是「先录一段视频消息、再打视频通话」这种最平常的操作里，通话整场都在
+    // 让路 —— 而通话里根本没有 AVCapture 音频在跑，最后谁也不注入。
+    // 现在只认「那条链路 1 秒内真的来拿过数据」。
+    if (SLVCamAVCaptureAudioSeen() && [[SLVCamFeed shared] audioConsumerActive:NULL]) {
         if (!sLoggedYieldAVCap) {
             sLoggedYieldAVCap = YES;
-            SLVLog(@"音频: 让路 —— 宿主音频走 AVCapture，交给那条链路");
+            SLVLog(@"音频: 让路 —— 宿主音频正在走 AVCapture/AudioQueue，交给那条链路");
         }
         return st;
     }
@@ -370,7 +384,8 @@ static OSStatus SLVCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags
     SLVCamFeed *feed = [SLVCamFeed shared];
 
     int replacedHere = 0;
-    double levelDB = -1.0;
+    double levelDB = NAN;
+    BOOL haveLevel = NO;
     for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
         AudioBuffer *b = &ioData->mBuffers[i];
         if (!b->mData || b->mDataByteSize == 0) continue;
@@ -395,7 +410,7 @@ static OSStatus SLVCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags
         memcpy(b->mData, pcm.bytes, pcm.length);
         replacedHere++;
         gSLReplaceCount++;
-        if (levelDB < 0) levelDB = SLVPCMLeveldBFS(pcm.bytes, pcm.length, &c->asbd);
+        if (!haveLevel) { levelDB = SLVPCMLeveldBFS(pcm.bytes, pcm.length, &c->asbd); haveLevel = YES; }
     }
 
     // 0.3.49：真把数据换进去了，就把「这一包是静音」的标志清掉。
@@ -414,17 +429,24 @@ static OSStatus SLVCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags
 
     // 0.3.49：注入电平。首包 + 之后每 250 包一行。
     // 只有「水位」看不出内容响不响 —— 水位 180ms 也可能是 180ms 的静音。
+    //
+    // 0.3.51：判断改成「真实的 dBFS」。以前拿 -0.5 dBFS 当有声的门槛，
+    // 那等于要求素材比满刻度只低半个 dB —— 现实里根本不存在，
+    // 于是所有正常音量都被打成「静音」，把真正的答案埋了三天。
     if (replacedHere > 0) {
         c->levelLogs++;
         if (c->levelLogs == 1 || c->levelLogs % 250 == 0) {
-            if (levelDB >= -0.5) {
-                SLVLog(@"音频: 注入电平 %.1f dBFS（bus=%u ← %s · 第 %d 包）",
-                      levelDB, (unsigned)c->bus, c->caller, c->levelLogs);
-            } else {
-                // 静音时必须带上现场：光看「第 N 包是静音」分不清是池子空了、
-                // 音轨没挂上、还是素材本身就没声音（0.3.50）。
+            if (isnan(levelDB)) {
+                SLVLog(@"音频: 注入电平 未知（采样格式不认识 · bits=%u flags=0x%x · 第 %d 包 · %@）",
+                      (unsigned)c->asbd.mBitsPerChannel, (unsigned)c->asbd.mFormatFlags,
+                      c->levelLogs, [feed audioDiag]);
+            } else if (levelDB <= -90.0) {
+                // 真静音：这时才需要看现场（池子空了 / 音轨没挂 / 素材本身无声）
                 SLVLog(@"音频: 注入电平 = 静音（bus=%u ← %s · 第 %d 包 · %@）",
                       (unsigned)c->bus, c->caller, c->levelLogs, [feed audioDiag]);
+            } else {
+                SLVLog(@"音频: 注入电平 %.1f dBFS（bus=%u ← %s · 第 %d 包 · %@）",
+                      levelDB, (unsigned)c->bus, c->caller, c->levelLogs, [feed audioDiag]);
             }
         }
     }

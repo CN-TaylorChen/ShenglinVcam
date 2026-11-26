@@ -16,6 +16,7 @@
 #import <ImageIO/ImageIO.h>
 #import <Accelerate/Accelerate.h>
 #import <unistd.h>
+#import <math.h>
 
 #pragma mark - 渲染到 YUV 的正确姿势（0.3.5）
 
@@ -354,6 +355,30 @@ typedef struct {
     CFAbsoluteTime lastCall;
 } SLVAudioConsumer;
 
+/// 一段 PCM 的响度（dBFS），NAN = 格式不认识。
+/// 和 SLCamAudioUnit.m 里那份是同一套算法，故意各写一份：
+/// 生产端和注入端必须能互相印证，共用一份的话探针错了会一起错。
+static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStreamBasicDescription *asbd) {
+    if (!bytes || !len || !asbd) return NAN;
+    BOOL isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    double sum = 0;
+    size_t n = 0;
+    if (isFloat && asbd->mBitsPerChannel == 32) {
+        const float *f = (const float *)bytes;
+        for (size_t i = 0; i < len / sizeof(float); i++) { double v = f[i]; sum += v * v; n++; }
+    } else if (!isFloat && asbd->mBitsPerChannel == 16) {
+        const int16_t *s = (const int16_t *)bytes;
+        for (size_t i = 0; i < len / sizeof(int16_t); i++) { double v = s[i] / 32768.0; sum += v * v; n++; }
+    } else {
+        return NAN;
+    }
+    if (!n) return -120.0;
+    double rms = sqrt(sum / (double)n);
+    if (rms <= 1e-9) return -120.0;
+    double db = 20.0 * log10(rms);
+    return db < -120.0 ? -120.0 : db;
+}
+
 @interface SLVCamFeed () {
     NSLock *_lock;
 
@@ -376,6 +401,7 @@ typedef struct {
     BOOL _audioDropLogged;
     BOOL _audioPassLogged;               // 「放行真麦克风」只打一次，诊断用
     NSUInteger _audioCalls;              // 消费端被调用次数（水位心跳用）
+    NSUInteger _audioPumped;             // 生产端写入的 PCM 块数（素材解出电平日志用）
     CMTime _lastVideoPTS;                // 0.3.50：重建 reader 时从这里续播，画面不跳回开头
     BOOL _resumeValid;
     CGSize _naturalSize;
@@ -805,13 +831,34 @@ typedef struct {
     _audioConsumerCount = w;
     _audioConsumerPruned += dropped;
 
+    // 一个都不剩了：把池子的历史前缀全扔掉，只留最后高水位那一小段。
+    //
+    // 不扔会出事：池子里已经积累了几十秒的已播数据（裁剪只在有消费者消费时才做），
+    // 下一个 unit 接上时从 cursor 0 开始读，等于一口气把 3 秒前的旧音频灌进去。
+    // 日志里那行「缓冲 3126ms 严重偏高（卡顿后遗留），硬切 290520 字节」就是这么来的。
+    NSUInteger trimmedMs = 0;
+    if (_audioConsumerCount == 0 && _audioPCM.length > 0 && _audioBytesPerSecond > 0) {
+        NSUInteger keep = (NSUInteger)(_audioBytesPerSecond * SLV_AUDIO_HIGH_SEC);
+        if (keep < 4096) keep = 4096;
+        if (_audioPCM.length > keep) {
+            NSUInteger cut = _audioPCM.length - keep;
+            trimmedMs = cut * 1000 / _audioBytesPerSecond;
+            [_audioPCM replaceBytesInRange:NSMakeRange(0, cut) withBytes:NULL length:0];
+        }
+    }
+
     // 这条日志很重要：它解释「为什么前面静音、后面又好了」。
     // 不限流就会每次取数据刷一行，所以每 5 秒最多一条。
     static CFAbsoluteTime sLastPruneLog = 0;
     if (now - sLastPruneLog > 5.0) {
         sLastPruneLog = now;
-        SLVLog(@"音频: 摘掉 %d 个不再来拉数据的消费者（剩 %d 个 · 累计 %d 个）",
-              dropped, _audioConsumerCount, _audioConsumerPruned);
+        if (trimmedMs) {
+            SLVLog(@"音频: 摘掉 %d 个不再来拉数据的消费者（剩 %d 个 · 累计 %d 个）· 清掉池里 %lums 旧数据",
+                  dropped, _audioConsumerCount, _audioConsumerPruned, (unsigned long)trimmedMs);
+        } else {
+            SLVLog(@"音频: 摘掉 %d 个不再来拉数据的消费者（剩 %d 个 · 累计 %d 个）",
+                  dropped, _audioConsumerCount, _audioConsumerPruned);
+        }
     }
 }
 
@@ -854,12 +901,31 @@ typedef struct {
     size_t len = bb ? CMBlockBufferGetDataLength(bb) : 0;
     if (len > 0) {
         NSMutableData *raw = [NSMutableData dataWithLength:len];
-        CMBlockBufferCopyDataBytes(bb, 0, len, raw.mutableBytes);
-        NSData *converted = [self sl_convertAudio:raw];
+        OSStatus copySt = CMBlockBufferCopyDataBytes(bb, 0, len, raw.mutableBytes);
+        NSData *converted = (copySt == noErr) ? [self sl_convertAudio:raw] : nil;
         if (converted.length) {
+            double db = NAN;
+            BOOL probe = NO;
             [_lock lock];
             [_audioPCM appendData:converted];
+            _audioPumped++;
+            if (_audioPumped == 1 || _audioPumped % 600 == 0) {
+                probe = YES;
+                db = SLVPCMLoudnessdBFS(converted.bytes, converted.length, &_audioDstASBD);
+            }
             [_lock unlock];
+            if (probe) {
+                // 生产端的独立证据：万一注入端又报「静音」，这一行能立刻分出
+                // 是「素材根本没解出声音」还是「注入/探测的问题」。
+                if (isnan(db)) {
+                    SLVLog(@"音频: 素材解出 未知格式（第 %lu 块 %luB · bits=%u flags=0x%x）",
+                          (unsigned long)_audioPumped, (unsigned long)converted.length,
+                          (unsigned)_audioDstASBD.mBitsPerChannel, (unsigned)_audioDstASBD.mFormatFlags);
+                } else {
+                    SLVLog(@"音频: 素材解出 %.1f dBFS（第 %lu 块 %luB）",
+                          db, (unsigned long)_audioPumped, (unsigned long)converted.length);
+                }
+            }
         }
     }
     CFRelease(sb);
@@ -1788,6 +1854,22 @@ BOOL SLVCamIsMomoProcess(void) {
     }
     if (got < numBytes) memset((uint8_t *)chunk.mutableBytes + got, 0, numBytes - got);  // 不够补静音
     return chunk;
+}
+
+/// 某个消费者此刻是否真的在拉数据（1 秒内来过）；key = NULL 表示 AVCapture / AudioQueue 那条链。
+///
+/// 用来替代「曾经见过 AVCapture 音频」这种一票否决的标志 —— 那个标志一旦置上就
+/// 永不清除，于是「先录了一段视频消息、再打视频通话」时，AudioUnit 链路整场都在
+/// 让路，而通话里根本没有 AVCapture 音频在跑，结果谁也不注入。
+- (BOOL)audioConsumerActive:(const void * _Nullable)key {
+    [_lock lock];
+    [self sl_pruneConsumersLocked];
+    BOOL found = NO;
+    for (int i = 0; i < _audioConsumerCount; i++) {
+        if (_audioConsumers[i].key == key) { found = YES; break; }
+    }
+    [_lock unlock];
+    return found;
 }
 
 /// 一行状态串，给注入层打「静音」时带上现场。
