@@ -116,6 +116,10 @@ BOOL SLVCamIsMomoProcess(void);
 /// 才能让解码线程把音轨挂上 —— 否则开头一两百毫秒只能出静音。
 - (void)primeAudioFormat:(const AudioStreamBasicDescription *)asbd;
 
+/// 一行状态串（池水位 / 活着的消费者数 / 音轨挂没挂上）。
+/// 注入层打「注入电平 = 静音」时带上它，才分得清「池子空了」和「素材本身无声」。
+- (NSString *)audioDiag;
+
 /// 实时音频线程专用：和 `audioForFormat:numBytes:` 一样，但**绝不阻塞**。
 /// 拿不到锁、或格式还没登记，就立刻返回 nil（注入层据此放行真麦克风）。
 /// 在宿主的音频回调里只能用它 —— 宁可漏一包，也不能把音频线程卡住。

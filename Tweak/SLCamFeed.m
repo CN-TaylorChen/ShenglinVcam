@@ -339,6 +339,21 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
 // 在通话里就是「对方听不清 / 听不到声音」。日志上还看不出来：水位照常、丢 0 字节。
 #define SLV_AUDIO_CONSUMERS 4
 
+// 0.3.50：多久没来拉数据就认为这个消费者已经死了。
+//
+// 视频通话里宿主会先建一个 AudioUnit 探格式，拉一两包就丢掉，再建真正做
+// 上行编码的那个。死掉的那个游标永远停在原地，而生产端是看「最落后的游标」
+// 判断水位的 —— 于是池子补到 120ms 就再也不补，活着的 unit 把这点数据吃完，
+// 之后每一包都是补零，对端从第一秒起就没声音。日志上看起来一切正常：
+// 心跳照涨、丢 0 字节、接管成功。所以必须按时间去认「谁还在拉」。
+static const CFAbsoluteTime SLV_AUDIO_CONSUMER_TTL = 1.0;
+
+typedef struct {
+    const void *key;        // AudioUnit 指针；NULL = AVCapture / AudioQueue 那条链
+    NSUInteger cursor;      // 相对 _audioPCM 的读位置
+    CFAbsoluteTime lastCall;
+} SLVAudioConsumer;
+
 @interface SLVCamFeed () {
     NSLock *_lock;
 
@@ -347,19 +362,22 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     NSString *_pipelineKey;              // "875704422:1920x1080"，变了就要重建 reader
     BOOL _reconfigRequested;
     NSMutableData *_audioPCM;
-    NSUInteger _audioReadCursor;         // 0.3.49 起只作为「默认消费者」的游标保留
     // 0.3.49：按消费者分开的游标（key 是 AudioUnit 指针，NULL = AVCapture/AudioQueue 那条链）
-    struct { const void *key; NSUInteger cursor; } _audioConsumers[SLV_AUDIO_CONSUMERS];
+    SLVAudioConsumer _audioConsumers[SLV_AUDIO_CONSUMERS];
     int _audioConsumerCount;
+    int _audioConsumerPruned;            // 累计被判定「死了」而摘掉的消费者数（诊断用）
     AudioStreamBasicDescription _audioDstASBD;
     BOOL _hasAudioDstASBD;
     AVAudioConverter *_audioConverter;
     NSUInteger _audioBytesPerSecond;
     BOOL _assetHasAudio;                 // 素材本身有没有音轨：决定「没数据」时是静音还是放行真麦克风
+    BOOL _audioTrackAttached;            // 当前 reader 到底把音轨挂上了没有（0.3.50 诊断用）
     NSUInteger _audioDropped;            // 累计丢弃字节（诊断用）
     BOOL _audioDropLogged;
     BOOL _audioPassLogged;               // 「放行真麦克风」只打一次，诊断用
     NSUInteger _audioCalls;              // 消费端被调用次数（水位心跳用）
+    CMTime _lastVideoPTS;                // 0.3.50：重建 reader 时从这里续播，画面不跳回开头
+    BOOL _resumeValid;
     CGSize _naturalSize;
 
     // ---- 解码线程独占 ----
@@ -517,7 +535,7 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     if (_hostStill) { CVPixelBufferRelease(_hostStill); _hostStill = NULL; }
     _hostStillKey = nil;
     [_audioPCM setLength:0];
-    _audioReadCursor = 0;
+    // 换素材必须把所有人的游标一起归零，否则旧位置会落在新池子外面
     for (int i = 0; i < _audioConsumerCount; i++) _audioConsumers[i].cursor = 0;
     _running = (_sourcePath.length > 0);
     BOOL run = _running;
@@ -717,9 +735,11 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
                     CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sb);
                     if (pb) {
                         CVPixelBufferRetain(pb);
+                        CMTime ts = CMSampleBufferGetPresentationTimeStamp(sb);
                         [_lock lock];
                         CVPixelBufferRef old = _latestVideo;
                         _latestVideo = pb;
+                        if (CMTIME_IS_VALID(ts) && CMTIME_IS_NUMERIC(ts)) _lastVideoPTS = ts;
                         [_lock unlock];
                         if (old) CVPixelBufferRelease(old);
                     }
@@ -769,11 +789,38 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     }
 }
 
-/// 池子里还剩多少（按最落后的那个消费者算）。
+/// 摘掉已经不再来拉数据的消费者。调用方必须已持有 _lock。
+///
+/// 判断依据只能是时间：AudioUnit 被宿主销毁时没有任何通知能落到 tweak 上，
+/// 我们只看到「它再也没来」。
+- (void)sl_pruneConsumersLocked {
+    if (_audioConsumerCount == 0) return;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    int w = 0, dropped = 0;
+    for (int i = 0; i < _audioConsumerCount; i++) {
+        if (now - _audioConsumers[i].lastCall > SLV_AUDIO_CONSUMER_TTL) { dropped++; continue; }
+        _audioConsumers[w++] = _audioConsumers[i];
+    }
+    if (!dropped) return;
+    _audioConsumerCount = w;
+    _audioConsumerPruned += dropped;
+
+    // 这条日志很重要：它解释「为什么前面静音、后面又好了」。
+    // 不限流就会每次取数据刷一行，所以每 5 秒最多一条。
+    static CFAbsoluteTime sLastPruneLog = 0;
+    if (now - sLastPruneLog > 5.0) {
+        sLastPruneLog = now;
+        SLVLog(@"音频: 摘掉 %d 个不再来拉数据的消费者（剩 %d 个 · 累计 %d 个）",
+              dropped, _audioConsumerCount, _audioConsumerPruned);
+    }
+}
+
+/// 池子里还剩多少（按最落后的那个**还活着**的消费者算）。
 /// 生产端只关心「最落后的消费者还缺多少」—— 用最靠前的会一直以为没人消费。
 /// 调用方必须已持有 _lock。
 - (NSUInteger)sl_bufferedLocked {
-    if (_audioConsumerCount == 0) return _audioPCM.length - _audioReadCursor;
+    [self sl_pruneConsumersLocked];
+    if (_audioConsumerCount == 0) return _audioPCM.length;
     NSUInteger min = _audioPCM.length;
     for (int i = 0; i < _audioConsumerCount; i++) {
         if (_audioConsumers[i].cursor < min) min = _audioConsumers[i].cursor;
@@ -878,6 +925,9 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
     _videoOut = nil;
     _audioOut = nil;
     _idleRounds = 0;
+    [_lock lock];
+    _audioTrackAttached = NO;
+    [_lock unlock];
 
     NSString *path;
     [_lock lock];
@@ -993,6 +1043,7 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
                 _audioOut = o;
                 [_lock lock];
                 _audioSrcASBD = src;
+                _audioTrackAttached = YES;
                 [_lock unlock];
             } else {
                 // 音轨在，但解不成 float32 / 单声道。表现就是「有音轨却全程静音」，
@@ -1000,6 +1051,19 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
                 SLVLog(@"feed 音轨解不成 PCM（编码不支持），这条素材只能静音");
             }
         }
+    }
+
+    CMTimeRange range = kCMTimeRangeInvalid;
+    [_lock lock];
+    if (_resumeValid && CMTIME_IS_VALID(_lastVideoPTS) && CMTIME_IS_NUMERIC(_lastVideoPTS)) {
+        range = CMTimeRangeMake(_lastVideoPTS, kCMTimePositiveInfinity);
+    }
+    _resumeValid = NO;
+    [_lock unlock];
+    if (CMTIMERANGE_IS_VALID(range)) {
+        reader.timeRange = range;
+        SLVLog(@"feed 从 %@ 秒续播（补挂音轨后不跳回开头）",
+              @((double)range.start.value / (double)range.start.timescale));
     }
 
     if (![reader startReading]) {
@@ -1530,8 +1594,7 @@ BOOL SLVCamIsMomoProcess(void) {
     _audioSrcASBD = src;
 
     _audioConverter = nil;
-    BOOL needConvert = !(asbd->mFormatFlags & kAudioFormatFlagIsFloat)
-                    || !(asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved)
+    BOOL needConvert = !(asbd->mFormatFlags & kAudioFormatFlagIsFloat)                    || !(asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved)
                     || asbd->mChannelsPerFrame != 1
                     || asbd->mSampleRate != 44100;
     if (needConvert) {
@@ -1542,7 +1605,19 @@ BOOL SLVCamIsMomoProcess(void) {
             if (!_audioConverter) SLVLog(@"音频转换器创建失败，将只换画面");
         }
     }
-    _reconfigRequested = YES;   // 让解码线程把音频轨挂上
+    // 让解码线程把音频轨挂上。
+    //
+    // 视频通话就是这个顺序：宿主先建好采集会话、我们先把 reader 建出来（那时
+    // 还不知道宿主音频格式，音轨挂不上），三秒后 AudioUnitRender 才第一次被调、
+    // 格式才登记进来。之前这里只是把 _reconfigRequested 置上，但缺音轨这件事
+    // 在日志里没有任何痕迹，只看得到「管线就绪 (video=Y audio=N)」和满屏静音。
+    _reconfigRequested = YES;
+    if (!_audioTrackAttached) {
+        // 重建要从当前帧接着播，否则画面会跳回素材开头。
+        _resumeValid = CMTIME_IS_VALID(_lastVideoPTS) && CMTIME_IS_NUMERIC(_lastVideoPTS);
+        SLVLog(@"音频: 当前管线没有音轨（宿主格式登记晚了），重建 reader 挂上音轨%@",
+              _resumeValid ? @"，画面从当前帧续播" : @"");
+    }
     SLVLog(@"audio 目标 %.0fHz %uch %uB/帧 转码=%@", asbd->mSampleRate,
           (unsigned)asbd->mChannelsPerFrame, (unsigned)asbd->mBytesPerFrame,
           needConvert ? @"Y" : @"N");
@@ -1561,8 +1636,14 @@ BOOL SLVCamIsMomoProcess(void) {
 /// 新建时起点跟「最靠前的那个消费者」对齐：它刚接上，不该先补 180ms 历史，
 /// 否则新 unit 一挂上就比别的链路慢半拍。
 - (int)sl_consumerSlotLocked:(const void * _Nullable)key {
+    [self sl_pruneConsumersLocked];
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+
     for (int i = 0; i < _audioConsumerCount; i++) {
-        if (_audioConsumers[i].key == key) return i;
+        if (_audioConsumers[i].key == key) {
+            _audioConsumers[i].lastCall = now;
+            return i;
+        }
     }
 
     NSUInteger start = 0;
@@ -1583,6 +1664,7 @@ BOOL SLVCamIsMomoProcess(void) {
     }
     _audioConsumers[slot].key = key;
     _audioConsumers[slot].cursor = start;
+    _audioConsumers[slot].lastCall = now;
     return slot;
 }
 
@@ -1706,6 +1788,21 @@ BOOL SLVCamIsMomoProcess(void) {
     }
     if (got < numBytes) memset((uint8_t *)chunk.mutableBytes + got, 0, numBytes - got);  // 不够补静音
     return chunk;
+}
+
+/// 一行状态串，给注入层打「静音」时带上现场。
+/// 实时音频线程调用，拿不到锁就返回占位符，绝不阻塞宿主。
+- (NSString *)audioDiag {
+    if (![_lock tryLock]) return @"诊断锁忙";
+    [self sl_pruneConsumersLocked];
+    NSUInteger buffered = [self sl_bufferedLocked];
+    NSUInteger ms = _audioBytesPerSecond ? (buffered * 1000 / _audioBytesPerSecond) : 0;
+    NSString *s = [NSString stringWithFormat:@"池 %lums · 消费者 %d · 音轨 %@ · 素材音轨 %@",
+                   (unsigned long)ms, _audioConsumerCount,
+                   _audioTrackAttached ? @"已挂" : @"未挂",
+                   _assetHasAudio ? @"有" : @"无"];
+    [_lock unlock];
+    return s;
 }
 
 - (NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes {

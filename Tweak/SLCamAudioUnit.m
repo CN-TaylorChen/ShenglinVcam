@@ -421,8 +421,10 @@ static OSStatus SLVCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags
                 SLVLog(@"音频: 注入电平 %.1f dBFS（bus=%u ← %s · 第 %d 包）",
                       levelDB, (unsigned)c->bus, c->caller, c->levelLogs);
             } else {
-                SLVLog(@"音频: 注入电平 = 静音（bus=%u ← %s · 第 %d 包）—— 素材音轨可能没解出来",
-                      (unsigned)c->bus, c->caller, c->levelLogs);
+                // 静音时必须带上现场：光看「第 N 包是静音」分不清是池子空了、
+                // 音轨没挂上、还是素材本身就没声音（0.3.50）。
+                SLVLog(@"音频: 注入电平 = 静音（bus=%u ← %s · 第 %d 包 · %@）",
+                      (unsigned)c->bus, c->caller, c->levelLogs, [feed audioDiag]);
             }
         }
     }
