@@ -294,7 +294,8 @@ static OSStatus SLVCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags
     if (sCalls % SLV_HEARTBEAT_EVERY == 0) {
         int delta = sBus1Calls - sBus1AtLastBeat;
         sBus1AtLastBeat = sBus1Calls;
-        SLVLog(@"音频: 心跳 调用 %d / bus=1 累计 %d（本轮 +%d）", sCalls, sBus1Calls, delta);
+        // 0.3.52：实时线程，走 RT 版（不 NSLog、时间戳在后台队列取）
+        SLVLogRT(@"音频: 心跳 调用 %d / bus=1 累计 %d（本轮 +%d）", sCalls, sBus1Calls, delta);
     }
 
     if (st != noErr || !ioData || ioData->mNumberBuffers == 0) {
@@ -436,17 +437,18 @@ static OSStatus SLVCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags
     if (replacedHere > 0) {
         c->levelLogs++;
         if (c->levelLogs == 1 || c->levelLogs % 250 == 0) {
+            // 0.3.52：每 5 秒一条、跑在实时线程 —— 必须走 RT 版
             if (isnan(levelDB)) {
-                SLVLog(@"音频: 注入电平 未知（采样格式不认识 · bits=%u flags=0x%x · 第 %d 包 · %@）",
-                      (unsigned)c->asbd.mBitsPerChannel, (unsigned)c->asbd.mFormatFlags,
-                      c->levelLogs, [feed audioDiag]);
+                SLVLogRT(@"音频: 注入电平 未知（采样格式不认识 · bits=%u flags=0x%x · 第 %d 包 · %@）",
+                        (unsigned)c->asbd.mBitsPerChannel, (unsigned)c->asbd.mFormatFlags,
+                        c->levelLogs, [feed audioDiag]);
             } else if (levelDB <= -90.0) {
                 // 真静音：这时才需要看现场（池子空了 / 音轨没挂 / 素材本身无声）
-                SLVLog(@"音频: 注入电平 = 静音（bus=%u ← %s · 第 %d 包 · %@）",
-                      (unsigned)c->bus, c->caller, c->levelLogs, [feed audioDiag]);
+                SLVLogRT(@"音频: 注入电平 = 静音（bus=%u ← %s · 第 %d 包 · %@）",
+                        (unsigned)c->bus, c->caller, c->levelLogs, [feed audioDiag]);
             } else {
-                SLVLog(@"音频: 注入电平 %.1f dBFS（bus=%u ← %s · 第 %d 包 · %@）",
-                      levelDB, (unsigned)c->bus, c->caller, c->levelLogs, [feed audioDiag]);
+                SLVLogRT(@"音频: 注入电平 %.1f dBFS（bus=%u ← %s · 第 %d 包 · %@）",
+                        levelDB, (unsigned)c->bus, c->caller, c->levelLogs, [feed audioDiag]);
             }
         }
     }
@@ -527,8 +529,9 @@ static void SLVCamAudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ,
                 SLVLog(@"音频: 已接管 AudioQueue 麦克风输入（%.0fHz %uch）",
                       ctx->asbd.mSampleRate, (unsigned)ctx->asbd.mChannelsPerFrame);
             } else if (ctx->replaced % 3000 == 0) {
-                SLVLog(@"音频: AudioQueue 心跳 %d 次（未替换 %d）",
-                      ctx->replaced, ctx->skipped);
+                // 0.3.52：AudioQueue 回调同样在音频线程上，走 RT 版
+                SLVLogRT(@"音频: AudioQueue 心跳 %d 次（未替换 %d）",
+                        ctx->replaced, ctx->skipped);
             }
         } else if (pcm == nil && ctx->replaced == 0) {
             ctx->skipped++;

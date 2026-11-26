@@ -22,7 +22,7 @@
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.51"
+#define SLVVersion @"0.3.52"
 
 // 每个开关的 tag。原来只有「循环 / 镜像 / 音频」三个设了 tag（0/1/2），
 // 「启用」那个没设，默认就是 0 —— 跟「循环播放」撞在一起。以前没人按 tag 区分，
@@ -33,6 +33,7 @@ typedef NS_ENUM(NSInteger, SLVSwitchTag) {
     SLVSwitchTagMirror  = 12,
     SLVSwitchTagAudio   = 13,
     SLVSwitchTagSquareCrop = 14,   // 0.3.12：陌陌实拍时刻不放大（只在陌陌里显示）
+    SLVSwitchTagLog     = 15,      // 0.3.52：记录运行日志
 };
 
 // 定义在下面的「存储」段里，这里先用一下
@@ -266,6 +267,7 @@ static UIView *SLVMakeHeader(NSString *text, CGFloat x, CGFloat width) {
                 case SLVSwitchTagMirror:  v = SLVBoolForKey(kSLCamMirrorKey, NO); break;
                 case SLVSwitchTagAudio:   v = SLVBoolForKey(kSLCamAudioKey, YES); break;
                 case SLVSwitchTagSquareCrop: v = SLVBoolForKey(kSLCamSquareCropKey, NO); break;
+                case SLVSwitchTagLog:     v = SLVLogOn(); break;
                 default: continue;
             }
             // 值没变就别动，否则会把用户刚拨完的那一下又「弹」一次
@@ -284,7 +286,7 @@ static UIView *SLVMakeHeader(NSString *text, CGFloat x, CGFloat width) {
         } else if (ip.section == 2 && ip.row == 2) {
             // 扇上的「旋转」写的是同一个键，这里必须跟着变
             cell.detailTextLabel.text = SLVRotationSummary();
-        } else if (ip.section == 4) {
+        } else if (ip.section == 4 && ip.row == 1) {
             cell.detailTextLabel.text = SLVHookStatusSummary();
         }
     }
@@ -402,7 +404,8 @@ static NSString *SLVRotationSummary(void) {
     // 显示一个拨了没反应的开关比不显示更让人困惑。
     if (section == 2) return SLVCamIsMomoProcess() ? 4 : 3;   // 循环 + 镜像 + 旋转 (+ 实拍时刻)
     if (section == 3) return 1;   // 音频
-    return 1;                     // 运行日志
+    // 0.3.52：诊断组多了「记录日志」开关，日志页降到第二行
+    return 2;                     // 记录日志 + 运行日志
 }
 
 - (NSString *)sl_headerForSection:(NSInteger)section {
@@ -502,9 +505,18 @@ static NSString *SLVRotationSummary(void) {
         sw.tag = SLVSwitchTagAudio;
         [sw addTarget:self action:@selector(sl_optionChanged:) forControlEvents:UIControlEventValueChanged];
     } else {
-        cell.textLabel.text = @"运行日志";
-        cell.detailTextLabel.text = SLVHookStatusSummary();
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        if (ip.row == 0) {
+            // 0.3.52：关闭后彻底不记（连字符串都不拼）。默认开，跟老版本行为一致。
+            cell.textLabel.text = @"记录运行日志";
+            sw = [[UISwitch alloc] init];
+            sw.on = SLVLogOn();
+            sw.tag = SLVSwitchTagLog;
+            [sw addTarget:self action:@selector(sl_optionChanged:) forControlEvents:UIControlEventValueChanged];
+        } else {
+            cell.textLabel.text = @"运行日志";
+            cell.detailTextLabel.text = SLVHookStatusSummary();
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        }
     }
     cell.accessoryView = sw;
     return cell;
@@ -518,7 +530,7 @@ static NSString *SLVRotationSummary(void) {
         [self.navigationController pushViewController:[[SLVMediaListController alloc] init] animated:YES];
     } else if (ip.section == 2 && ip.row == 2) {
         [self sl_pickRotation];
-    } else if (ip.section == 4) {
+    } else if (ip.section == 4 && ip.row == 1) {
         [self.navigationController pushViewController:[[SLVLogViewController alloc] init] animated:YES];
     }
 }
@@ -564,7 +576,13 @@ static NSString *SLVRotationSummary(void) {
 }
 
 - (void)sl_optionChanged:(UISwitch *)sw {
-    // tag 见文件头的 SLVSwitchTag：10 启用 / 11 循环 / 12 镜像 / 13 音频 / 14 实拍时刻
+    // tag 见文件头的 SLVSwitchTag：10 启用 / 11 循环 / 12 镜像 / 13 音频 / 14 实拍时刻 / 15 日志
+    if (sw.tag == SLVSwitchTagLog) {
+        // 0.3.52：只是记不记日志，跟帧源无关，不用 SLVCamReloadAll
+        SLVLogSetEnabled(sw.on);
+        SLVToast(sw.on ? @"日志：开" : @"日志：关");
+        return;
+    }
     if (sw.tag == SLVSwitchTagAudio) {
         SLVSetBool(kSLCamAudioKey, sw.on);
         SLVCamReloadAll();

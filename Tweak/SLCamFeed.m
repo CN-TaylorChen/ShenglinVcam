@@ -1826,9 +1826,10 @@ BOOL SLVCamIsMomoProcess(void) {
     _audioCalls++;
     if (_audioCalls % 3000 == 0 && _audioBytesPerSecond > 0) {
         NSUInteger mine = _audioPCM.length - *cursor;
-        SLVLog(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包 · 消费者 %d 个",
-              (unsigned long)(mine * 1000 / _audioBytesPerSecond),
-              (unsigned long)_audioDropped, (unsigned long)_audioCalls, _audioConsumerCount);
+        // 0.3.52：这是音频实时线程（AudioUnitRender 里调进来的），走 RT 版
+        SLVLogRT(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包 · 消费者 %d 个",
+                (unsigned long)(mine * 1000 / _audioBytesPerSecond),
+                (unsigned long)_audioDropped, (unsigned long)_audioCalls, _audioConsumerCount);
     }
 
     BOOL hasAudio = _assetHasAudio;

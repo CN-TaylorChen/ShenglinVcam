@@ -23,6 +23,41 @@ static int gSLLogPathIndex = -1;
 static int gSLLogWriteFail = 0;
 static int gSLLogLastErrno = 0;
 
+NSString *const SLVLogEnabledKey = @"SLCamLogEnabled";
+
+// ---- 0.3.52：日志开关 ----
+//
+// -1 = 还没读过；0 = 关；1 = 开。
+// 用 int8_t 而不是 BOOL + 另一个 loaded 标志，是为了让「读一次」这件事也是单变量的：
+// 音频线程上读这个值不能加锁（SLVLogOn 被 SLVLogRT 每几秒调一次，而且是在采集回调里）。
+static int8_t gSLOnState = -1;
+
+BOOL SLVLogOn(void) {
+    if (gSLOnState >= 0) return gSLOnState == 1;
+    os_unfair_lock_lock(&gSLLogLock);
+    if (gSLOnState < 0) {
+        id v = [[NSUserDefaults standardUserDefaults] objectForKey:SLVLogEnabledKey];
+        // 没有这个键 = 从没动过开关 = 按老行为一直记
+        gSLOnState = (v == nil || [v boolValue]) ? 1 : 0;
+    }
+    os_unfair_lock_unlock(&gSLLogLock);
+    return gSLOnState == 1;
+}
+
+void SLVLogSetEnabled(BOOL on) {
+    os_unfair_lock_lock(&gSLLogLock);
+    gSLOnState = on ? 1 : 0;
+    os_unfair_lock_unlock(&gSLLogLock);
+
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setBool:on forKey:SLVLogEnabledKey];
+    [d synchronize];
+
+    // 关掉这一下之后就别再往文件里追加了，但历史内容保留 ——
+    // 用户关的是「继续记」，不是「把之前查问题的证据删掉」。
+    if (on) SLVLogWrite(@"=== 日志已开启 ===");
+}
+
 /// 候选路径按「跨 App 共享 → App 沙盒 → 临时目录」排。
 /// 共享那条是全设备一份，所有 App 的日志都落在一起，排查时不用逐个容器翻。
 static NSArray<NSString *> *SLVLogCandidates(void) {
@@ -234,19 +269,43 @@ static BOOL SLVAppendLine(NSString *line) {
     return NO;
 }
 
-void SLVLogWrite(NSString *line) {
-    if (!line.length) return;
+/// 落盘队列：串行 + 低优先级。日志永远不该跟画面/音频抢 CPU。
+static dispatch_queue_t SLVLogQueue(void) {
     static dispatch_queue_t q = NULL;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ q = dispatch_queue_create("com.shenglin.vcam.log", DISPATCH_QUEUE_SERIAL); });
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.shenglin.vcam.log", DISPATCH_QUEUE_SERIAL);
+        dispatch_set_target_queue(q, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    });
+    return q;
+}
 
-    NSString *full = [NSString stringWithFormat:@"%@ %@\n", SLVTimestamp(), line];
-    dispatch_async(q, ^{
-        if (!SLVAppendLine(full)) {
+/// 入队。syslogOnFail = YES 时才在写失败时补一条 NSLog。
+static void SLVEnqueue(NSString *line, BOOL syslogOnFail) {
+    if (!line.length || !SLVLogOn()) return;
+
+    dispatch_async(SLVLogQueue(), ^{
+        // 0.3.52：时间戳挪进队列里取。
+        //
+        // 原来这行在 dispatch_async 之前，也就是在**调用线程**上跑；而这条日志最热的时候
+        // 正好是音频渲染回调（20ms 一包）。NSDateFormatter 单次 30~150μs，首次还要加载
+        // locale 数据（几十毫秒）—— 那一下足够把一包音频挤掉。现在整段都在后台队列里。
+        NSString *full = [NSString stringWithFormat:@"%@ %@\n", SLVTimestamp(), line];
+        if (!SLVAppendLine(full) && syslogOnFail) {
             // 四条候选全军覆没：至少留在系统日志里，Console 还能捞到
             NSLog(@"SL-VCAM(log fail %d): %@", gSLLogLastErrno, full);
         }
     });
+}
+
+void SLVLogWrite(NSString *line) {
+    SLVEnqueue(line, YES);
+}
+
+void SLVLogWriteRT(NSString *line) {
+    // 写失败也不 NSLog：这条路是给音频实时线程用的，
+    // 一旦写不进去就往 syslog 打，等于把刚躲开的阻塞又请回来了。
+    SLVEnqueue(line, NO);
 }
 
 NSString *SLVLogDiagnostics(void) {
@@ -260,6 +319,11 @@ NSString *SLVLogDiagnostics(void) {
         : (size >= 1024 ? [NSString stringWithFormat:@"%.1f KB", size / 1024.0]
                         : [NSString stringWithFormat:@"%llu B", size]);
 
+    // 0.3.52：关掉开关后别再说「写入正常」—— 那会让人以为日志在长，
+    // 实际翻到下面全是旧的。直接说关着，顺带保留文件大小。
+    if (!SLVLogOn()) {
+        return [NSString stringWithFormat:@"已关闭 · 文件 %@（历史内容仍可查看）", sizeText];
+    }
     if (gSLLogWriteFail > 0) {
         return [NSString stringWithFormat:@"写失败 %d 次 · errno %d · %@",
                 gSLLogWriteFail, gSLLogLastErrno, sizeText];
