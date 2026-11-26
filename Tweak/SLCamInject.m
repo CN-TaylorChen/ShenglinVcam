@@ -264,6 +264,25 @@ static void SLVCamLogAttachmentKeys(CMSampleBufferRef sbuf, CMFormatDescriptionR
     if (atts) CFRelease(atts);
 }
 
+// 0.3.40：注入心跳。
+//
+// 「替换中」只说明钩子挂上了，说明不了这一帧到底有没有换成素材。
+// 三个计数一分开，下次看日志就知道是哪种情况：
+//   原地 = 写进宿主自己的 buffer，成功        → 交付层没问题
+//   换帧 = 拿素材自己的 buffer 零拷贝        → 也没问题
+//   放行 = 这一帧没换上，交回真实摄像头画面  → 这里一旦有数，画面就会「露真摄像头」
+static int sSLCamInPlaceFrames = 0;
+static int sSLCamSwappedFrames = 0;
+static int sSLCamPassedFrames  = 0;
+
+static void SLVCamInjectHeartbeat(void) {
+    int n = sSLCamInPlaceFrames + sSLCamSwappedFrames + sSLCamPassedFrames;
+    if (n > 0 && n % 150 == 0) {
+        SLVLog(@"注入: 心跳 原地=%d 换帧=%d 放行=%d",
+               sSLCamInPlaceFrames, sSLCamSwappedFrames, sSLCamPassedFrames);
+    }
+}
+
 static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf) {
     IMP orig = SLVCamOriginalIMP(self, _cmd);
 
@@ -286,6 +305,10 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
 
     CMMediaType mediaType = CMFormatDescriptionGetMediaType(fmt);
     CMSampleBufferRef fake = NULL;
+
+    // 0.3.40：这一帧是不是「原地改写宿主自己的 buffer」。
+    // 是的话不造新 sample buffer，最后把宿主原装那个 sbuf 原样放行。
+    BOOL passOriginal = NO;
 
     if (mediaType == kCMMediaType_Video) {
         CVImageBufferRef img = CMSampleBufferGetImageBuffer(sbuf);
@@ -352,8 +375,23 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
             // 是「buffer 是谁造的」本身：宿主把 IOSurface 拿去建 Metal 纹理，
             // 我们 CVPixelBufferCreate 出来的那种排布它读不出正确内容，画出来就是绿的。
             // 现在直接写进宿主自己的 buffer，指针 / 格式 / 属性全是它熟悉的那个。
+            //
+            // 原地改写的这一帧，别再造 sample buffer。
+            //
+            // `copyFrameForHostBuffer:` 返回的指针等于 img，含义就是「素材已经写进你给
+            // 的这个 buffer 了」。原来这里仍然走 CMSampleBufferCreateReadyWithImageBuffer
+            // 另造一个 sbuf 交下去 —— 像素是对的，但新 sbuf 是「裸」的：
+            // 没有 sample 附件数组、duration 被归一成 1/30、dts 被置成 invalid。
+            // 写文件那条路（appendSampleBuffer）不挑这些，陌陌「实拍时刻」的实时取景器挑 ——
+            // 它拿到这一帧画不出来，界面上就是一整块纯灰（0.3.39 的现象）。
+            //
+            // buffer 本来就是宿主自己的，那就把**宿主原装的 sbuf** 原样交回去：
+            // 时间戳、附件、fmt、所有权全是它熟悉的那份，链路上没有一个新对象。
             CVPixelBufferRef frame = [feed copyFrameForHostBuffer:img];
-            if (frame) {
+            if (frame == img) {
+                passOriginal = YES;
+                CVPixelBufferRelease(frame);
+            } else if (frame) {
                 // 优先沿用宿主的 fmt（下游的编码器/写入器都按它配置，换了会出岔子）。
                 // 只有当假帧确实与它不匹配时，才退而求其次自建一个 —— 自建的那个
                 // 必须把宿主的 extensions 带过去，否则宿主读扩展拿到 NULL 会崩。
@@ -453,6 +491,20 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
                 }
                 if (ownFmt) CFRelease(ownFmt);
                 CVPixelBufferRelease(frame);
+                sSLCamSwappedFrames++;
+                SLVCamInjectHeartbeat();
+            } else {
+                // 这一帧没换上：素材还没解出帧、或写进宿主 buffer 失败。
+                // 两种情况都放行真画面（绝不黑屏），但日志必须分开能看出来 ——
+                // 「素材帧有尺寸」就说明是写失败，没尺寸是还没解出来。
+                sSLCamPassedFrames++;
+                if (sSLCamPassedFrames <= 2 || sSLCamPassedFrames % 300 == 0) {
+                    CGSize ls = [feed latestFrameSize];
+                    SLVLog(@"注入: 这一帧没换上，放行真画面 · 素材帧=%.0fx%.0f 宿主=%zux%zu · 累计 %d 帧",
+                           ls.width, ls.height, (size_t)size.width, (size_t)size.height,
+                           sSLCamPassedFrames);
+                }
+                SLVCamInjectHeartbeat();
             }
         }
     } else if (mediaType == kCMMediaType_Audio) {
@@ -530,6 +582,22 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
                 SLVLog(@"录制: VideoDataOutput 读连接失败（%@）", e.reason ?: @"?");
             }
         }
+    }
+
+    if (passOriginal) {
+        // 素材已经写进宿主自己的 buffer 了。把**它原装那个 sample buffer** 交回去，
+        // 不新建、不改时间戳、不动附件 —— 实时取景器（陌陌实拍时刻）就是喂这种帧的。
+        if (sSLCamInPlaceFrames == 0) {
+            CVPixelBufferRef f = CMSampleBufferGetImageBuffer(sbuf);
+            SLVLog(@"注入: 首个原地改写帧按宿主原 sbuf 放行 %zux%zu",
+                   f ? (size_t)CVPixelBufferGetWidth(f) : 0,
+                   f ? (size_t)CVPixelBufferGetHeight(f) : 0);
+        }
+        sSLCamInPlaceFrames++;
+        SLVCamInjectHeartbeat();
+        SLVCamFeedPreview(sbuf);
+        ((SLVProcessSampleBufferFn)orig)(self, _cmd, sbuf);
+        return;
     }
 
     if (fake) {
@@ -1030,6 +1098,19 @@ static NSHashTable *gSLPreviewLayers = nil;   // 弱引用：预览层归 App �
 static os_unfair_lock gSLPreviewLock = OS_UNFAIR_LOCK_INIT;   // 建层在主线程、喂帧在采集线程
 static IMP gSLPreviewInitOrig = NULL;
 static IMP gSLPreviewSetSessionOrig = NULL;
+
+// 0.3.40：预览层还有两个入口没挂上。
+//
+// `-initWithSession:` 和 `-setSession:` 只是最常用的两条。`-initWithSession:connection:`
+// 是另一条独立的初始化（不少 SDK 喜欢用它，因为能顺手把 connection 一起定下），
+// 类方法 `+layerWithSession:` / `+layerWithSessionWithNoConnection:` 则直接不经 init 路径。
+// 这些全都漏着的时候表现很隐蔽：**进程里明明有预览层，日志里「预览」一行都不会有**，
+// 我们也就不会去盖它 —— 陌陌「实拍时刻」取景框全灰就是这种「看起来像没画」的样子。
+// 四个入口都挂上，至少能保证「有预览层就一定知道」。
+static IMP gSLPreviewInitConnOrig = NULL;
+static IMP gSLPreviewLayerWithSessionOrig = NULL;
+static IMP gSLPreviewLayerNoConnOrig = NULL;
+
 static BOOL gSLPreviewMounted = NO;
 static BOOL gSLPreviewFedLogged = NO;
 static CFAbsoluteTime gSLPreviewLastSync = 0.0;
@@ -1051,6 +1132,30 @@ static void SLVCamPreviewSetSession(id self, SEL _cmd, AVCaptureSession *session
         (void (*)(id, SEL, AVCaptureSession *))gSLPreviewSetSessionOrig;
     if (fn) fn(self, _cmd, session);
     SLVCamRegisterPreviewLayer(self);
+}
+
+// 0.3.40：其余三个入口。逻辑跟上面两个一样 —— 先让原实现跑，拿到对象就登记。
+static id SLVCamPreviewInitWithSessionConnection(id self, SEL _cmd,
+                                                 AVCaptureSession *session,
+                                                 AVCaptureConnection *conn) {
+    id (*fn)(id, SEL, id, id) = (id (*)(id, SEL, id, id))gSLPreviewInitConnOrig;
+    id r = fn ? fn(self, _cmd, session, conn) : nil;
+    if (r) SLVCamRegisterPreviewLayer(r);
+    return r;
+}
+
+static id SLVCamPreviewLayerWithSession(id self, SEL _cmd, AVCaptureSession *session) {
+    id (*fn)(id, SEL, id) = (id (*)(id, SEL, id))gSLPreviewLayerWithSessionOrig;
+    id r = fn ? fn(self, _cmd, session) : nil;
+    if (r) SLVCamRegisterPreviewLayer(r);
+    return r;
+}
+
+static id SLVCamPreviewLayerWithNoConnection(id self, SEL _cmd, AVCaptureSession *session) {
+    id (*fn)(id, SEL, id) = (id (*)(id, SEL, id))gSLPreviewLayerNoConnOrig;
+    id r = fn ? fn(self, _cmd, session) : nil;
+    if (r) SLVCamRegisterPreviewLayer(r);
+    return r;
 }
 
 static void SLVCamRegisterPreviewLayer(id layer) {
@@ -1533,8 +1638,20 @@ static void SLVCamInstallPreviewLayerHook(void) {
                   (IMP)SLVCamPreviewInitWithSession, &gSLPreviewInitOrig);
     SLVCamHookSel(cls, NSSelectorFromString(@"setSession:"),
                   (IMP)SLVCamPreviewSetSession, &gSLPreviewSetSessionOrig);
-    SLVLog(@"预览: 预览层接管已布点 init=%d setSession=%d",
-          gSLPreviewInitOrig != nil, gSLPreviewSetSessionOrig != nil);
+
+    // 0.3.40：另外三个入口。类方法挂在元类上，`class_getInstanceMethod` 才能找到。
+    SLVCamHookSel(cls, NSSelectorFromString(@"initWithSession:connection:"),
+                  (IMP)SLVCamPreviewInitWithSessionConnection, &gSLPreviewInitConnOrig);
+    Class meta = object_getClass(cls);
+    SLVCamHookSel(meta, NSSelectorFromString(@"layerWithSession:"),
+                  (IMP)SLVCamPreviewLayerWithSession, &gSLPreviewLayerWithSessionOrig);
+    SLVCamHookSel(meta, NSSelectorFromString(@"layerWithSessionWithNoConnection:"),
+                  (IMP)SLVCamPreviewLayerWithNoConnection, &gSLPreviewLayerNoConnOrig);
+
+    SLVLog(@"预览: 预览层接管已布点 init=%d setSession=%d initConn=%d layer=%d layerNoConn=%d",
+          gSLPreviewInitOrig != nil, gSLPreviewSetSessionOrig != nil,
+          gSLPreviewInitConnOrig != nil, gSLPreviewLayerWithSessionOrig != nil,
+          gSLPreviewLayerNoConnOrig != nil);
 }
 
 void SLVCamInstallHooks(void) {

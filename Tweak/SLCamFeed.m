@@ -195,6 +195,32 @@ static void SLVTagBGRAFrame(CVPixelBufferRef pb) {
     CVBufferSetAttachments(pb, (__bridge CFDictionaryRef)atts, kCVAttachmentMode_ShouldPropagate);
 }
 
+/// 把 BGRA 帧的 alpha 全部压成 255（不透明）。
+///
+/// 为什么必须做：解码出来的 BGRA 视频帧，alpha 通道经常是**没填的 0**。
+/// 写文件那条路（编码器直接把 BGRA 收下来，alpha 丢掉）所以一直没暴露；
+/// 而**实时画到屏幕上**的那条路是按 alpha 混合的 —— alpha=0 就等于整幅透明，
+/// 界面上看到的只有它底下的背景色（陌陌「实拍时刻」那块纯灰就是这么来的：
+/// 素材明明写进去了，屏幕上却什么都看不见）。
+///
+/// 用 `|= 0xFF000000` 一遍过：已经是不透明的地方值不变，编译器会按 64 位向量化，
+/// 1080x1920 也就 1ms 上下。只处理 32BGRA，别的格式 alpha 位不在这个位置。
+static void SLVForceOpaqueBGRA(CVPixelBufferRef pb) {
+    if (!pb) return;
+    if (CVPixelBufferGetPixelFormatType(pb) != kCVPixelFormatType_32BGRA) return;
+    if (CVPixelBufferLockBaseAddress(pb, 0) != kCVReturnSuccess) return;
+
+    uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
+    if (base) {
+        size_t rb = CVPixelBufferGetBytesPerRow(pb);
+        size_t h  = CVPixelBufferGetHeight(pb);
+        uint32_t *p = (uint32_t *)base;
+        size_t n = (rb / 4) * h;              // 整块按 4 字节一个像素连着扫，跨度不变
+        for (size_t i = 0; i < n; i++) p[i] |= 0xFF000000u;
+    }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+}
+
 /// 把一帧中心像素的 BGRA 打出来。
 ///
 /// 这是为了分清「我们渲错了」和「宿主解释错了」：
@@ -1467,6 +1493,22 @@ BOOL SLVCamIsMomoProcess(void) {
                     bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)
                 colorSpace:cs];
         CGColorSpaceRelease(cs);
+
+        // 0.3.40：alpha 补成不透明。视频素材解出来的 BGRA 常常 alpha=0，
+        // 编码写入文件看不出问题，**实时取景器按 alpha 混合就整幅透明**。
+        SLVForceOpaqueBGRA(dst);
+
+        // 写完之后**读一次 dst 的中心像素**。
+        //
+        // 「写成功」只是说 CI 没报错，不代表宿主画得出来：alpha 全 0、色彩附件缺失
+        // 这类问题在这里就已经定死了，而要等到看录屏才发现。只在尺寸/格式变化时打一次。
+        static NSString *sLastWriteLog = nil;
+        NSString *writeKey = [NSString stringWithFormat:@"%zux%zu:%u:q%d", w, h,
+                              (unsigned)dpf, squareCrop ? 1 : 0];
+        if (![sLastWriteLog isEqualToString:writeKey]) {
+            sLastWriteLog = [writeKey copy];
+            SLVLogCenterPixel(dst, @"注入 写帧后");
+        }
         return YES;
     }
 
