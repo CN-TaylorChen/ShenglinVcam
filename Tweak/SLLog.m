@@ -371,7 +371,8 @@ static NSString *SLVDecodeUTF8(NSData *d) {
     NSArray<NSString *> *all = [s componentsSeparatedByString:@"\n"];
     NSInteger n = (NSInteger)all.count;
     NSInteger start = (lines > 0 && n > lines) ? n - lines : 0;
-    return [all subarrayWithRange:NSMakeRange((NSUInteger)start, (NSUInteger)(n - start)) componentsJoinedByString:@"\n"];
+    NSArray<NSString *> *part = [all subarrayWithRange:NSMakeRange((NSUInteger)start, (NSUInteger)(n - start))];
+    return [part componentsJoinedByString:@"\n"];
 }
 
 + (void)clear {
