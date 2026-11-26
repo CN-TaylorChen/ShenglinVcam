@@ -6,6 +6,9 @@
 /// 写一行日志（内部已加时间戳）
 void SLVLogWrite(NSString *line);
 
+/// 当前实际选中的日志文件路径（启动时把它打进第一行，避免「日志是空的」还要猜写在哪儿）
+NSString *SLVLogCurrentPath(void);
+
 #define SLVLog(fmt, ...) do { \
     NSString *__sl_m = [NSString stringWithFormat:(fmt), ##__VA_ARGS__]; \
     NSLog(@"SL-VCAM: %@", __sl_m); \

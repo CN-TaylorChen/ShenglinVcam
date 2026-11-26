@@ -1,3 +1,60 @@
+## 0.3.46 —— 抖音里日志是空白的：先落日志，再判目标
+
+### 症状
+
+抖音闪退修好了，但抖音里的 `slvcam.log` 是**空文件**（陌陌里正常，有内容）。
+
+### 两个原因叠在一起
+
+**一、不是目标进程就 return，一个字都不写**
+
+```objc
+%ctor {
+    if (![SLVTargetRegistry isTargetProcess]) return;   // ← 静默返回
+    SLVLog(@"=== ShenglinVcam v%@ · %@ ===", ...);      // ← 日志在这之后
+```
+
+日志写在判定**之后**。于是「没注入」「被白名单挡掉」「注入了但没干活」这三种情况
+在日志上完全一样：一片空白。抖音这边到底是哪种，无从判断。
+
+**二、沙盒那条路径建得出来、写不进去**
+
+选路径时，前两个绝对路径失败后会落到沙盒 Documents，但代码**建完文件就直接用**，
+没有回验：
+
+```objc
+p = [dir stringByAppendingPathComponent:@"slvcam.log"];
+if (![fm fileExistsAtPath:p]) [fm createFileAtPath:p contents:nil attributes:nil];
+// ← 到这里就结束了，文件能不能真的写入没人确认
+```
+
+文件建得出来不代表写得进去（数据保护、宿主自定义容器都会让写入静默失败），
+结果就是一个 0 字节的空文件躺在那儿。
+
+### 改法
+
+1. **横幅提到判定之前**：任何非 `com.apple.*` 进程启动时先写一行，带版本、bundle id、
+   pid 和**日志实际落盘路径**。被白名单挡掉时再补一行
+   `非目标进程，本次不装钩子（白名单 …）` —— 一眼分清是哪种情况。
+2. **路径要回验**：建完文件后确认 `isWritableFileAtPath`，再真的开一次写句柄，
+   都通过了才算数。
+3. **多一层兜底**：候选路径变成四条 ——
+   `/var/mobile/Documents/…` → `/var/jb/var/mobile/Documents/…` → 沙盒 `Documents/…`
+   → **`NSTemporaryDirectory()/ShenglinVcam/slvcam.log`**（临时目录任何 App 都写得进去，
+   宿主就算锁了 Documents 也还有这一层）。
+
+### 装上之后
+
+抖音启动后第一行应该是：
+
+```
+=== ShenglinVcam v0.3.46 · com.ss.iphone.ugc.Aweme · pid 1234 · 日志 /…/Documents/ShenglinVcam/slvcam.log ===
+```
+
+这行自带路径，不用再问「日志到底写哪儿去了」。
+
+---
+
 ## 0.3.45 —— 修抖音评论区闪退：口令不再 hook 宿主的 setText:
 
 ### 症状

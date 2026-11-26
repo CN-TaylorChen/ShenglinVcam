@@ -13,6 +13,7 @@
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <unistd.h>
 #import "SLFloatingBall.h"
 #import "SLCodeWord.h"
 #import "SLCamBridge.h"
@@ -21,7 +22,7 @@
 #import "SLTarget.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.45"
+#define SLVVersion @"0.3.46"
 
 /// 设置页「运行日志」那行右侧的钩子状态（SLVLogViewController.h 里声明的）
 NSString *SLVHookStatusSummary(void) {
@@ -47,10 +48,29 @@ NSString *SLVHookStateShort(void) {
 
 %ctor {
     @autoreleasepool {
-        if (![SLVTargetRegistry isTargetProcess]) return;
-
+        // ── 先落日志，再做判定 ──
+        // 0.3.45 及以前这里是反过来的：不是目标进程就直接 return，一个字都不写。
+        // 结果在抖音里日志是空的，分不清「没注入」「被白名单挡掉」「注入了但没干活」。
+        // 现在任何非 com.apple.* 进程都会先写一行横幅，带上 pid 和日志实际落盘路径。
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        SLVLog(@"=== ShenglinVcam v%@ · %@ ===", SLVVersion, bid ?: @"?");
+        BOOL appleSys = bid.length && [bid hasPrefix:@"com.apple."]
+                        && ![bid isEqualToString:@"com.apple.camera"];
+
+        if (!appleSys) {
+            SLVLog(@"=== ShenglinVcam v%@ · %@ · pid %d · 日志 %@ ===",
+                   SLVVersion, bid ?: @"?", (int)getpid(), SLVLogCurrentPath());
+
+            if (![SLVTargetRegistry isTargetProcess]) {
+                NSArray *list = [SLVTargetRegistry targetBundleIDs];
+                SLVLog(@"非目标进程，本次不装钩子（白名单 %@）",
+                       list.count ? [list componentsJoinedByString:@","] : @"空");
+                return;
+            }
+        } else {
+            if (![SLVTargetRegistry isTargetProcess]) return;
+            SLVLog(@"=== ShenglinVcam v%@ · %@ · pid %d · 日志 %@ ===",
+                   SLVVersion, bid ?: @"?", (int)getpid(), SLVLogCurrentPath());
+        }
 
         // 注入层先装（底包是空实现，套用时在这里接 AVCapture 的钩子）
         SLVCamInstallHooks();

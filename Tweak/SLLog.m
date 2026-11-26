@@ -3,34 +3,55 @@
 #define SLV_LOG_MAX_BYTES  (1024 * 1024)
 #define SLV_LOG_KEEP_BYTES (512 * 1024)
 
+/// 目录不存在就建、文件不存在就建，最后**确认真的能写**再返回 YES。
+///
+/// 0.3.45 及以前，沙盒那条路径是「建完直接用」，没有回验 —— 建得出来不代表写得进去
+/// （数据保护、宿主自定义容器权限都会让写入静默失败），表现就是「日志文件是空的」。
+static BOOL SLVEnsureWritableFile(NSString *path, NSFileManager *fm) {
+    if (!path.length) return NO;
+    NSString *dir = [path stringByDeletingLastPathComponent];
+    if (![fm fileExistsAtPath:dir]) {
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
+    if (![fm isWritableFileAtPath:path]) return NO;
+
+    // 能不能真的打开写句柄 —— 属性写着可写、实际被数据保护拦下的情况就挡在这里
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) return NO;
+    [fh seekToEndOfFile];
+    [fh closeFile];
+    return YES;
+}
+
 static NSString *SLVLogPath(void) {
     static NSString *p = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSFileManager *fm = [NSFileManager defaultManager];
-        NSArray<NSString *> *cands = @[
+
+        NSMutableArray<NSString *> *cands = [NSMutableArray arrayWithObjects:
             @"/var/mobile/Documents/ShenglinVcam/slvcam.log",
-            @"/var/jb/var/mobile/Documents/ShenglinVcam/slvcam.log"
-        ];
+            @"/var/jb/var/mobile/Documents/ShenglinVcam/slvcam.log", nil];
+
+        // 沙盒 Documents：绝大多数越狱设备上这里才是真正可写的位置
+        NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        if (doc.length) [cands addObject:[doc stringByAppendingPathComponent:@"ShenglinVcam/slvcam.log"]];
+
+        // 临时目录：任何 App 都写得进去，宿主就算把 Documents 锁了也还有这一层
+        NSString *tmp = NSTemporaryDirectory();
+        if (tmp.length) [cands addObject:[tmp stringByAppendingPathComponent:@"ShenglinVcam/slvcam.log"]];
+
         for (NSString *c in cands) {
-            NSString *dir = [c stringByDeletingLastPathComponent];
-            if (![fm fileExistsAtPath:dir]) {
-                [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-            }
-            if (![fm fileExistsAtPath:c]) [fm createFileAtPath:c contents:nil attributes:nil];
-            if ([fm isWritableFileAtPath:c]) { p = c; break; }
+            if (SLVEnsureWritableFile(c, fm)) { p = c; break; }
         }
-        if (!p) {
-            NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-            NSString *dir = [doc stringByAppendingPathComponent:@"ShenglinVcam"];
-            if (![fm fileExistsAtPath:dir]) {
-                [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-            }
-            p = [dir stringByAppendingPathComponent:@"slvcam.log"];
-            if (![fm fileExistsAtPath:p]) [fm createFileAtPath:p contents:nil attributes:nil];
-        }
+        if (!p) p = @"/tmp/shenglin_vcam.log";
     });
     return p;
+}
+
+NSString *SLVLogCurrentPath(void) {
+    return SLVLogPath();
 }
 
 static NSString *SLVTimestamp(void) {
