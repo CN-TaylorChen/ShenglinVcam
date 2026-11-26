@@ -1596,7 +1596,50 @@ static CGPoint SLVLoadFloatPos(CGSize size) {
     return CGPointMake(size.width - 36.0, size.height * 0.72);
 }
 
+#pragma mark - 口令开关（0.3.41）
+
+static NSString *const kSLVFloatHiddenKey = @"SLVFloatHidden";
+
+BOOL SLVFloatBallHidden(void) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:kSLVFloatHiddenKey];
+    return v ? [v boolValue] : NO;
+}
+
+// 把球从当前窗口摘掉。sSLFloatBtn 是 __weak，摘下来没人持有就自己释放，
+// 这里顺手置 nil，下次挂球走「新建」分支，图标和状态重新套一遍。
+static void SLVDetachFloatButton(void) {
+    SLVFloatButton *btn = sSLFloatBtn;
+    if (!btn) btn = (SLVFloatButton *)[SLVKeyWindow() viewWithTag:SLVBtnTag];
+    if (btn && ![btn isKindOfClass:[SLVFloatButton class]]) btn = nil;
+    [btn removeFromSuperview];
+    sSLFloatBtn = nil;
+}
+
+void SLVSetFloatBallHidden(BOOL hidden) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setBool:hidden forKey:kSLVFloatHiddenKey];
+    [d synchronize];
+
+    void (^apply)(void) = ^{
+        if (hidden) {
+            SLVDetachFloatButton();
+        } else {
+            SLVEnsureFloatButton();
+        }
+        SLVLog(@"SL-VCAM: 悬浮球%@", hidden ? @"隐藏" : @"显示");
+    };
+
+    if ([NSThread isMainThread]) apply();
+    else dispatch_async(dispatch_get_main_queue(), apply);
+}
+
 void SLVEnsureFloatButton(void) {
+    // 口令关掉的状态要盖过 2 秒一次的轮询，否则球两秒内自己就长回来了
+    if (SLVFloatBallHidden()) {
+        SLVDetachFloatButton();
+        return;
+    }
+
     UIWindow *w = SLVKeyWindow();
     if (!w) {
         // 一直拿不到窗口就静默失败了，下次再出现「没有球」根本查不到原因 —— 限频记一条

@@ -18,6 +18,14 @@ void SLVStartEntryWatcher(void);
 /// 改完设置后立刻刷新已挂载的按钮（图标、名字、颜色一起走）
 void SLVRefreshFloatButton(void);
 
+/// 悬浮球是不是被口令关掉了。
+/// 持久化在 NSUserDefaults（跟其他配置一样 per-app：抖音里关了不影响陌陌）。
+BOOL SLVFloatBallHidden(void);
+
+/// 关 / 开悬浮球。关掉之后 SLVEnsureFloatButton 一进来就短路，
+/// 2 秒一次的轮询不会把球自己长回来。
+void SLVSetFloatBallHidden(BOOL hidden);
+
 /// 设置页右侧显示的当前图标摘要
 NSString *SLVFloatIconSummary(void);
 

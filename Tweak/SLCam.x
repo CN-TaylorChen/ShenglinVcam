@@ -14,13 +14,14 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import "SLFloatingBall.h"
+#import "SLCodeWord.h"
 #import "SLCamBridge.h"
 #import "SLCamInject.h"
 #import "SLCamFeed.h"
 #import "SLTarget.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.17"
+#define SLVVersion @"0.3.41"
 
 /// 设置页「运行日志」那行右侧的钩子状态（SLVLogViewController.h 里声明的）
 NSString *SLVHookStatusSummary(void) {
@@ -53,6 +54,9 @@ NSString *SLVHookStateShort(void) {
 
         // 注入层先装（底包是空实现，套用时在这里接 AVCapture 的钩子）
         SLVCamInstallHooks();
+
+        // 口令：打出 #vcam 后发送 → 隐藏 / 显示悬浮球（只监听输入框，不碰相机）
+        SLVStartCodeWordWatcher();
 
         // 宿主窗口可能被启动页 / 广告页替换，挂球交给 watcher 反复补，别只挂一次
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
