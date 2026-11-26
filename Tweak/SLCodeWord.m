@@ -301,7 +301,7 @@ static void SLVWindowSendEvent(id self, SEL _cmd, UIEvent *event) {
             if (t.window != (UIWindow *)self) continue;
             if (!SLVCodeWordIsCode(SLVCodeWordTextOf(input))) continue;
 
-            UIView *hit = [(UIWindow *)self hitTest:[t locationInWindow] withEvent:event];
+            UIView *hit = [(UIWindow *)self hitTest:[t locationInView:(UIView *)self] withEvent:event];
             if (!hit) continue;
             if (!SLVCodeWordRectLooksLikeSendButton(hit, input)) {
                 continue;
