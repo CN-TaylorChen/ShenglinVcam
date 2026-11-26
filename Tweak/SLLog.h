@@ -7,6 +7,10 @@
 //   <App 沙盒>/tmp/ShenglinVcam/slvcam.log
 //   /tmp/shenglin-vcam.log
 // 运行中写入失败会自动换下一条，并把 errno 记在诊断串里。
+//
+// 0.3.48：读日志改成「只读尾部 + 行首对齐 + 宽松解码」。
+// 之前是整份读、整份按 UTF-8 解，文件开头只要有一个坏字节就整份解不出来，
+// 页面全白但诊断行还报「写入正常」—— 坏字节的来源就是超过 1MB 时按 512KB 硬截。
 
 #import <Foundation/Foundation.h>
 
@@ -28,6 +32,7 @@ NSString *SLVLogDiagnostics(void);
 @interface SLVLog : NSObject
 + (NSString *)filePath;
 + (NSString *)diagnostics;
++ (unsigned long long)fileSize;   // 0.3.48：日志页用它区分「真没内容」和「有内容但读不出来」
 + (NSString *)tailLines:(NSInteger)lines;
 + (void)clear;
 @end

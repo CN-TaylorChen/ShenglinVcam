@@ -169,9 +169,27 @@
 - (void)sl_reload {
     [self sl_refreshStatus];
 
-    self.tv.text = [SLVLog tailLines:400] ?: @"(暂无日志)";
-    if (self.tv.text.length > 1) {
+    NSString *tail = nil;
+    @try { tail = [SLVLog tailLines:400]; } @catch (NSException *e) { tail = nil; }
+
+    if (tail.length) {
+        self.tv.text = tail;
         [self.tv scrollRangeToVisible:NSMakeRange(self.tv.text.length - 1, 1)];
+        return;
+    }
+
+    // 0.3.48：读不出来时必须说清楚是「没写进去」还是「写了但读不出来」。
+    // 之前一律显示空白，"写入正常 · 940.8 KB" 和一片白同屏出现，根本没法判断。
+    unsigned long long size = 0;
+    @try { size = [SLVLog fileSize]; } @catch (NSException *e) { size = 0; }
+    if (size > 0) {
+        self.tv.text = [NSString stringWithFormat:
+                        @"(文件有 %llu 字节，但没读出可显示的内容)\n"
+                        @"路径：%@\n"
+                        @"点右上角「复制」，把这段和诊断行一起发出去。", size,
+                        [SLVLog filePath] ?: @"(不可写)"];
+    } else {
+        self.tv.text = @"(暂无日志)";
     }
 }
 

@@ -133,16 +133,62 @@ static NSString *SLVTimestamp(void) {
     return [fmt stringFromDate:[NSDate date]];
 }
 
+// 0.3.48：切点必须落在「行首」，而且必须是合法 UTF-8 的起点。
+//
+// 老实现直接从 end-512KB 硬切，碰上中文（3 字节）就会把一个字切成两半，
+// 于是整个文件的第一行就是非法 UTF-8 —— 之后不管写进去多少行，
+// 整份文件都解不出来：initWithData:NSUTF8StringEncoding 返回 nil，
+// 日志页一个字都显示不了，但诊断行照样报「写入正常 · 940.8 KB」。
+// 陌陌那边日志没长到 1MB、从没触发过截断，所以一直正常。
 static void SLVTruncateIfNeeded(NSString *path) {
     struct stat st;
     if (!path.length) return;
-    if (stat(path.fileSystemRepresentation, &st) != 0) return;
+    const char *p = path.fileSystemRepresentation;
+    if (!p || stat(p, &st) != 0) return;
     if (st.st_size <= SLV_LOG_MAX_BYTES) return;
 
-    NSData *d = [NSData dataWithContentsOfFile:path];
-    if (d.length <= SLV_LOG_MAX_BYTES) return;
-    NSData *tail = [d subdataWithRange:NSMakeRange(d.length - SLV_LOG_KEEP_BYTES, SLV_LOG_KEEP_BYTES)];
-    [tail writeToFile:path atomically:YES];
+    off_t from = st.st_size - SLV_LOG_KEEP_BYTES;
+    if (from < 0) from = 0;
+
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) return;
+
+    // 从 from 往后找第一个换行 —— 行首对齐，半截 UTF-8 自然被甩掉。
+    // 最多往后找 64KB；找不到就不截这一轮（宁可文件大一点，也别把可读性搞坏）。
+    off_t cut = -1;
+    char buf[4096];
+    off_t probe = from;
+    while (probe < st.st_size && (probe - from) <= 64 * 1024) {
+        ssize_t g = pread(fd, buf, sizeof(buf), probe);
+        if (g <= 0) break;
+        for (ssize_t i = 0; i < g; i++) {
+            if (buf[i] == '\n') { cut = probe + i + 1; break; }
+        }
+        if (cut >= 0) break;
+        probe += g;
+    }
+    if (cut < 0 || cut >= st.st_size) { close(fd); return; }
+
+    size_t keep = (size_t)(st.st_size - cut);
+    NSMutableData *tail = [NSMutableData dataWithLength:keep];
+    ssize_t r = pread(fd, tail.mutableBytes, keep, cut);
+    close(fd);
+    if (r <= 0) return;
+    tail.length = (NSUInteger)r;
+
+    // 还是走 POSIX 截断写，不用 writeToFile:atomically: —— 后者是「临时文件 + rename」，
+    // 会换掉 inode，正在往里 append 的线程会继续写进已删除的旧 inode，那几行就凭空消失了。
+    int wfd = open(p, O_WRONLY | O_TRUNC);
+    if (wfd < 0) return;
+    const uint8_t *bytes = tail.bytes;
+    size_t total = tail.length, off = 0;
+    while (off < total) {
+        ssize_t n = write(wfd, bytes + off, total - off);
+        if (n > 0) { off += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+    close(wfd);
 }
 
 /// 追加一行。返回 NO 表示这一行最终没落盘。
@@ -221,6 +267,47 @@ NSString *SLVLogDiagnostics(void) {
     return [NSString stringWithFormat:@"写入正常 · %@", sizeText];
 }
 
+static BOOL SLVIsUTF8Cont(uint8_t c) { return (c & 0xC0) == 0x80; }
+
+/// 宽松解码：UTF-8 解不出来时把非法字节换成 '?'，而不是整段返回 nil。
+///
+/// 老代码是 `initWithData:encoding:NSUTF8StringEncoding ?: @""` —— 只要文件里有
+/// 一个坏字节，整份日志就变成空字符串，页面上就是一片白，且没有任何提示。
+/// 日志这种「出问题时才看的文件」绝对不能出现「有问题时反而看不到」。
+static NSString *SLVDecodeUTF8(NSData *d) {
+    if (!d.length) return @"";
+    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if (s) return s;
+
+    const uint8_t *b = d.bytes;
+    NSUInteger n = d.length, i = 0;
+    NSMutableData *out = [NSMutableData dataWithCapacity:n];
+    while (i < n) {
+        uint8_t c = b[i];
+        NSUInteger need = 0;
+        if (c < 0x80) need = 0;
+        else if ((c & 0xE0) == 0xC0) need = 1;
+        else if ((c & 0xF0) == 0xE0) need = 2;
+        else if ((c & 0xF8) == 0xF0) need = 3;
+        else { [out appendBytes:"?" length:1]; i++; continue; }
+
+        BOOL ok = (need == 0) || (i + need < n);
+        if (ok && need > 0) {
+            for (NSUInteger k = 1; k <= need; k++) {
+                if (!SLVIsUTF8Cont(b[i + k])) { ok = NO; break; }
+            }
+        }
+        if (ok) {
+            [out appendBytes:(b + i) length:need + 1];
+            i += need + 1;
+        } else {
+            [out appendBytes:"?" length:1];
+            i++;
+        }
+    }
+    return [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] ?: @"";
+}
+
 @implementation SLVLog
 
 + (NSString *)filePath {
@@ -231,14 +318,60 @@ NSString *SLVLogDiagnostics(void) {
     return SLVLogDiagnostics();
 }
 
++ (unsigned long long)fileSize {
+    NSString *path = SLVLogCurrentPath();
+    struct stat st;
+    if (!path.length) return 0;
+    if (stat(path.fileSystemRepresentation, &st) != 0) return 0;
+    return (unsigned long long)st.st_size;
+}
+
+// 只读文件尾部，不把整份日志读进内存，也不整份解码。
+//
+// 两个作用：
+// 1. 940KB 的文件读 400 行没必要整份加载；
+// 2. 更关键的是容错 —— 从尾部往前读、再跳到第一个换行之后，
+//    文件开头就算是坏掉的半截 UTF-8 也完全不碍事（0.3.48 的空白就是它导致的）。
 + (NSString *)tailLines:(NSInteger)lines {
-    NSData *d = [NSData dataWithContentsOfFile:SLVLogCurrentPath()];
-    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
+    NSString *path = SLVLogCurrentPath();
+    if (!path.length) return @"";
+    const char *p = path.fileSystemRepresentation;
+    if (!p) return @"";
+
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) return @"";
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return @""; }
+
+    const off_t window = 256 * 1024;
+    off_t size = st.st_size;
+    off_t off = size > window ? size - window : 0;
+    size_t len = (size_t)(size - off);
+
+    NSMutableData *buf = [NSMutableData dataWithLength:len];
+    if (!buf.mutableBytes) { close(fd); return @""; }
+    ssize_t got = pread(fd, buf.mutableBytes, len, off);
+    close(fd);
+    if (got <= 0) return @"";
+    buf.length = (NSUInteger)got;
+
+    NSData *body = buf;
+    if (off > 0) {
+        const uint8_t *b = buf.bytes;
+        NSUInteger i = 0;
+        while (i < buf.length && b[i] != '\n') i++;
+        if (i >= buf.length) return @"";
+        body = [buf subdataWithRange:NSMakeRange(i + 1, buf.length - i - 1)];
+    }
+
+    NSString *s = SLVDecodeUTF8(body);
+    if (!s.length) return @"";
+
     NSArray<NSString *> *all = [s componentsSeparatedByString:@"\n"];
-    NSInteger n = all.count;
-    NSInteger start = n > lines ? n - lines : 0;
-    NSArray<NSString *> *part = [all subarrayWithRange:NSMakeRange(start, n - start)];
-    return [part componentsJoinedByString:@"\n"];
+    NSInteger n = (NSInteger)all.count;
+    NSInteger start = (lines > 0 && n > lines) ? n - lines : 0;
+    return [all subarrayWithRange:NSMakeRange((NSUInteger)start, (NSUInteger)(n - start)) componentsJoinedByString:@"\n"];
 }
 
 + (void)clear {
