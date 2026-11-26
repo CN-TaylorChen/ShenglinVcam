@@ -108,7 +108,7 @@ BOOL SLVCamIsMomoProcess(void);
 /// 听感是跳字、语速翻倍，对端就是「听不清」。consumer 传 AudioUnit 指针即可。
 - (nullable NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd
                            numBytes:(size_t)numBytes
-                           consumer:(const void *)consumer;
+                           consumer:(const void * _Nullable)consumer;
 
 /// 只登记宿主音频格式，不取数据。
 ///
@@ -125,7 +125,7 @@ BOOL SLVCamIsMomoProcess(void);
 /// 同上，按消费者分开读游标（AudioQueue 那条链只有一个消费者，传 NULL 即可）
 - (nullable NSData *)tryAudioForFormat:(const AudioStreamBasicDescription *)asbd
                               numBytes:(size_t)numBytes
-                              consumer:(const void *)consumer;
+                              consumer:(const void * _Nullable)consumer;
 
 /// 回到第一帧（切换素材、重新打开相机时调）
 - (void)rewind;

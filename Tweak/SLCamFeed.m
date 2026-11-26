@@ -396,8 +396,8 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
 - (BOOL)sl_pumpAudio;
 - (BOOL)sl_audioBelowHighWater;
 - (NSData *)sl_audioLocked:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes
-                configure:(BOOL)configure consumer:(const void *)consumer;
-- (int)sl_consumerSlotLocked:(const void *)key;
+                configure:(BOOL)configure consumer:(const void * _Nullable)consumer;
+- (int)sl_consumerSlotLocked:(const void * _Nullable)key;
 - (NSUInteger)sl_bufferedLocked;
 - (NSData *)sl_convertAudio:(NSData *)input;
 - (NSInteger)sl_normalizedRotation;
@@ -1560,7 +1560,7 @@ BOOL SLVCamIsMomoProcess(void) {
 ///
 /// 新建时起点跟「最靠前的那个消费者」对齐：它刚接上，不该先补 180ms 历史，
 /// 否则新 unit 一挂上就比别的链路慢半拍。
-- (int)sl_consumerSlotLocked:(const void *)key {
+- (int)sl_consumerSlotLocked:(const void * _Nullable)key {
     for (int i = 0; i < _audioConsumerCount; i++) {
         if (_audioConsumers[i].key == key) return i;
     }
@@ -1589,7 +1589,7 @@ BOOL SLVCamIsMomoProcess(void) {
 /// 取一包 PCM。调用方必须已持有 _lock。
 /// consumer：谁在取（AudioUnit 指针；NULL = AVCapture / AudioQueue 那条链）。
 - (NSData *)sl_audioLocked:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes
-                configure:(BOOL)configure consumer:(const void *)consumer {
+                configure:(BOOL)configure consumer:(const void * _Nullable)consumer {
     if (!asbd || asbd->mBytesPerFrame == 0 || numBytes == 0) return nil;
 
     // 关掉「替换音频」= 静音。这里必须返回全零的 PCM，不能返回 nil：
@@ -1713,7 +1713,7 @@ BOOL SLVCamIsMomoProcess(void) {
 }
 
 - (NSData *)audioForFormat:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes
-                  consumer:(const void *)consumer {
+                  consumer:(const void * _Nullable)consumer {
     [_lock lock];
     NSData *d = [self sl_audioLocked:asbd numBytes:numBytes configure:YES consumer:consumer];
     [_lock unlock];
@@ -1725,7 +1725,7 @@ BOOL SLVCamIsMomoProcess(void) {
 }
 
 - (NSData *)tryAudioForFormat:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes
-                     consumer:(const void *)consumer {
+                     consumer:(const void * _Nullable)consumer {
     // 实时音频线程专用：拿不到锁就放行这一包真麦克风，绝不阻塞宿主。
     // 锁只在解码线程 append 那一瞬间被持有，正常几乎不会撞上；
     // 一旦撞上，说明解码线程正在干重活，这时候卡住宿主才是灾难。
