@@ -1,3 +1,61 @@
+## 0.3.45 —— 修抖音评论区闪退：口令不再 hook 宿主的 setText:
+
+### 症状
+
+抖音里**点开评论区或者一打字就闪退**。陌陌、相机都正常。
+
+### 根因：`-setText:` 钩子把宿主的写入吞掉了
+
+0.3.42 ~ 0.3.44 为了「程序性写入也能看见口令」，hook 了 `UITextView` / `UITextField`
+以及输入框**实际类**的 `-setText:`：
+
+```objc
+static void SLVTextViewSetText(id self, SEL _cmd, NSString *text) {
+    IMP orig = SLVCodeWordOrigForClass([self class]);   // ← 按实际类查表
+    if (orig) ((SLVSetTextIMP)orig)(self, _cmd, text);
+    ...
+}
+```
+
+抖音评论区的输入框是 `UITextView` 的**子类**，而子类自己没实现 `setText:`。
+于是消息会落到我们挂在 `UITextView` 上的钩子上，此时 `self` 是子类：
+
+- 按 `[self class]` 去表里找原实现 → 子类名不在表里 → `orig == NULL`
+- `if (orig)` 这一句让**原实现根本没被调用**，`setText:` 静默失效，一个字都没写进去
+- 宿主接着按「我刚写进去的字符串长度」算 range / 光标位置，
+  拿到的却还是旧内容（常常是 nil）→ NSRange 越界 / TextKit 状态错乱 → 闪退
+
+聊天 App（陌陌）输入框少、写入路径单一，所以一直没暴露；抖音评论区正好踩满。
+
+### 改法：整块删掉，口令只读不写
+
+那条钩子本来就是多余的 —— **手打、粘贴都会发 `TextDidChange` 通知**，
+`setText:` 只是用来捞「草稿恢复」这种边角情况，代价却是改写宿主的文本系统。
+
+| 项 | 0.3.44 | 0.3.45 |
+|---|---|---|
+| `-[UITextView setText:]` | 挂钩子 | **不挂** |
+| `-[UITextField setText:]` | 挂钩子 | **不挂** |
+| 输入框实际类（如 `UIExpandingTextViewInternal`） | 懒挂 | **不挂** |
+| 触发 | TextDidChange 通知 | TextDidChange 通知（唯一来源） |
+| 对宿主文本的写操作 | 每次 setText: 都会被拦 | 只在命中口令时清一次 |
+
+顺带：
+
+- 归一化前先看长度，超过 32 个字符直接不看 —— 口令只有 5 个字符，
+  抖音评论区每敲一个字都走这里，长文本连全角转换都不做。
+- 删掉 `SLVTextViewSetText` / `SLVCodeWordHookSetTextClass` / 原 IMP 表，
+  共享状态只剩「防重入标志 + 0.6 秒防抖」，没有跨线程写表的问题了。
+
+### 装上之后
+
+- 抖音：评论区能打开、能打字、不发评论也能正常退出
+- 陌陌：打 `#vcam` 照样立刻切球（走的还是同一条通知，行为不变）
+- 日志里不该再出现 `给 … 补挂了 setText:`，改成一行的
+  `口令监听已装（… · 只读宿主文本，不挂钩子）`
+
+---
+
 ## 0.3.44 —— 口令改成「打出来就生效」
 
 ### 语义变了

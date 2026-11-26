@@ -7,26 +7,27 @@
 //  输入框里的内容一变成 #vcam，立刻：切球 + 把口令从输入框里清掉。
 //  清掉是为了不让它赖在输入框里（以前发出去以后字还在，导致反复触发、消息也照发）。
 //
-//  ── 为什么不再等「发送」 ──
+//  ── 0.3.45：只读不写宿主 ──
 //
-//  0.3.41 ~ 0.3.43 一直在追发送那一下，结论是追不到：
+//  0.3.42 ~ 0.3.44 为了「程序性写入也能看见」，hook 了 UITextView / UITextField
+//  以及输入框实际类的 -setText:。这在抖音上是致命的：
 //
-//    · 陌陌的发送键既不走 target-action，也不是 setText: 清空；
-//    · 0.3.43 的日志证明整轮操作里没有一次点击落在输入条右侧 ——
-//      发送极可能是用键盘上的「发送」键完成的，那个触摸在 UIRemoteKeyboardWindow 里，
-//      而这类系统窗口自己重写了 sendEvent:，挂在 -[UIWindow sendEvent:] 上的钩子对它无效。
+//    · 抖音评论区的输入框是 UITextView 的子类，它自己没实现 setText:，
+//      于是消息进的是我们挂在 UITextView 上的钩子；钩子按 [self class] 找原实现，
+//      找到的是子类名 —— 表里没有 → 原实现根本没被调用，setText: 静默失效；
+//    · 宿主的 setText: 被吞掉之后，它按「写进去的长度」继续算 range，
+//      拿到的却还是旧内容 → NSRange 越界 / TextKit 状态错乱 → 闪退。
 //
-//  与其继续猜发送键长什么样，不如把触发点挪到「文本本身」：
-//  文本变成口令 = 用户就是想执行口令，这个信号不需要识别任何按钮。
+//  而这条钩子本来就是多余的：手打、粘贴都会发 TextDidChange 通知。
+//  所以 0.3.45 把它整块删掉，口令只管「听」，一个字都不往宿主输入框里塞 ——
+//  除非确认命中了口令，那时才清空（这是口令本身的语义）。
 //
 //  ── 实现 ──
 //
 //    1. 文本通知（UITextField/UITextView TextDidChange）：手打、粘贴都能收到。
-//    2. 顺带 hook 输入框实际类的 -setText:：程序性写入（草稿恢复、快捷输入）也看得见。
-//       只在该类自己实现了 setText: 时才挂，避免和父类钩子重复触发。
-//    3. 命中后清字做了三层兜底（text / attributedText / textStorage），
+//    2. 命中后清字做了三层兜底（text / attributedText / textStorage），
 //       并在 0.3 秒后复查一次，宿主塞回来就再清一次。
-//    4. 0.6 秒内不重复触发，防止清字引发的连锁通知把球来回翻。
+//    3. 0.6 秒内不重复触发，防止清字引发的连锁通知把球来回翻。
 //
 
 #import "SLCodeWord.h"
@@ -42,6 +43,10 @@ NSString *const SLVCodeWordText = @"#vcam";
 /// 两次触发的最小间隔：清字本身会引发一串文本通知，别让它把球翻回去
 static const CFTimeInterval kSLCodeWordGap = 0.6;
 
+/// 超过这个长度直接不看了。口令只有 5 个字符，长文本连归一化都不必做 ——
+/// 抖音评论区每敲一个字都会走到这里，能省一点是一点。
+static const NSUInteger kSLCodeWordMaxScan = 32;
+
 /// 自己清字期间挡掉重入
 static BOOL sSLCodeWordBusy = NO;
 static CFAbsoluteTime sSLLastFireAt = 0;
@@ -55,6 +60,7 @@ static NSString *sSLLastChainLogged = nil;
 static NSString *SLVCodeWordNormalize(NSString *_Nullable text) {
     if (text.length == 0) return @"";
     NSString *t = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (t.length > kSLCodeWordMaxScan) return nil;   // 太长，肯定不是口令
     NSMutableString *out = [NSMutableString stringWithCapacity:t.length];
     for (NSUInteger i = 0; i < t.length; i++) {
         unichar c = [t characterAtIndex:i];
@@ -66,7 +72,8 @@ static NSString *SLVCodeWordNormalize(NSString *_Nullable text) {
 }
 
 static BOOL SLVCodeWordIsCode(NSString *_Nullable text) {
-    return [SLVCodeWordNormalize(text) isEqualToString:SLVCodeWordText];
+    NSString *n = SLVCodeWordNormalize(text);
+    return n != nil && [n isEqualToString:SLVCodeWordText];
 }
 
 static NSString *SLVCodeWordTextOf(id input) {
@@ -123,74 +130,13 @@ static void SLVCodeWordToggle(void) {
     SLVLog(@"SL-VCAM: 口令 %@ → 悬浮球%@", SLVCodeWordText, hide ? @"隐藏" : @"显示");
 }
 
-#pragma mark - 隐藏 setText:（程序性写入也能看见）
-
-typedef void (*SLVSetTextIMP)(id, SEL, NSString *);
-
-// 每个类单独存一份原 IMP。
-// 不能用一个全局变量：UITextView 和它的子类如果都实现了 setText:，
-// 两份原 IMP 不是同一个，混用就会调错实现。
-#define SLV_MAX_SETTEXT_HOOKS 8
-static Class sSLSTClasses[SLV_MAX_SETTEXT_HOOKS];
-static IMP sSLSTOrigs[SLV_MAX_SETTEXT_HOOKS];
-static int sSLSTCount = 0;
-
-static IMP SLVCodeWordOrigForClass(Class cls) {
-    for (int i = sSLSTCount - 1; i >= 0; i--) {
-        if (sSLSTClasses[i] == cls) return sSLSTOrigs[i];
-    }
-    return NULL;
-}
-
-static void SLVCodeWordHandleText(UIView *input);
-
-static void SLVTextViewSetText(id self, SEL _cmd, NSString *text) {
-    IMP orig = SLVCodeWordOrigForClass([self class]);
-    if (orig) ((SLVSetTextIMP)orig)(self, _cmd, text);
-
-    if (!sSLCodeWordBusy && [self isKindOfClass:[UIView class]]) {
-        SLVCodeWordHandleText((UIView *)self);
-    }
-}
-
-/// 给某个类挂 setText:。只在该类**自己**实现了这个方法时才挂，
-/// 否则会和父类的钩子重复，一次赋值走两遍。
-static void SLVCodeWordHookSetTextClass(Class cls) {
-    if (!cls || sSLSTCount >= SLV_MAX_SETTEXT_HOOKS) return;
-    for (int i = 0; i < sSLSTCount; i++) {
-        if (sSLSTClasses[i] == cls) return;   // 挂过了
-    }
-
-    SEL sel = NSSelectorFromString(@"setText:");
-    unsigned int n = 0;
-    Method *list = class_copyMethodList(cls, &n);
-    BOOL own = NO;
-    for (unsigned int i = 0; i < n; i++) {
-        if (method_getName(list[i]) == sel) { own = YES; break; }
-    }
-    if (list) free(list);
-    if (!own) return;   // 继承父类的实现，父类钩子已经能覆盖
-
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
-
-    IMP prev = method_setImplementation(m, (IMP)SLVTextViewSetText);
-    sSLSTClasses[sSLSTCount] = cls;
-    sSLSTOrigs[sSLSTCount] = prev;
-    sSLSTCount++;
-
-    SLVLog(@"SL-VCAM: 给 %@ 补挂了 setText:", NSStringFromClass(cls));
-}
-
 #pragma mark - 状态机：文本变化
 
-/// 文本一变成口令就干活。手打、粘贴、程序写入都走这里。
+/// 文本一变成口令就干活。手打、粘贴都走这里。
+///
+/// 只读宿主输入框：除了命中口令时清一次字，其余情况连 text 都只是看一眼就走。
 static void SLVCodeWordHandleText(UIView *input) {
     if (sSLCodeWordBusy || !input) return;
-
-    // 顺手把输入框实际类的 setText: 挂上（陌陌是 UIExpandingTextViewInternal），
-    // 这样它自己重写 setText: 时也绕不过我们。挂过的类内部会直接返回。
-    SLVCodeWordHookSetTextClass([input class]);
 
     NSString *text = SLVCodeWordTextOf(input);
     if (!SLVCodeWordIsCode(text)) return;
@@ -250,11 +196,7 @@ void SLVStartCodeWordWatcher(void) {
             if ([obj isKindOfClass:[UITextView class]]) SLVCodeWordHandleText(obj);
         }];
 
-        // 程序性写入：宿主自己把 text 置成口令（草稿恢复、快捷输入）也认
-        SLVCodeWordHookSetTextClass([UITextView class]);
-        SLVCodeWordHookSetTextClass([UITextField class]);
-
-        SLVLog(@"SL-VCAM: 口令监听已装（输入 %@ 即生效，无需发送 · 清空钩子=%d 个类）",
-              SLVCodeWordText, sSLSTCount);
+        SLVLog(@"SL-VCAM: 口令监听已装（输入 %@ 即生效，无需发送 · 只读宿主文本，不挂钩子）",
+              SLVCodeWordText);
     });
 }
