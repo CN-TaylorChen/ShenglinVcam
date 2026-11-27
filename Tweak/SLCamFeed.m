@@ -370,6 +370,22 @@ static const double SLV_AUDIO_SYNC_TOL = 0.12;
 static const double SLV_AUDIO_SYNC_CHECK = 0.25;
 #define SLV_AUDIO_TS_MAX 512
 
+// 0.3.54：生产端的判据从「水位」改成「素材时刻」。
+//
+// 水位是相对消费者的：没人拉就一直满，生产端于是原地不动；而画面是按墙钟走的，
+// 两边一旦被拉开（重建 reader、切素材、宿主播一下）就再也追不回来。0.3.53 的
+// 日志里那行「音频 8.36s / 画面 14.00s → 挪 -5641ms」就是这条造的 —— 生产端根本
+// 没解到 14 秒，对齐逻辑只能把游标夹到池尾，白丢一段再补一段静音。
+//
+// 现在生产端只认一件事：**已经解出来的音频够不够「画面时刻 + 120ms」**。
+// 不够就一直解，够了就停。这样音频的解码位置天生跟着画面走。
+//
+// 解码位置落后画面超过这个值，说明中间断过（重建 / 卡顿），这时候
+// 1) 一次多补一些包（追赶），2) 解出来但比画面早这么多的块直接扔掉 ——
+// 那部分内容按定义已经播过了，进池子只会变成「延后播放的旧声音」。
+static const double SLV_AUDIO_STALE_SEC    = 0.30;
+#define SLV_AUDIO_CATCHUP_MAX 24      // 追赶时一轮最多补几包（稳态是 8）
+
 // 视频追赶：一次最多连解几帧。视频落后时（解码慢、系统忙）不能只解一帧就睡，
 // 否则会越落越远，最后整段变成慢放 —— 那才是「音画不同步」里最难察觉的一种。
 #define SLV_VIDEO_CATCHUP_MAX 6
@@ -438,6 +454,13 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     BOOL _resumeValid;
     CGSize _naturalSize;
 
+    // 0.3.54：生产端自己的位置（已解出的最后一包结束时刻）。
+    // 池子空的时候时间轴给不出答案，但生产端必须知道「自己解到第几秒」，
+    // 否则重建 reader 后第一包还没进来时就没法判断该不该继续解。
+    double _audioHeadPTS;
+    NSUInteger _audioSkipBlocks;         // 被「丢弃追帧」扔掉的块数（诊断用）
+    CFAbsoluteTime _audioSkipLogAt;
+
     // ---- 解码线程独占 ----
     AVAssetReader *_reader;
     AVAssetReaderTrackOutput *_videoOut;
@@ -477,7 +500,8 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
 - (void)sl_decodeLoopWithGeneration:(NSUInteger)gen;
 - (void)sl_buildReaderForKey:(NSString *)key;
 - (BOOL)sl_pumpAudio;
-- (BOOL)sl_audioBelowHighWater;
+- (BOOL)sl_audioNeedMore;
+- (BOOL)sl_audioNeedMoreLocked;
 - (NSData *)sl_audioLocked:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes
                 configure:(BOOL)configure consumer:(const void * _Nullable)consumer;
 - (int)sl_consumerSlotLocked:(const void * _Nullable)key;
@@ -605,6 +629,7 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     _hostStillKey = nil;
     [_audioPCM setLength:0];
     _audioTSCount = 0;
+    _audioHeadPTS = NAN;                 // 0.3.54：池子清空了，生产端位置也没了
     // 换素材必须把所有人的游标一起归零，否则旧位置会落在新池子外面
     for (int i = 0; i < _audioConsumerCount; i++) _audioConsumers[i].cursor = 0;
     _running = (_sourcePath.length > 0);
@@ -857,12 +882,23 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
 
             // 一个视频帧周期里音频往往不止需要一包（一包 AAC 通常只有 23ms，
             // 而 30fps 一帧是 33ms），以前「一帧只补一包」会让缓冲长期处于抽干状态。
-            // 现在按水位补，最多补 8 包，避免一次把解码线程卡太久。
+            //
+            // 0.3.54：补到「画面时刻 + 120ms」为止（判据在 sl_audioNeedMore 里）。
+            // 落后多的时候一轮多补几包 —— 这段是追赶，不是稳态，不能按 8 包憋着
+            // 慢慢追，否则一次 1 秒的断档要 1 秒才补回来，听起来就是持续的口型错位。
             if (_audioOut) {
-                for (int i = 0; i < 8; i++) {
+                int maxBlocks = 8;
+                [_lock lock];
+                double headPTS = _audioHeadPTS;
+                double vptsNow = [self sl_videoPTSLocked];
+                [_lock unlock];
+                if (!isnan(headPTS) && !isnan(vptsNow) && vptsNow - headPTS > SLV_AUDIO_STALE_SEC) {
+                    maxBlocks = SLV_AUDIO_CATCHUP_MAX;
+                }
+                for (int i = 0; i < maxBlocks; i++) {
                     if (![self sl_pumpAudio]) break;
                     gotAny = YES;
-                    if (![self sl_audioBelowHighWater]) break;
+                    if (![self sl_audioNeedMore]) break;
                 }
             }
 
@@ -964,28 +1000,43 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     return _audioPCM.length - min;
 }
 
-/// 缓冲还没到高水位，可以继续补
-- (BOOL)sl_audioBelowHighWater {
-    [_lock lock];
+/// 生产端是否还要继续解音频。调用方必须已持有 _lock。
+///
+/// 判据只有一条：已经解出来的音频够不够「画面时刻 + 缓冲」。
+/// 不能用池子水位判 —— 水位是相对消费者的，没有人拉的时候它一直满，
+/// 生产端就停在那儿不动，而画面按墙钟继续走，差距永久留下。
+- (BOOL)sl_audioNeedMoreLocked {
+    if (_audioBytesPerSecond == 0) return YES;      // 目标格式还没确定，先别停
+    double vpts = [self sl_videoPTSLocked];
+    if (!isnan(vpts) && !isnan(_audioHeadPTS)) {
+        return _audioHeadPTS < vpts + SLV_AUDIO_HIGH_SEC;
+    }
+    // 画面时刻还不知道（图片素材 / 首帧还没出来）：退回水位判断
     NSUInteger buffered = [self sl_bufferedLocked];
-    NSUInteger rate = _audioBytesPerSecond;
-    [_lock unlock];
-    if (rate == 0) return YES;      // 目标格式还没确定，先别停
-    return buffered < (NSUInteger)(rate * SLV_AUDIO_HIGH_SEC);
+    return buffered < (NSUInteger)(_audioBytesPerSecond * SLV_AUDIO_HIGH_SEC);
 }
 
-/// 解码线程内调用：音频池没到高水位才继续解
+/// 同上，自己加锁。解码线程用。
+- (BOOL)sl_audioNeedMore {
+    [_lock lock];
+    BOOL need = [self sl_audioNeedMoreLocked];
+    [_lock unlock];
+    return need;
+}
+
+/// 解码线程内调用：按画面时刻补齐音频
 - (BOOL)sl_pumpAudio {
     [_lock lock];
-    NSUInteger buffered = [self sl_bufferedLocked];
-    NSUInteger limit = (NSUInteger)(_audioBytesPerSecond * SLV_AUDIO_HIGH_SEC);
+    BOOL need = [self sl_audioNeedMoreLocked];
     [_lock unlock];
-    if (limit && buffered >= limit) return NO;
+    if (!need) return NO;
 
     CMSampleBufferRef sb = [_audioOut copyNextSampleBuffer];
     if (!sb) return NO;
 
     CMTime sbPTS = CMSampleBufferGetPresentationTimeStamp(sb);
+    BOOL hasPTS = CMTIME_IS_VALID(sbPTS) && CMTIME_IS_NUMERIC(sbPTS);
+    double pts = hasPTS ? CMTimeGetSeconds(sbPTS) : NAN;
     CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
     size_t len = bb ? CMBlockBufferGetDataLength(bb) : 0;
     if (len > 0) {
@@ -995,33 +1046,59 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
         if (converted.length) {
             double db = NAN;
             BOOL probe = NO;
+            BOOL skipped = NO;
+            double skipSec = 0;
             [_lock lock];
-            NSUInteger at = _audioPCM.length;
-            [_audioPCM appendData:converted];
-            // 0.3.53：记下这块 PCM 在池子里的位置和它对应的素材时间。
-            // 音画对齐就是拿它反推「游标读到第几秒」。
-            if (CMTIME_IS_VALID(sbPTS) && CMTIME_IS_NUMERIC(sbPTS)) {
-                double pts = CMTimeGetSeconds(sbPTS);
-                if (_audioTSCount == 0 || pts > _audioTS[_audioTSCount - 1].pts + 0.0005) {
-                    if (_audioTSCount >= SLV_AUDIO_TS_MAX) {
-                        // 满了就抽稀一半，保留偶数位（时间上仍单调）
-                        int w = 0;
-                        for (int i = 0; i < _audioTSCount; i += 2) _audioTS[w++] = _audioTS[i];
-                        _audioTSCount = w;
-                    }
-                    if (_audioTSCount < SLV_AUDIO_TS_MAX) {
-                        _audioTS[_audioTSCount].off = at;
-                        _audioTS[_audioTSCount].pts = pts;
-                        _audioTSCount++;
+            double blk = _audioBytesPerSecond
+                       ? (double)converted.length / (double)_audioBytesPerSecond : 0.0;
+            double vpts = [self sl_videoPTSLocked];
+            // 无论这块要不要，生产端的位置都要前移 —— 否则「丢弃追帧」会永远以为
+            // 自己还在原处，一轮 8 包全扔掉，白烧解码。
+            if (!isnan(pts)) _audioHeadPTS = pts + blk;
+
+            // 0.3.54：比画面早 300ms 以上的块直接扔掉。
+            // 这段内容按定义已经播过了（画面都走到它后面了），进池子只会变成
+            // 「延后播放的旧声音」，然后被读取端的对齐逻辑再跳过一次 —— 白白
+            // 让池子里塞一堆没人要的数据，还占着内存。
+            if (!isnan(pts) && !isnan(vpts) && (pts + blk) < (vpts - SLV_AUDIO_STALE_SEC)) {
+                skipped = YES;
+                skipSec = blk;
+                _audioSkipBlocks++;
+            } else {
+                NSUInteger at = _audioPCM.length;
+                [_audioPCM appendData:converted];
+                // 0.3.53：记下这块 PCM 在池子里的位置和它对应的素材时间。
+                // 音画对齐就是拿它反推「游标读到第几秒」。
+                if (hasPTS) {
+                    if (_audioTSCount == 0 || pts > _audioTS[_audioTSCount - 1].pts + 0.0005) {
+                        if (_audioTSCount >= SLV_AUDIO_TS_MAX) {
+                            // 满了就抽稀一半，保留偶数位（时间上仍单调）
+                            int w = 0;
+                            for (int i = 0; i < _audioTSCount; i += 2) _audioTS[w++] = _audioTS[i];
+                            _audioTSCount = w;
+                        }
+                        if (_audioTSCount < SLV_AUDIO_TS_MAX) {
+                            _audioTS[_audioTSCount].off = at;
+                            _audioTS[_audioTSCount].pts = pts;
+                            _audioTSCount++;
+                        }
                     }
                 }
+                _audioPumped++;
+                if (_audioPumped == 1 || _audioPumped % 600 == 0) {
+                    probe = YES;
+                    db = SLVPCMLoudnessdBFS(converted.bytes, converted.length, &_audioDstASBD);
+                }
             }
-            _audioPumped++;
-            if (_audioPumped == 1 || _audioPumped % 600 == 0) {
-                probe = YES;
-                db = SLVPCMLoudnessdBFS(converted.bytes, converted.length, &_audioDstASBD);
-            }
+            CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
+            BOOL skipLog = skipped && (nowT - _audioSkipLogAt > 2.0);
+            if (skipLog) _audioSkipLogAt = nowT;
+            NSUInteger skipCount = _audioSkipBlocks;
             [_lock unlock];
+            if (skipLog) {
+                SLVLog(@"音频: 丢弃追帧 跳过 %.0fms（画面已到 %.2fs · 累计 %lu 块）",
+                      skipSec * 1000.0, isnan(vpts) ? 0.0 : vpts, (unsigned long)skipCount);
+            }
             if (probe) {
                 // 生产端的独立证据：万一注入端又报「静音」，这一行能立刻分出
                 // 是「素材根本没解出声音」还是「注入/探测的问题」。
@@ -1106,6 +1183,7 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     // 不清会出事 —— 旧映射指向的是上一轮的素材时间，对齐时会把游标挪到错误位置。
     [_audioPCM setLength:0];
     _audioTSCount = 0;
+    _audioHeadPTS = NAN;                 // 0.3.54：新 reader 从新位置重新解
     for (int i = 0; i < _audioConsumerCount; i++) _audioConsumers[i].cursor = 0;
     [_lock unlock];
 
@@ -1978,7 +2056,15 @@ BOOL SLVCamIsMomoProcess(void) {
             double drift = apts - vpts;       // >0：音频跑在画面前面
             if (fabs(drift) > SLV_AUDIO_SYNC_TOL) {
                 NSInteger want = [self sl_offsetAtPTSLocked:vpts];
-                if (want >= 0) {
+                // 0.3.54：只有「目标位置确实有数据」才挪。
+                //
+                // 以前是无条件挪，而 offsetAtPTS 会把超出池子的目标夹到池尾 ——
+                // 于是「画面 14 秒、音频只解到 8 秒」时，游标被扔到池尾，池子里
+                // 那一小段有效数据白丢，接着就是「池 0ms」+ 一整段静音。现在数据
+                // 不到位就不动游标，交给生产端按 PTS 补齐（见 sl_audioNeedMoreLocked），
+                // 下一轮再看。
+                if (want >= 0 && (NSUInteger)want + numBytes <= _audioPCM.length &&
+                    (NSUInteger)want <= _audioPCM.length) {
                     *cursor = (NSUInteger)want;
                     _audioSyncJumps++;
                     if (syncNow - _audioSyncLogAt > 1.0) {
@@ -1986,6 +2072,12 @@ BOOL SLVCamIsMomoProcess(void) {
                         SLVLogRT(@"音频: 音画对齐 音频 %.2fs / 画面 %.2fs → 挪 %+.0fms（累计 %lu 次）",
                                  apts, vpts, drift * 1000.0, (unsigned long)_audioSyncJumps);
                     }
+                } else if (syncNow - _audioSyncLogAt > 3.0) {
+                    _audioSyncLogAt = syncNow;
+                    SLVLogRT(@"音频: 音画偏差 %.0fms 但数据还没解到（音频 %.2fs / 画面 %.2fs · 池 %lums），等生产端补齐",
+                             drift * 1000.0, apts, vpts,
+                             (unsigned long)(_audioBytesPerSecond
+                                             ? (_audioPCM.length - *cursor) * 1000 / _audioBytesPerSecond : 0));
                 }
             }
         }
@@ -2054,11 +2146,15 @@ BOOL SLVCamIsMomoProcess(void) {
         double vpts = [self sl_videoPTSLocked];
         double apts = [self sl_ptsAtOffsetLocked:*cursor];
         double driftMs = (isnan(vpts) || isnan(apts)) ? 0.0 : (apts - vpts) * 1000.0;
+        // 生产端位置：>0 表示已经解到画面之后（正常，领先一个水位），
+        // 明显 <0 表示解不过来（解码跟不上），这时才会出现持续的口型错位。
+        double prodMs = (isnan(vpts) || isnan(_audioHeadPTS)) ? 0.0 : (_audioHeadPTS - vpts) * 1000.0;
         // 0.3.52：这是音频实时线程（AudioUnitRender 里调进来的），走 RT 版
-        SLVLogRT(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包 · 消费者 %d 个 · 音画偏差 %+.0fms · 对齐 %lu 次",
+        SLVLogRT(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包 · 消费者 %d 个 · 音画偏差 %+.0fms · 生产 %+.0fms · 对齐 %lu 次 · 跳帧 %lu",
                 (unsigned long)(mine * 1000 / _audioBytesPerSecond),
                 (unsigned long)_audioDropped, (unsigned long)_audioCalls, _audioConsumerCount,
-                driftMs, (unsigned long)_audioSyncJumps);
+                driftMs, prodMs, (unsigned long)_audioSyncJumps,
+                (unsigned long)_audioSkipBlocks);
     }
 
     BOOL hasAudio = _assetHasAudio;
@@ -2109,13 +2205,21 @@ BOOL SLVCamIsMomoProcess(void) {
     [self sl_pruneConsumersLocked];
     NSUInteger buffered = [self sl_bufferedLocked];
     NSUInteger ms = _audioBytesPerSecond ? (buffered * 1000 / _audioBytesPerSecond) : 0;
-    // 0.3.53：带上音画偏差。这是判断「同步有没有跑掉」最直接的一个数，
-    // 池子大小只能反映延迟，偏差才反映错位。
+    // 0.3.53：带上音画偏差。这是判断「同步有没有跑掉」最直接的一个数。
+    //
+    // 0.3.54：偏差必须按「播放位置」算 —— 也就是最靠前的那个消费者游标。
+    // 以前这里拿的是池尾，而池尾天然比播放位置领先一个水位（100~200ms），
+    // 稳态下就会被读成「音频超前 150ms」，其实根本没超。口径不一致比没数据更糟。
+    NSUInteger play = 0;
+    BOOL hasPlay = NO;
+    for (int i = 0; i < _audioConsumerCount; i++) {
+        if (!hasPlay || _audioConsumers[i].cursor > play) { play = _audioConsumers[i].cursor; hasPlay = YES; }
+    }
     double vpts = [self sl_videoPTSLocked];
-    double apts = [self sl_ptsAtOffsetLocked:_audioPCM.length];
+    double apts = [self sl_ptsAtOffsetLocked:(hasPlay ? play : _audioPCM.length)];
     NSString *drift = (isnan(vpts) || isnan(apts))
-        ? @"偏差 -"
-        : [NSString stringWithFormat:@"偏差 %+.0fms", (apts - vpts) * 1000.0];
+        ? @"播放偏差 -"
+        : [NSString stringWithFormat:@"播放偏差 %+.0fms", (apts - vpts) * 1000.0];
     NSString *s = [NSString stringWithFormat:@"池 %lums · 消费者 %d · 音轨 %@ · 素材音轨 %@ · %@",
                    (unsigned long)ms, _audioConsumerCount,
                    _audioTrackAttached ? @"已挂" : @"未挂",
