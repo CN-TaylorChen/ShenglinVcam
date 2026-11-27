@@ -453,6 +453,18 @@ typedef struct {
     float gain;             // 上一包用的限幅增益（1.0 = 没限幅），做块间渐变用
     NSUInteger splices;     // 这个消费者累计做了多少次接缝淡入
     NSUInteger limits;      // 累计限幅次数
+
+    // 0.3.58：接缝改成「事件驱动」。
+    //
+    // 0.3.57 只靠波形判断（|本包首样本 - 上包尾样本| > 0.25）。这个判据在音乐素材
+    // 上是错的：48kHz 下鼓点、镲的相邻样本差本来就能超过 0.25，于是包边界一落在
+    // 鼓点上就误判。0.3.57 的日志里 10 秒出现 35 次接缝（每 285ms 一次，正好是
+    // 鼓点节奏），每次都被强制套一个 40ms 淡入 —— 鼓点被削成渐强，听感发闷。
+    //
+    // 现在改成：只有真的发生了位置跳变（重建 reader / 对齐挪位 / 追帧丢弃 / 硬切）
+    // 才置 _audioJumpEpoch，消费者看到 epoch 变了才淡入。波形只留一个很高的阈值
+    // 兜底真爆音，不再拿它当主判据。
+    NSUInteger seenEpoch;   // 上次取包时看到的 _audioJumpEpoch
 } SLVAudioConsumer;
 
 /// 一段 PCM 的响度（dBFS），NAN = 格式不认识。
@@ -531,7 +543,8 @@ static const float SLV_PEAK_CEIL = 0.891f;      // -1 dBFS
 /// 返回位掩码：1 = 做了接缝淡入，2 = 触发了峰值兜底，0 = 这包本来就很干净。
 static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
                                 const AudioStreamBasicDescription *a,
-                                int32_t *lastVal, BOOL *hasLast, float *gainInOut) {
+                                int32_t *lastVal, BOOL *hasLast, float *gainInOut,
+                                BOOL jumped) {
     if (!bytes || !len || !a || a->mBytesPerFrame == 0) return 0;
 
     BOOL isFloat = (a->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
@@ -613,16 +626,18 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
 
     // ---- ④ 接缝淡入 ----
     //
-    // 判据只看一个数：这一包的第 0 个样本跟上一包的最后一个样本差多少。
-    // 差得远 = 中间断过（重建、换格式、对齐跳位、追帧丢弃），波形在这里有个台阶。
+    // 0.3.58：主判据换成事件。`jumped` 为真表示这一包之前确实发生过位置跳变
+    //（重建 reader / 对齐挪位 / 追帧丢弃 / 硬切），波形在这里必然有个台阶。
     //
-    // 0.3.56 用的是 8ms —— 那只够抹掉「台阶造成的爆音」，对「内容从第 3 秒跳到
-    // 第 9 秒」这种跳段几乎没用，听感还是一声突兀的「咔」。现在放到 40ms
-    //（一包 20~23ms，实际效果是整包从上一包的值渐入），跳段变成一次快速渐强。
+    // 波形只做兜底：阈值 0.55（≈ -5 dBFS 的相邻样本跳变）。整幅跳变才会到这里，
+    // 鼓点、镲那类真实瞬态（0.25 上下）不再被误判 —— 0.3.57 的日志里 10 秒误判
+    // 35 次，每次都白套一个 40ms 淡入，把鼓点削成了渐强。
     float cur0 = SLVGetSample(bytes, 0, isFloat);
-    // 阈值 0.25（≈ -12 dBFS 的相邻样本跳变）。定得再低会误伤鼓点这类真实瞬态，
-    // 定得再高真断点就漏过去了 —— 断点通常是整幅跳变。
-    if (*hasLast && fabsf(cur0 - lastVal[0] / 32768.0f) > 0.25f) {
+    BOOL seam = jumped;
+    if (!seam && *hasLast && fabsf(cur0 - lastVal[0] / 32768.0f) > 0.55f) {
+        seam = YES;
+    }
+    if (seam && frames >= 2) {
         uint32_t fade = (uint32_t)(a->mSampleRate * 0.040);
         if (fade < 16) fade = 16;
         if (fade > frames) fade = (uint32_t)frames;
@@ -698,12 +713,16 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
     NSUInteger _audioFormatJumps;
     NSUInteger _audioSplices;
     NSUInteger _audioLimits;
+    // 0.3.58：跳位纪元。任何「内容位置真的变了」的事件都 ++，消费者看到变了才淡入。
+    // 反过来说：没有这些事件就不该有淡入 —— 波形本身不构成跳位的证据。
+    NSUInteger _audioJumpEpoch;
     BOOL _primePending;                  // 已有一件「后台登记格式」的活在路上
     BOOL _audioMismatchLogged;
     CFAbsoluteTime _audioFormatAt;       // 当前目标格式是哪一刻定型的（迟滞用）
 
     // ---- 解码线程独占 ----
     AVAssetReader *_reader;
+    NSUInteger _readerGen;               // 0.3.58：这个 reader 属于哪一代（防旧线程取消新一代）
     AVAssetReaderTrackOutput *_videoOut;
     AVAssetReaderTrackOutput *_audioOut;
     AudioStreamBasicDescription _audioSrcASBD;
@@ -733,13 +752,22 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
     // 旋转 / 镜像 / 尺寸转换只做一次，结果按 key 缓存，之后每帧纯 memcpy。
     CVPixelBufferRef _hostStill;
     NSString *_hostStillKey;             // "格式:宽x高:m镜像:r角度"
+
+    // 0.3.58：视频出帧路径计数。
+    //
+    // 这两个数决定「糊到底该不该算在我们头上」：
+    //   · 直出很大 = 素材尺寸/格式本来就贴着宿主，我们一个像素都没动
+    //   · 渲染很大 = 每帧都在过 CoreImage 缩放，质量和耗时都要盯
+    // 之前没有这两个数，只能靠 key 里的尺寸去猜。
+    NSUInteger _videoDirectCount;
+    NSUInteger _videoRenderCount;
 }
 
 - (void)sl_restart;
 + (BOOL)sl_isImagePath:(NSString *)p;
 - (void)sl_loadStillImage;
 - (void)sl_decodeLoopWithGeneration:(NSUInteger)gen;
-- (void)sl_buildReaderForKey:(NSString *)key;
+- (void)sl_buildReaderForKey:(NSString *)key generation:(NSUInteger)gen;
 - (BOOL)sl_pumpAudio;
 - (BOOL)sl_audioNeedMore;
 - (BOOL)sl_audioNeedMoreLocked;
@@ -870,6 +898,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
     _hostStillKey = nil;
     [_audioPCM setLength:0];
     _audioTSCount = 0;
+    _audioJumpEpoch++;                   // 0.3.58：池子清空 = 内容断点，下一个包必须渐入
     _audioHeadPTS = NAN;                 // 0.3.54：池子清空了，生产端位置也没了
     // 换素材必须把所有人的游标一起归零，否则旧位置会落在新池子外面
     for (int i = 0; i < _audioConsumerCount; i++) {
@@ -1072,7 +1101,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
                     _resumeValid = CMTIME_IS_VALID(_lastVideoPTS) && CMTIME_IS_NUMERIC(_lastVideoPTS);
                     [_lock unlock];
                 }
-                [self sl_buildReaderForKey:key];
+                [self sl_buildReaderForKey:key generation:gen];
                 if (!_reader) { usleep(30 * 1000); continue; }
             }
 
@@ -1173,7 +1202,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
                 _idleRounds = 0;
                 if (loop) {
                     // 一轮播完 —— 重建 reader 实现循环播放
-                    [self sl_buildReaderForKey:key];
+                    [self sl_buildReaderForKey:key generation:gen];
                     if (!_reader) usleep(50 * 1000);
                 } else {
                     usleep(120 * 1000);
@@ -1349,6 +1378,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
                 skipped = YES;
                 skipSec = blk;
                 _audioSkipBlocks++;
+                _audioJumpEpoch++;        // 0.3.58：整块被扔掉，前后的内容接不上
             } else {
                 NSUInteger at = _audioPCM.length;
                 [_audioPCM appendData:converted];
@@ -1480,11 +1510,25 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
 
 #pragma mark - Reader 构建（只在解码线程调用）
 
-- (void)sl_buildReaderForKey:(NSString *)key {
-    [_reader cancelReading];
-    _reader = nil;
+- (void)sl_buildReaderForKey:(NSString *)key generation:(NSUInteger)gen {
+    // 0.3.58：换素材会 detach 新线程，旧线程在 buildReader 里还会再跑一段。
+    // 以前它无条件 `[_reader cancelReading]` —— 正好把新线程刚 startReading 成功的
+    // 那个 reader 取消掉，日志里就是「startReading 失败: 这项操作无法完成」，
+    // 代价是换素材后 3~5 秒还是旧画面（13:08:18 失败，13:08:22 才恢复）。
+    // 现在旧线程一进这个方法就掉头，绝不碰共享的 reader。
+    [_lock lock];
+    if (gen != _generation) {
+        [_lock unlock];
+        return;
+    }
+    // 只取消「自己这一代」的 reader。别人的由它自己的线程收拾。
+    AVAssetReader *old = (_readerGen == gen) ? _reader : nil;
+    if (old) _reader = nil;
     _videoOut = nil;
     _audioOut = nil;
+    [_lock unlock];
+    if (old) [old cancelReading];
+
     _idleRounds = 0;
     _playValid = NO;                     // 0.3.53：新 reader 的时间轴从新锚点算起
     [_lock lock];
@@ -1493,6 +1537,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
     // 不清会出事 —— 旧映射指向的是上一轮的素材时间，对齐时会把游标挪到错误位置。
     [_audioPCM setLength:0];
     _audioTSCount = 0;
+    _audioJumpEpoch++;                   // 0.3.58：池子清空 = 内容断点，下一个包必须渐入
     _audioHeadPTS = NAN;                 // 0.3.54：新 reader 从新位置重新解
     for (int i = 0; i < _audioConsumerCount; i++) _audioConsumers[i].cursor = 0;
     [_lock unlock];
@@ -1638,7 +1683,20 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
         SLVLog(@"feed startReading 失败: %@", reader.error.localizedDescription ?: @"?");
         return;
     }
-    _reader = reader;
+    // startReading 这段可能又换了素材：这一代已经不是最新的，reader 直接作废，
+    // 不挂到共享变量上 —— 否则下一轮会被别的线程 cancel 掉，白跑一趟还留一行错误。
+    [_lock lock];
+    BOOL stillCurrent = (gen == _generation);
+    if (stillCurrent) {
+        _reader = reader;
+        _readerGen = gen;
+    }
+    [_lock unlock];
+    if (!stillCurrent) {
+        [reader cancelReading];
+        SLVLog(@"feed 重建完成时素材已换，丢弃这一代 reader（gen %lu）", (unsigned long)gen);
+        return;
+    }
 
     // 循环播放每轮都要重建 reader，每 11 秒刷一行会把日志淹掉。
     // 只在「首次 / 目标格式变了 / 每 20 轮」打一次 —— 真出问题时也还看得到心跳。
@@ -1679,6 +1737,15 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
     CVPixelBufferRef pb = _latestVideo ? (CVPixelBufferRef)CVPixelBufferRetain(_latestVideo) : NULL;
     [_lock unlock];
     return pb;
+}
+
+/// 0.3.58：出帧路径计数（诊断）。
+/// 直出 = 素材帧原样交出去（零拷贝）；渲染 = 过了一趟 CoreImage（缩放/旋转/镜像）。
+- (void)videoPathCountsDirect:(NSUInteger *)direct render:(NSUInteger *)render {
+    [_lock lock];
+    if (direct) *direct = _videoDirectCount;
+    if (render) *render = _videoRenderCount;
+    [_lock unlock];
 }
 
 // 注入专用（0.3.8）：把宿主**自己的**真帧 buffer 交进来，返回一帧能直接交给宿主的画面。
@@ -1782,12 +1849,14 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
     // 素材帧本来就跟宿主要的一模一样 → 零拷贝直出。
     // 视频不旋转不镜像走的就是这条，它一直正常，别为了「统一」把它拖慢。
     if (!isImage && !mirror && rot == 0 && sw == hw && sh == hh && spf == hpf) {
+        _videoDirectCount++;             // 0.3.58：零拷贝，画质就是我们素材的原样
         return src;                      // 已 retain
     }
 
     if (!isImage) {
         // 视频开了旋转 / 镜像：直接写进宿主的 buffer，
         // 省掉「先渲到自建 buffer、再搬一趟」的整趟开销
+        _videoRenderCount++;             // 0.3.58：这一帧要过 CI，耗时和质量都记在这里
         BOOL ok = [self sl_writeSource:src into:host mirror:mirror rotation:rot squareCrop:YES];
         CVPixelBufferRelease(src);
         return ok ? (CVPixelBufferRef)CVPixelBufferRetain(host) : NULL;
@@ -2289,6 +2358,7 @@ BOOL SLVCamIsMomoProcess(void) {
     if (hadPool) {
         [_audioPCM setLength:0];
         _audioTSCount = 0;
+        _audioJumpEpoch++;               // 0.3.58：换格式清池，字节标尺都变了
         _audioHeadPTS = NAN;
         for (int i = 0; i < _audioConsumerCount; i++) {
             _audioConsumers[i].cursor = 0;
@@ -2533,6 +2603,7 @@ BOOL SLVCamIsMomoProcess(void) {
                     (NSUInteger)want <= _audioPCM.length) {
                     *cursor = (NSUInteger)want;
                     _audioSyncJumps++;
+                    _audioJumpEpoch++;   // 0.3.58：游标被挪走了，波形在这里不连续
                     if (syncNow - _audioSyncLogAt > 1.0) {
                         _audioSyncLogAt = syncNow;
                         SLVLogRT(@"音频: 音画对齐 音频 %.2fs / 画面 %.2fs → 挪 %+.0fms（累计 %lu 次）",
@@ -2575,6 +2646,7 @@ BOOL SLVCamIsMomoProcess(void) {
             avail -= drop;
             _audioDropped += drop;
             _audioHardCuts++;
+            _audioJumpEpoch++;          // 0.3.58：池子被切掉一段，下一个包必须渐入
             // 0.3.56 这里是一次性标志：第一次打过就永远静默，于是池子后面又切了
             // 多少次日志上都看不见。改成 2 秒限流 + 累计次数，切几次一目了然。
             // 这一行在音频实时线程上，必须走 SLVLogRT（只入队，不 NSLog）。
@@ -2664,10 +2736,16 @@ BOOL SLVCamIsMomoProcess(void) {
     //
     // 放在最后一步、对**这一包副本**做，池子里的数据保持原样 —— 下一个消费者
     // 读同一段内容时看到的还是原始波形，只是各自在自己那一段的接缝处补了斜坡。
+    // 0.3.58：这一包是不是紧接一次「位置真的跳了」。
+    // 首次取包（hasLast=NO）也算 —— 那时候要从静音渐入，不能直接怼上去。
+    BOOL jumped = (_audioConsumers[slot].seenEpoch != _audioJumpEpoch) || !_audioConsumers[slot].hasLast;
+    _audioConsumers[slot].seenEpoch = _audioJumpEpoch;
+
     NSUInteger polished = SLVPolishChunk((uint8_t *)chunk.mutableBytes, numBytes, asbd,
                                          _audioConsumers[slot].lastVal,
                                          &_audioConsumers[slot].hasLast,
-                                         &_audioConsumers[slot].gain);
+                                         &_audioConsumers[slot].gain,
+                                         jumped);
     if (polished & 1) {
         _audioConsumers[slot].splices++;
         _audioSplices++;

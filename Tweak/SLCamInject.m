@@ -18,6 +18,7 @@
 #import <objc/runtime.h>
 #import <os/lock.h>
 #import <dlfcn.h>
+#import <string.h>
 
 typedef void (*SLVProcessSampleBufferFn)(id, SEL, CMSampleBufferRef);
 
@@ -59,6 +60,62 @@ static NSString *SLVFourCC(OSType v) {
         if (c[i] < 32 || c[i] > 126) c[i] = '?';
     }
     return @(c);
+}
+
+// ---- 0.3.58：视频心跳 ----
+//
+// 0.3.57 的日志里音频有六七个指标，视频一个都没有 —— 所以「对面看着糊」只能靠猜。
+// 这里补上最要紧的四个数：
+//   · 宿主实际来要多少帧  → 采集帧率，Agora 编码的上限就是它
+//   · 我们替换成功多少帧  → 少了说明打包失败或没数据，宿主拿到的是重复帧
+//   · 每帧处理花多久      → 超 33ms 就掉到 30fps 以下
+//   · 直出 / 渲染         → 直出 = 我们一个像素都没动，糊就怨不到这层
+static uint64_t sSLCamVideoAsked = 0;
+static uint64_t sSLCamVideoServed = 0;
+static uint64_t sSLCamVideoBypass = 0;
+static double   sSLCamProcTotalMs = 0;
+static double   sSLCamProcMaxMs = 0;
+static CFAbsoluteTime sSLCamVideoBeatAt = 0;
+static uint64_t sSLCamBeatAsked = 0;
+static uint64_t sSLCamBeatServed = 0;
+static uint64_t sSLCamBeatBypass = 0;
+static double   sSLCamBeatTotalMs = 0;
+
+static void SLVCamVideoBeat(CMFormatDescriptionRef fmt, double procMs, BOOL served) {
+    sSLCamVideoAsked++;
+    if (served) sSLCamVideoServed++; else sSLCamVideoBypass++;
+    if (procMs > 0) {
+        sSLCamProcTotalMs += procMs;
+        if (procMs > sSLCamProcMaxMs) sSLCamProcMaxMs = procMs;
+    }
+    // 300 帧 ≈ 30fps 下的 10 秒。按帧数而不是按时间触发，掉帧时也能看出真实节奏。
+    if (sSLCamVideoAsked % 300 != 0) return;
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    uint64_t asked = sSLCamVideoAsked - sSLCamBeatAsked;
+    uint64_t servedN = sSLCamVideoServed - sSLCamBeatServed;
+    uint64_t bypassN = sSLCamVideoBypass - sSLCamBeatBypass;
+    double win = sSLCamVideoBeatAt > 0 ? (now - sSLCamVideoBeatAt) : 0;
+    double avg = asked ? (sSLCamProcTotalMs - sSLCamBeatTotalMs) / (double)asked : 0;
+    double fps = (win > 0.1) ? ((double)asked / win) : 0;
+
+    NSUInteger direct = 0, render = 0;
+    [[SLVCamFeed shared] videoPathCountsDirect:&direct render:&render];
+
+    CMVideoDimensions d = fmt ? CMVideoFormatDescriptionGetDimensions(fmt) : (CMVideoDimensions){0, 0};
+    OSType sub = fmt ? CMFormatDescriptionGetMediaSubType(fmt) : 0;
+    SLVLog(@"视频: 心跳 %.1fs 宿主来要 %llu 帧（%.1ffps）· 替换 %llu / 放行 %llu · 处理均 %.1fms 峰 %.1fms · 宿主 %dx%d %@ · 直出累计 %lu / 渲染累计 %lu",
+          win, (unsigned long long)asked, fps,
+          (unsigned long long)servedN, (unsigned long long)bypassN,
+          avg, sSLCamProcMaxMs, d.width, d.height, SLVFourCC(sub),
+          (unsigned long)direct, (unsigned long)render);
+
+    sSLCamProcMaxMs = 0;   // 峰值按窗口算，否则整场都被开头几帧拖着
+    sSLCamVideoBeatAt = now;
+    sSLCamBeatAsked = sSLCamVideoAsked;
+    sSLCamBeatServed = sSLCamVideoServed;
+    sSLCamBeatBypass = sSLCamVideoBypass;
+    sSLCamBeatTotalMs = sSLCamProcTotalMs;
 }
 
 /// 音视频输出可能各自重写了 _processSampleBuffer:，必须按 Method 分别保存原始 IMP，
@@ -275,6 +332,7 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
 
     CMMediaType mediaType = CMFormatDescriptionGetMediaType(fmt);
     CMSampleBufferRef fake = NULL;
+    double slvProcMs = 0;                // 0.3.58：这一帧的处理耗时（视频心跳用）
 
     if (mediaType == kCMMediaType_Video) {
         CVImageBufferRef img = CMSampleBufferGetImageBuffer(sbuf);
@@ -341,7 +399,9 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
             // 是「buffer 是谁造的」本身：宿主把 IOSurface 拿去建 Metal 纹理，
             // 我们 CVPixelBufferCreate 出来的那种排布它读不出正确内容，画出来就是绿的。
             // 现在直接写进宿主自己的 buffer，指针 / 格式 / 属性全是它熟悉的那个。
+            CFAbsoluteTime slvT0 = CFAbsoluteTimeGetCurrent();
             CVPixelBufferRef frame = [feed copyFrameForHostBuffer:img];
+            slvProcMs = (CFAbsoluteTimeGetCurrent() - slvT0) * 1000.0;
             if (frame) {
                 // 优先沿用宿主的 fmt（下游的编码器/写入器都按它配置，换了会出岔子）。
                 // 只有当假帧确实与它不匹配时，才退而求其次自建一个 —— 自建的那个
@@ -498,9 +558,11 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
     }
 
     if (fake) {
+        if (mediaType == kCMMediaType_Video) SLVCamVideoBeat(fmt, slvProcMs, YES);
         ((SLVProcessSampleBufferFn)orig)(self, _cmd, fake);
         CFRelease(fake);
     } else {
+        if (mediaType == kCMMediaType_Video) SLVCamVideoBeat(fmt, slvProcMs, NO);
         ((SLVProcessSampleBufferFn)orig)(self, _cmd, sbuf);   // 拿不到假帧就放真帧，绝不黑屏
     }
 }
@@ -567,6 +629,143 @@ static void SLVCamDumpCandidates(const char *className) {
           hits.count ? [hits componentsJoinedByString:@", "] : @"(无)");
 }
 
+#pragma mark - RTC 编码参数探针（0.3.58）
+
+// 「对面看着糊」到底是编码档位低，还是美颜把细节磨掉了？
+// 这两件事在我们这一层看不到 —— 只能问宿主：把 Agora 真正收到的参数打出来。
+//
+// 全部**只读**：拦下来打完日志，原样转发给原实现，宿主行为一个字节都不变。
+// 之所以要单独做，是因为 0.3.57 的零拷贝对照场（素材 720x1280、和宿主格式完全一致、
+// 我们一个像素没动）对面**照样糊** —— 那问题就只能在这条链的下游。
+
+static NSString *SLVCamKV(id obj, NSString *key) {
+    if (!obj) return @"-";
+    @try {
+        id v = [obj valueForKey:key];
+        if (!v || v == [NSNull null]) return @"-";
+        return [v description];
+    } @catch (__unused NSException *e) {
+        return @"?";
+    }
+}
+
+/// dimension 是 CGSize，KVC 回来是 NSValue。日志里「1280x720」比「{1280, 720}」好认。
+static NSString *SLVCamKVSize(id obj, NSString *key) {
+    if (!obj) return @"-";
+    @try {
+        id v = [obj valueForKey:key];
+        if (!v || v == [NSNull null]) return @"-";
+        if ([v isKindOfClass:[NSValue class]]) {
+            const char *t = [(NSValue *)v objCType];
+            if (t && strcmp(t, @encode(CGSize)) == 0) {
+                CGSize s = [(NSValue *)v CGSizeValue];
+                return [NSString stringWithFormat:@"%.0fx%.0f", s.width, s.height];
+            }
+        }
+        return [v description];
+    } @catch (__unused NSException *e) {
+        return @"?";
+    }
+}
+
+#define SLV_MAX_RTC_HOOKS 8
+static Method gSLRtcMethod[SLV_MAX_RTC_HOOKS];
+static IMP    gSLRtcOrig[SLV_MAX_RTC_HOOKS];
+static int    gSLRtcCount = 0;
+static BOOL   sSLRtcLogged = NO;
+
+/// 按 Method 指针存原实现：同一个 selector 在父类和子类上都可能被调用，
+/// 存成「一个 selector 一份」会把子类那次转发到父类的实现上去。
+static IMP SLVCamRtcOrigIMP(id self, SEL _cmd) {
+    Method m = class_getInstanceMethod([self class], _cmd);
+    for (int i = 0; i < gSLRtcCount; i++) {
+        if (gSLRtcMethod[i] == m) return gSLRtcOrig[i];
+    }
+    return NULL;
+}
+
+static BOOL SLVCamRtcHook(Class cls, NSString *name, IMP imp) {
+    if (!cls) return NO;
+    SEL sel = NSSelectorFromString(name);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NO;
+    for (int i = 0; i < gSLRtcCount; i++) if (gSLRtcMethod[i] == m) return YES;
+    if (gSLRtcCount >= SLV_MAX_RTC_HOOKS) return NO;
+    gSLRtcMethod[gSLRtcCount] = m;
+    gSLRtcOrig[gSLRtcCount] = method_getImplementation(m);
+    gSLRtcCount++;
+    method_setImplementation(m, imp);
+    SLVLog(@"RTC: 挂上 -[%s %s]", class_getName(cls), sel_getName(sel));
+    return YES;
+}
+
+// 返回类型必须是 int：这几个 API 都返回错误码，宿主会拿它判断成败。
+// 声明成 void 会丢返回值，轻则日志里一堆误判，重则宿主以为设置失败而重试。
+static int SLVCamRtcVideoConfig(id self, SEL _cmd, id cfg) {
+    SLVLog(@"RTC: 编码档位 dimension=%@ · fps=%@ · bitrate=%@ · orientation=%@ · degradation=%@ · mirror=%@",
+          SLVCamKVSize(cfg, @"dimension"), SLVCamKV(cfg, @"frameRate"),
+          SLVCamKV(cfg, @"bitrate"), SLVCamKV(cfg, @"orientationMode"),
+          SLVCamKV(cfg, @"degradationPreference"), SLVCamKV(cfg, @"mirrorMode"));
+    IMP o = SLVCamRtcOrigIMP(self, _cmd);
+    return o ? ((int (*)(id, SEL, id))o)(self, _cmd, cfg) : 0;
+}
+
+static int SLVCamRtcBeauty(id self, SEL _cmd, BOOL on, id opt) {
+    SLVLog(@"RTC: 美颜 %@ · lightening=%@ smoothness=%@ redness=%@ sharpness=%@",
+          on ? @"开" : @"关",
+          SLVCamKV(opt, @"lighteningLevel"), SLVCamKV(opt, @"smoothnessLevel"),
+          SLVCamKV(opt, @"rednessLevel"), SLVCamKV(opt, @"sharpnessLevel"));
+    IMP o = SLVCamRtcOrigIMP(self, _cmd);
+    return o ? ((int (*)(id, SEL, BOOL, id))o)(self, _cmd, on, opt) : 0;
+}
+
+static int SLVCamRtcVideoProfile(id self, SEL _cmd, NSInteger profile, BOOL swap) {
+    SLVLog(@"RTC: 视频档位 profile=%ld · swapWH=%@（0=160x120 1=320x180 2=480x360 3=640x360 4=640x480 …）",
+          (long)profile, swap ? @"Y" : @"N");
+    IMP o = SLVCamRtcOrigIMP(self, _cmd);
+    return o ? ((int (*)(id, SEL, NSInteger, BOOL))o)(self, _cmd, profile, swap) : 0;
+}
+
+static int SLVCamRtcCameraConfig(id self, SEL _cmd, id cfg) {
+    SLVLog(@"RTC: 采集配置 %@", SLVCamKV(cfg, @"description") ?: @"-");
+    IMP o = SLVCamRtcOrigIMP(self, _cmd);
+    return o ? ((int (*)(id, SEL, id))o)(self, _cmd, cfg) : 0;
+}
+
+/// 4.x 进频道走的是这个。它本身不带分辨率，但能证明「探针确实活着」——
+/// 如果它打了、编码档位那条一直不打，就说明陌陌没走标准 API，得换地方找。
+static int SLVCamRtcChannelMedia(id self, SEL _cmd, id opt) {
+    SLVLog(@"RTC: 频道媒体选项 publishCamera=%@ publishMic=%@ autoSubscribe=%@",
+          SLVCamKV(opt, @"publishCameraTrack"),
+          SLVCamKV(opt, @"publishMicrophoneTrack"),
+          SLVCamKV(opt, @"autoSubscribeAudio"));
+    IMP o = SLVCamRtcOrigIMP(self, _cmd);
+    return o ? ((int (*)(id, SEL, id))o)(self, _cmd, opt) : 0;
+}
+
+/// RTC SDK 是懒加载的：首次扫描时可能还不存在。所以这个函数可以被反复调用，
+/// 一旦类出现了就挂上，之后一直有效。
+static void SLVCamInstallRtcProbes(void) {
+    if (sSLRtcLogged) return;
+    Class kit = objc_getClass("AgoraRtcEngineKit");
+    if (!kit) return;
+
+    SLVCamRtcHook(kit, @"setVideoEncoderConfiguration:", (IMP)SLVCamRtcVideoConfig);
+    SLVCamRtcHook(kit, @"setBeautyEffectOptions:options:", (IMP)SLVCamRtcBeauty);
+    SLVCamRtcHook(kit, @"setVideoProfile:swapWidthAndHeight:", (IMP)SLVCamRtcVideoProfile);
+    SLVCamRtcHook(kit, @"setCameraCapturerConfiguration:", (IMP)SLVCamRtcCameraConfig);
+    SLVCamRtcHook(kit, @"updateChannelWithMediaOptions:", (IMP)SLVCamRtcChannelMedia);
+
+    // 一个都没命中 = 这个类不是 RTC 引擎（或者陌陌用的是别家 SDK）。
+    // 不置标志，下次会话加输出时再试一遍 —— 总比一次没命中就永久放弃好。
+    if (gSLRtcCount == 0) {
+        SLVLog(@"RTC: AgoraRtcEngineKit 存在但 5 个方法全没命中，等下次会话再试");
+        return;
+    }
+    sSLRtcLogged = YES;
+    SLVLog(@"RTC: 编码/美颜探针已布点 %d 项（只读，不改宿主行为）", gSLRtcCount);
+}
+
 #pragma mark - 会话输出探测
 
 // App 到底往会话里加了哪些输出？音频是不是走 AVCaptureAudioDataOutput，
@@ -584,6 +783,8 @@ static void SLVCamAddOutput(id self, SEL _cmd, id output) {
     // 会话开始装配输出，往往意味着 RTC / 录音 SDK 已经加载完了，
     // 这时候补扫一次符号，把刚才还不存在的镜像覆盖上
     SLVCamInstallAudioUnitHook();
+    // 0.3.58：RTC 类多半也是这会儿才齐，编码/美颜探针在这里补挂一次
+    SLVCamInstallRtcProbes();
 }
 
 static void SLVCamHookSessionOutputs(void) {
@@ -1095,6 +1296,9 @@ void SLVCamInstallHooks(void) {
 
     // 抖音拍照走 AVCapturePhotoOutput，又是另一条 —— 两条都要挂
     SLVCamInstallPhotoOutputHook();
+
+    // 0.3.58：RTC 编码档位 / 美颜强度探针。类没加载的话会在会话加输出时补挂。
+    SLVCamInstallRtcProbes();
 
     if (sSLCamHookCount == 0) {
         SLVLog(@"注入: 没找到 _processSampleBuffer: —— 该系统版本可能改了私有 API，"

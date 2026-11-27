@@ -160,6 +160,11 @@ BOOL SLVCamIsMomoProcess(void);
 /// 拍照要拿它判断「预览是竖屏还是横屏」，从而决定补多少度。没有帧返回 CGSizeZero。
 - (CGSize)latestFrameSize;
 
+/// 出帧路径计数（0.3.58 诊断）：直出 = 素材原样交出去（零拷贝，画质无损）；
+/// 渲染 = 过了一趟 CoreImage（缩放/旋转/镜像）。
+/// 直出占绝大多数，说明「糊」不可能是我们这一层造成的 —— 我们一个像素都没动。
+- (void)videoPathCountsDirect:(NSUInteger *)direct render:(NSUInteger *)render;
+
 /// 素材可用：路径非空且文件存在
 - (BOOL)isReady;
 
