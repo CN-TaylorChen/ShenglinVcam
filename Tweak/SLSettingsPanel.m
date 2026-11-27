@@ -22,7 +22,7 @@
 #import "SLLogViewController.h"
 #import "SLLog.h"
 
-#define SLVVersion @"0.3.58"
+#define SLVVersion @"0.3.59"
 
 // 每个开关的 tag。原来只有「循环 / 镜像 / 音频」三个设了 tag（0/1/2），
 // 「启用」那个没设，默认就是 0 —— 跟「循环播放」撞在一起。以前没人按 tag 区分，
@@ -34,6 +34,7 @@ typedef NS_ENUM(NSInteger, SLVSwitchTag) {
     SLVSwitchTagAudio   = 13,
     SLVSwitchTagSquareCrop = 14,   // 0.3.12：陌陌实拍时刻不放大（只在陌陌里显示）
     SLVSwitchTagLog     = 15,      // 0.3.52：记录运行日志
+    SLVSwitchTagEncodeBoost = 16,  // 0.3.59：抬高清上行档位（只在陌陌里显示）
 };
 
 // 定义在下面的「存储」段里，这里先用一下
@@ -267,6 +268,7 @@ static UIView *SLVMakeHeader(NSString *text, CGFloat x, CGFloat width) {
                 case SLVSwitchTagMirror:  v = SLVBoolForKey(kSLCamMirrorKey, NO); break;
                 case SLVSwitchTagAudio:   v = SLVBoolForKey(kSLCamAudioKey, YES); break;
                 case SLVSwitchTagSquareCrop: v = SLVBoolForKey(kSLCamSquareCropKey, NO); break;
+                case SLVSwitchTagEncodeBoost: v = SLVBoolForKey(kSLCamEncodeBoostKey, NO); break;
                 case SLVSwitchTagLog:     v = SLVLogOn(); break;
                 default: continue;
             }
@@ -402,7 +404,7 @@ static NSString *SLVRotationSummary(void) {
     if (section == 1) return 1;   // 当前素材（预览已挪进素材页，见 0.3.3）
     // 0.3.12：「实拍时刻不放大」只对陌陌有意义，别的 App 不显示这一行 ——
     // 显示一个拨了没反应的开关比不显示更让人困惑。
-    if (section == 2) return SLVCamIsMomoProcess() ? 4 : 3;   // 循环 + 镜像 + 旋转 (+ 实拍时刻)
+    if (section == 2) return SLVCamIsMomoProcess() ? 5 : 3;   // 循环 + 镜像 + 旋转 (+ 实拍时刻 + 高清上行)
     if (section == 3) return 1;   // 音频
     // 0.3.52：诊断组多了「记录日志」开关，日志页降到第二行
     return 2;                     // 记录日志 + 运行日志
@@ -490,6 +492,14 @@ static NSString *SLVRotationSummary(void) {
             sw.on = SLVBoolForKey(kSLCamSquareCropKey, NO);
             sw.tag = SLVSwitchTagSquareCrop;
             [sw addTarget:self action:@selector(sl_optionChanged:) forControlEvents:UIControlEventValueChanged];
+        } else if (ip.row == 4) {
+            // 0.3.59：只有陌陌走到这一行。开 = 抬高清上行档位（更清晰、更耗流量），
+            // 关 = 原样透传宿主自己的档位。
+            cell.textLabel.text = @"提高通话画质";
+            sw = [[UISwitch alloc] init];
+            sw.on = SLVBoolForKey(kSLCamEncodeBoostKey, NO);
+            sw.tag = SLVSwitchTagEncodeBoost;
+            [sw addTarget:self action:@selector(sl_optionChanged:) forControlEvents:UIControlEventValueChanged];
         } else {
             BOOL loop = (ip.row == 0);
             cell.textLabel.text = loop ? @"循环播放" : @"镜像画面";
@@ -576,7 +586,7 @@ static NSString *SLVRotationSummary(void) {
 }
 
 - (void)sl_optionChanged:(UISwitch *)sw {
-    // tag 见文件头的 SLVSwitchTag：10 启用 / 11 循环 / 12 镜像 / 13 音频 / 14 实拍时刻 / 15 日志
+    // tag 见文件头的 SLVSwitchTag：10 启用 / 11 循环 / 12 镜像 / 13 音频 / 14 实拍时刻 / 15 日志 / 16 高清上行
     if (sw.tag == SLVSwitchTagLog) {
         // 0.3.52：只是记不记日志，跟帧源无关，不用 SLVCamReloadAll
         SLVLogSetEnabled(sw.on);
@@ -593,6 +603,13 @@ static NSString *SLVRotationSummary(void) {
         SLVSetBool(kSLCamSquareCropKey, sw.on);
         SLVCamReloadAll();
         SLVToast(sw.on ? @"实拍时刻：不放大" : @"实拍时刻：铺满整帧");
+        return;
+    }
+    if (sw.tag == SLVSwitchTagEncodeBoost) {
+        // 只在宿主下一次把档位交给引擎时才读这个开关（每次通话开始都会交一次），
+        // 所以通话中途拨的话，本次通话不受影响 —— 说清楚，别让人以为没生效。
+        SLVSetBool(kSLCamEncodeBoostKey, sw.on);
+        SLVToast(sw.on ? @"画质提高 · 下次通话生效" : @"画质恢复默认");
         return;
     }
     SLVSetBool(sw.tag == SLVSwitchTagLoop ? kSLCamLoopKey : kSLCamMirrorKey, sw.on);

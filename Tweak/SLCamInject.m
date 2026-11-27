@@ -637,6 +637,8 @@ static void SLVCamDumpCandidates(const char *className) {
 // 全部**只读**：拦下来打完日志，原样转发给原实现，宿主行为一个字节都不变。
 // 之所以要单独做，是因为 0.3.57 的零拷贝对照场（素材 720x1280、和宿主格式完全一致、
 // 我们一个像素没动）对面**照样糊** —— 那问题就只能在这条链的下游。
+//
+// 0.3.59 起唯一例外是 setVideoEncoderConfiguration：开关打开时会先改写档位再转发。
 
 static NSString *SLVCamKV(id obj, NSString *key) {
     if (!obj) return @"-";
@@ -701,11 +703,135 @@ static BOOL SLVCamRtcHook(Class cls, NSString *name, IMP imp) {
 
 // 返回类型必须是 int：这几个 API 都返回错误码，宿主会拿它判断成败。
 // 声明成 void 会丢返回值，轻则日志里一堆误判，重则宿主以为设置失败而重试。
+
+// ---- 0.3.59：上行档位抬高（默认关） ----
+//
+// 0.3.58 的探针把「糊」定位成一条硬上限：陌陌交给 Agora 的是 fps=15 · bitrate=500。
+// 500kbps ÷ 15fps ÷ 921600px ≈ 0.036 bit/像素 —— 这个密度下编码器必然降分辨率，
+// 我们送 720x1280，对面拿到的只有 360p 级别。
+//
+// 同一个网络下安卓端看着明显更清楚，说明带宽不是瓶颈，是 iOS 端自己压得太狠。
+// 所以这里做一件事：宿主把档位交给引擎之前，先抬上去再转发。
+//
+// 默认关 —— 高码率在弱网下会更卡、更耗电，得让用户自己决定要不要。
+#define SLV_ENC_MIN_FPS       24
+#define SLV_ENC_MIN_KBPS    1600
+#define SLV_ENC_SHORT_SIDE    720    // 短边至少 720（竖屏 720x1280 / 横屏 1280x720）
+#define SLV_ENC_LONG_MAX     1280    // 长边不再往上加，免得一路顶到 4K 白耗带宽
+
+static BOOL SLVCamEncodeBoostOn(void) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:kSLCamEncodeBoostKey];
+    return v ? [v boolValue] : NO;
+}
+
+/// 按候选键名依次取，第一个取到的就是它。Agora 各版本这个属性叫法不完全一样，
+/// 0.3.58 只试了 dimension，日志里一直打「-」正是这个原因。
+static id SLVCamKVFirst(id obj, NSArray<NSString *> *keys, NSString **hitKey) {
+    if (!obj) return nil;
+    for (NSString *k in keys) {
+        @try {
+            id v = [obj valueForKey:k];
+            if (v && v != [NSNull null]) {
+                if (hitKey) *hitKey = k;
+                return v;
+            }
+        } @catch (__unused NSException *e) { }
+    }
+    return nil;
+}
+
+/// 把宿主给的档位抬到「看得清」的水平。返回 YES 表示真的动了。
+/// 全部只改这份配置对象：宿主本来就是要把它交给引擎的，改它等于改了它的意图，
+/// 但不会碰到引擎之外的任何状态。
+static BOOL SLVCamRaiseEncoderConfig(id cfg, NSInteger *outFps, NSInteger *outKbps,
+                                     CGSize *outDim, BOOL *hasDim,
+                                     NSInteger *inFps, NSInteger *inKbps, CGSize *inDim) {
+    if (!cfg) return NO;
+
+    NSString *dimKey = nil;
+    id dimVal = SLVCamKVFirst(cfg, @[@"dimension", @"videoDimension", @"size"], &dimKey);
+
+    NSInteger fps = [[SLVCamKVFirst(cfg, @[@"frameRate"], NULL) ?: @0] integerValue];
+    NSInteger kbps = [[SLVCamKVFirst(cfg, @[@"bitrate"], NULL) ?: @0] integerValue];
+    *inFps = fps;
+    *inKbps = kbps;
+    *inDim = CGSizeZero;
+    *hasDim = NO;
+
+    CGSize dim = CGSizeZero;
+    if ([dimVal isKindOfClass:[NSValue class]]) {
+        const char *t = [(NSValue *)dimVal objCType];
+        if (t && strcmp(t, @encode(CGSize)) == 0) dim = [(NSValue *)dimVal CGSizeValue];
+    }
+    if (dim.width >= 2 && dim.height >= 2) {
+        *hasDim = YES;
+        *inDim = dim;
+    }
+
+    NSInteger tFps = MAX(fps, SLV_ENC_MIN_FPS);
+    NSInteger tKbps = MAX(kbps, SLV_ENC_MIN_KBPS);
+    CGSize tDim = dim;
+
+    if (*hasDim) {
+        CGFloat mn = MIN(dim.width, dim.height);
+        CGFloat mx = MAX(dim.width, dim.height);
+        CGFloat k = 1.0;
+        if (mn < SLV_ENC_SHORT_SIDE) k = SLV_ENC_SHORT_SIDE / mn;
+        if (mx * k > SLV_ENC_LONG_MAX) k = SLV_ENC_LONG_MAX / mx;
+        if (k > 1.0) {
+            // 编码器只吃偶数边长，差 1 像素会被拒
+            tDim = CGSizeMake(round(dim.width * k / 2.0) * 2.0,
+                              round(dim.height * k / 2.0) * 2.0);
+        }
+    }
+
+    BOOL changed = NO;
+    if (tFps != fps) {
+        @try { [cfg setValue:@(tFps) forKey:@"frameRate"]; changed = YES; }
+        @catch (__unused NSException *e) { }
+    }
+    if (tKbps != kbps) {
+        @try { [cfg setValue:@(tKbps) forKey:@"bitrate"]; changed = YES; }
+        @catch (__unused NSException *e) { }
+    }
+    if (*hasDim && !CGSizeEqualToSize(tDim, dim) && dimKey) {
+        @try { [cfg setValue:[NSValue valueWithCGSize:tDim] forKey:dimKey]; changed = YES; }
+        @catch (__unused NSException *e) { }
+    }
+
+    *outFps = tFps;
+    *outKbps = tKbps;
+    *outDim = tDim;
+    return changed;
+}
+
 static int SLVCamRtcVideoConfig(id self, SEL _cmd, id cfg) {
-    SLVLog(@"RTC: 编码档位 dimension=%@ · fps=%@ · bitrate=%@ · orientation=%@ · degradation=%@ · mirror=%@",
-          SLVCamKVSize(cfg, @"dimension"), SLVCamKV(cfg, @"frameRate"),
-          SLVCamKV(cfg, @"bitrate"), SLVCamKV(cfg, @"orientationMode"),
-          SLVCamKV(cfg, @"degradationPreference"), SLVCamKV(cfg, @"mirrorMode"));
+    NSString *dimKey = nil;
+    id dimVal = SLVCamKVFirst(cfg, @[@"dimension", @"videoDimension", @"size"], &dimKey);
+    NSString *dimText = dimKey ? SLVCamKVSize(cfg, dimKey) : @"-";
+
+    if (!SLVCamEncodeBoostOn()) {
+        SLVLog(@"RTC: 编码档位 dimension=%@ · fps=%@ · bitrate=%@ · orientation=%@ · degradation=%@ · mirror=%@",
+              dimText, SLVCamKV(cfg, @"frameRate"), SLVCamKV(cfg, @"bitrate"),
+              SLVCamKV(cfg, @"orientationMode"), SLVCamKV(cfg, @"degradationPreference"),
+              SLVCamKV(cfg, @"mirrorMode"));
+    } else {
+        NSInteger iFps = 0, iKbps = 0, tFps = 0, tKbps = 0;
+        CGSize iDim = CGSizeZero, tDim = CGSizeZero;
+        BOOL hasDim = NO;
+        BOOL changed = SLVCamRaiseEncoderConfig(cfg, &tFps, &tKbps, &tDim, &hasDim,
+                                                &iFps, &iKbps, &iDim);
+        NSString *dimFrom = hasDim ? [NSString stringWithFormat:@"%.0fx%.0f", iDim.width, iDim.height] : @"-";
+        NSString *dimTo = hasDim ? [NSString stringWithFormat:@"%.0fx%.0f", tDim.width, tDim.height] : @"-";
+        if (changed) {
+            SLVLog(@"RTC: 编码档位 抬高 %ldfps/%ldkbps/%@ → %ldfps/%ldkbps/%@（已改写，再转发给引擎）",
+                  (long)iFps, (long)iKbps, dimFrom, (long)tFps, (long)tKbps, dimTo);
+        } else {
+            SLVLog(@"RTC: 编码档位 %ldfps/%ldkbps/%@ —— 已经不低于目标，原样转发",
+                  (long)iFps, (long)iKbps, dimFrom);
+        }
+    }
+
     IMP o = SLVCamRtcOrigIMP(self, _cmd);
     return o ? ((int (*)(id, SEL, id))o)(self, _cmd, cfg) : 0;
 }
@@ -763,7 +889,7 @@ static void SLVCamInstallRtcProbes(void) {
         return;
     }
     sSLRtcLogged = YES;
-    SLVLog(@"RTC: 编码/美颜探针已布点 %d 项（只读，不改宿主行为）", gSLRtcCount);
+    SLVLog(@"RTC: 编码/美颜探针已布点 %d 项（编码档位可改写，其余只读）", gSLRtcCount);
 }
 
 #pragma mark - 会话输出探测
