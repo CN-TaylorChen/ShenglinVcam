@@ -42,13 +42,24 @@ static BOOL sLoggedFirstAudio = NO;
 static int  sSLCamFailCount = 0;
 static int  sSLCamAudioFailCount = 0;
 static int  sSLCamBadPTS = 0;
-static int  sSLCamTimingFixLogged = 0;
 static int  sSLCamOwnFmtLogged = 0;
 static int  sSLCamDTSFixLogged = 0;
 static int  sSLCamAttachLogged = 0;
 static int  sSLCamSetAttachFailLogged = 0;
 static int  sSLCamOwnFmtExtFailLogged = 0;
 static int  sSLCamOwnFmtRejectedLogged = 0;
+
+// ---- 0.3.61：按 output 分槽记上一帧 PTS，用来算真实帧间隔 ----
+//
+// 为什么不是一个全局变量：微信会同时挂预览/通话两路 AVCaptureVideoDataOutput，
+// 两路 PTS 交错到达，用全局变量会把 66ms 的间隔算成 33ms —— 误报 30fps，
+// 恰好又掉回这次「码率白抬」的同一个坑里。按 output 对象分槽，各算各的。
+#define SLV_TS_SLOTS 4
+static const void *sSLCamTSSelf[SLV_TS_SLOTS];
+static CMTime      sSLCamTSPrev[SLV_TS_SLOTS];
+static os_unfair_lock sSLCamTSLock = OS_UNFAIR_LOCK_INIT;
+static double sSLCamDurLastMs = 0;      // 最近一帧填进去的间隔（心跳直接打这个）
+static int    sSLCamDurFixLogged = 0;
 
 /// 四字符码转可读串（'BGRA' / '420f'），日志里比裸数字好认
 static NSString *SLVFourCC(OSType v) {
@@ -62,6 +73,37 @@ static NSString *SLVFourCC(OSType v) {
     return @(c);
 }
 
+/// 本帧与「同一 output 上一帧」的间隔（毫秒）。
+/// 没有上一帧、或不属于同一路流、或时基不单调时返回 -1（调用方自己兜底）。
+static double SLVCamFrameIntervalMs(const void *out, CMTime pts) {
+    if (!out || !CMTIME_IS_VALID(pts)) return -1;
+
+    double ms = -1;
+    os_unfair_lock_lock(&sSLCamTSLock);
+    int slot = -1, empty = -1;
+    for (int i = 0; i < SLV_TS_SLOTS; i++) {
+        if (sSLCamTSSelf[i] == out) { slot = i; break; }
+        if (!sSLCamTSSelf[i] && empty < 0) empty = i;
+    }
+    if (slot < 0 && empty >= 0) {
+        slot = empty;
+        sSLCamTSSelf[slot] = out;
+        sSLCamTSPrev[slot] = kCMTimeInvalid;
+    }
+    if (slot >= 0) {
+        CMTime prev = sSLCamTSPrev[slot];
+        if (CMTIME_IS_VALID(prev)) {
+            CMTime d = CMTimeSubtract(pts, prev);
+            if (CMTIME_IS_VALID(d) && CMTIME_IS_POSITIVE(d)) {
+                ms = CMTimeGetSeconds(d) * 1000.0;
+            }
+        }
+        sSLCamTSPrev[slot] = pts;
+    }
+    os_unfair_lock_unlock(&sSLCamTSLock);
+    return ms;
+}
+
 // ---- 0.3.58：视频心跳 ----
 //
 // 0.3.57 的日志里音频有六七个指标，视频一个都没有 —— 所以「对面看着糊」只能靠猜。
@@ -70,6 +112,7 @@ static NSString *SLVFourCC(OSType v) {
 //   · 我们替换成功多少帧  → 少了说明打包失败或没数据，宿主拿到的是重复帧
 //   · 每帧处理花多久      → 超 33ms 就掉到 30fps 以下
 //   · 直出 / 渲染         → 直出 = 我们一个像素都没动，糊就怨不到这层
+// 0.3.61 补第五个：帧间隔 —— 就是写进 duration 的那个值，也是码控摊预算的依据
 static uint64_t sSLCamVideoAsked = 0;
 static uint64_t sSLCamVideoServed = 0;
 static uint64_t sSLCamVideoBypass = 0;
@@ -117,8 +160,8 @@ static void SLVCamVideoBeat(CMFormatDescriptionRef fmt, double procMs, BOOL serv
 
     CMVideoDimensions d = fmt ? CMVideoFormatDescriptionGetDimensions(fmt) : (CMVideoDimensions){0, 0};
     OSType sub = fmt ? CMFormatDescriptionGetMediaSubType(fmt) : 0;
-    SLVLog(@"视频: 心跳 %.1fs 宿主来要 %llu 帧（%.1ffps）· 替换 %llu / 放行 %llu · 处理均 %.1fms 峰 %.1fms · 宿主 %dx%d %@ · 直出累计 %lu / 渲染累计 %lu",
-          win, (unsigned long long)asked, fps,
+    SLVLog(@"视频: 心跳 %.1fs 宿主来要 %llu 帧（%.1ffps）· 帧间隔 %.1fms · 替换 %llu / 放行 %llu · 处理均 %.1fms 峰 %.1fms · 宿主 %dx%d %@ · 直出累计 %lu / 渲染累计 %lu",
+          win, (unsigned long long)asked, fps, sSLCamDurLastMs,
           (unsigned long long)servedN, (unsigned long long)bypassN,
           avg, sSLCamProcMaxMs, d.width, d.height, SLVFourCC(sub),
           (unsigned long)direct, (unsigned long)render);
@@ -378,24 +421,45 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
             timing.decodeTimeStamp       = CMSampleBufferGetDecodeTimeStamp(sbuf);
             timing.duration              = CMSampleBufferGetDuration(sbuf);
 
-            // duration 必须是「有效 + 非负」，否则 CMSampleBufferCreateReady 会以
-            // kCMSampleBufferError_InvalidSampleTimingInfo 失败 —— 这个错跟格式无关，
-            // 但表现和格式错一模一样（每帧都失败）。采集帧的 duration 经常是 indefinite，
-            // 光判 CMTIME_IS_INVALID 拦不住。
-            if (!CMTIME_IS_VALID(timing.duration) || CMTimeCompare(timing.duration, kCMTimeZero) < 0) {
-                if (sSLCamTimingFixLogged++ == 0) {
-                    SLVLog(@"注入: 真帧 duration 非法（value=%lld scale=%d flags=%u），已归一成 1/30",
-                          timing.duration.value, timing.duration.timescale, timing.duration.flags);
+            // 0.3.61：duration 必须反映**真实帧间隔**，不能写死 1/30。
+            //
+            // 0.3.60 及之前这里一律填 1/30。后果：宿主按 15fps 送帧，我们却告诉下游
+            // 「每帧 33.3ms」，等于宣称这是 30fps 的流。Agora 内部的码率控制是按
+            // **声明帧率**摊每帧预算的 —— 声明 30fps，就按每帧 bitrate/30 发；实际只有
+            // 一半的帧进来，总发出码率就只剩一半。设 4000kbps 实际跑出 ~2000，
+            // 抬码率当然没感觉。
+            // 更关键的是：这条错误信息连零拷贝直出也一起带着（直出只跳过像素，
+            // 不跳过 timing），所以才会出现「像素一个字节没动，对面还是糊」。
+            //
+            // duration 还必须是「有效 + 非负」，否则 CMSampleBufferCreateReady 会以
+            // kCMSampleBufferError_InvalidSampleTimingInfo 失败，表现和格式错一模一样。
+            CMTime hostDur = timing.duration;
+            if (CMTIME_IS_VALID(hostDur) && CMTimeCompare(hostDur, kCMTimeZero) > 0) {
+                // 宿主给了合法时长，信它。
+            } else {
+                double gapMs = SLVCamFrameIntervalMs((__bridge void *)self,
+                                                     timing.presentationTimeStamp);
+                // 夹在 1/60 ~ 1/10：太小说明两路流混在了一起（会误报高帧率、
+                // 把码率预算继续摊薄），太大说明中间断过流（按断档时长声明会让
+                // 编码器以为帧率骤降，反手砍码率）。
+                if (!(gapMs > 0)) gapMs = 66.7;     // 没有上一帧：按陌陌通话的 15fps 兜底
+                if (gapMs < 16.7) gapMs = 16.7;
+                if (gapMs > 100.0) gapMs = 100.0;
+                timing.duration = CMTimeMakeWithSeconds(gapMs / 1000.0, 1000000);
+                if (sSLCamDurFixLogged++ == 0) {
+                    SLVLog(@"注入: duration 按真实帧间隔填 %.1fms（宿主原值 value=%lld scale=%d flags=%u，不再写死 1/30）",
+                          gapMs, hostDur.value, hostDur.timescale, hostDur.flags);
                 }
-                timing.duration = CMTimeMake(1, 30);
             }
+            sSLCamDurLastMs = CMTimeGetSeconds(timing.duration) * 1000.0;
             if (!CMTIME_IS_VALID(timing.decodeTimeStamp)) {
+                // 实时采集没有 B 帧，dts 本来就该等于 pts。留 invalid 会让部分链路
+                // 自己按 duration 累加时间轴，又一次把错误的帧率坐实。
                 if (sSLCamDTSFixLogged++ == 0) {
-                    SLVLog(@"注入: 真帧 dts 非法（value=%lld scale=%d flags=%u），已置为 invalid",
-                          timing.decodeTimeStamp.value, timing.decodeTimeStamp.timescale,
-                          timing.decodeTimeStamp.flags);
+                    SLVLog(@"注入: 真帧 dts 非法（value=%lld scale=%d），已按 PTS 补齐",
+                          timing.decodeTimeStamp.value, timing.decodeTimeStamp.timescale);
                 }
-                timing.decodeTimeStamp = kCMTimeInvalid;
+                timing.decodeTimeStamp = timing.presentationTimeStamp;
             }
             if (!CMTIME_IS_VALID(timing.presentationTimeStamp)) {
                 // 没有有效的 PTS 就没法接进宿主的时间轴，硬塞一个反而会把下游时序搞乱。
