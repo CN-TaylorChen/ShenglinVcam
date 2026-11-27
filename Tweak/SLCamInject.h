@@ -35,7 +35,11 @@ BOOL SLVCamHooksInstalled(void);
 int SLVCamHookCount(void);
 
 /// 宿主的音频是否确实从 AVCapture 走（见过 AVCapture 的音频采样缓冲）。
-/// AudioUnit 那条链路据此让路，避免两条链路同时消费同一个 PCM 池。
+/// 注意：这是「历史上一票否决」的旧判据，0.3.55 起让路改看
+/// SLVCamFeed 的 externalAudioActive（1 秒内真的来拿过数据）。
 BOOL SLVCamAVCaptureAudioSeen(void);
+
+/// 走 AVCapture 音频链的帧数（0.3.55 音频体检用）
+int SLVCamAVCaptureAudioFrameCount(void);
 
 NS_ASSUME_NONNULL_END

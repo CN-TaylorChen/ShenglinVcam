@@ -123,6 +123,11 @@ BOOL SLVCamIsMomoProcess(void);
 /// 这个消费者此刻是否真的在拉数据（1 秒内来过）。key = NULL 表示 AVCapture / AudioQueue。
 - (BOOL)audioConsumerActive:(const void * _Nullable)key;
 
+/// 宿主是否正走 AVCapture / AudioQueue 那条音频链（1 秒内真的来拿过数据）。
+/// 用来决定 AudioUnit / AudioQueue 两条链路要不要让路 —— 不加锁、不阻塞，
+/// 实时音频回调里可以直接调用。
+- (BOOL)externalAudioActive;
+
 /// 实时音频线程专用：和 `audioForFormat:numBytes:` 一样，但**绝不阻塞**。
 /// 拿不到锁、或格式还没登记，就立刻返回 nil（注入层据此放行真麦克风）。
 /// 在宿主的音频回调里只能用它 —— 宁可漏一包，也不能把音频线程卡住。

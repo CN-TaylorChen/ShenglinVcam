@@ -324,8 +324,9 @@ static OSStatus SLVCamAudioUnitRender(AudioUnit unit, AudioUnitRenderActionFlags
     // 以前这里看的是「曾经见过 AVCapture 音频」这种一票否决标志，置上就永不清除。
     // 于是「先录一段视频消息、再打视频通话」这种最平常的操作里，通话整场都在
     // 让路 —— 而通话里根本没有 AVCapture 音频在跑，最后谁也不注入。
-    // 现在只认「那条链路 1 秒内真的来拿过数据」。
-    if (SLVCamAVCaptureAudioSeen() && [[SLVCamFeed shared] audioConsumerActive:NULL]) {
+    // 0.3.55：判据收到 feed 里做成「1 秒内真的来拿过数据」，并且是不加锁的 ——
+    // 这里跑在音频渲染线程上，绝不能等锁。
+    if ([[SLVCamFeed shared] externalAudioActive]) {
         if (!sLoggedYieldAVCap) {
             sLoggedYieldAVCap = YES;
             SLVLog(@"音频: 让路 —— 宿主音频正在走 AVCapture/AudioQueue，交给那条链路");
@@ -513,8 +514,14 @@ static void SLVCamAudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ,
               inBuffer ? (unsigned)inBuffer->mAudioDataByteSize : 0);
     }
 
+    // 0.3.55：让路判据和 AudioUnit 那条分支统一成「AVCapture 音频 1 秒内真的来过」。
+    //
+    // 以前这里是 `!SLVCamAVCaptureAudioSeen()` —— 一个永久标志。微信、QQ 都会为了
+    // 语音消息先建一次 AVCapture 音频输出，标志一置上，之后整场视频通话这条
+    // AudioQueue 链路全部让路，替换音频直接失效，而且日志上只有一句「已接管」。
+    BOOL externalAudio = [[SLVCamFeed shared] externalAudioActive];
     if (ctx->usable && inBuffer && inBuffer->mAudioData && inBuffer->mAudioDataByteSize > 0
-        && SLVCamInjecting() && !SLVCamAVCaptureAudioSeen()) {
+        && SLVCamInjecting() && !externalAudio) {
         // 这个回调跑在宿主的音频线程上，可能就在主线程的 runloop 里。
         // 所以只能走 tryAudioForFormat: —— 抢不到锁就放行这一包真麦克风，
         // 绝不能在这里等锁，否则宿主整条音频链路（乃至界面）都会被拖住。
@@ -596,6 +603,22 @@ static OSStatus SLVCamAudioQueueNewInput(const AudioStreamBasicDescription *fmt,
 
 #pragma mark - 安装
 
+/// 三条音频入口各自的流量数一次（0.3.55）。
+/// 宿主麦克风到底走哪条，只看这一行就够 —— 全 0 就是「一条都没走我们挂的入口」。
+static void SLVAudioCensus(const char *when) {
+    if (!SLVCamInjecting()) return;
+    int aqFired = 0;
+    for (int i = 0; i < gSLAQContextCount; i++) {
+        if (gSLAQContexts[i] && gSLAQContexts[i]->fired) aqFired++;
+    }
+    int av = SLVCamAVCaptureAudioFrameCount();
+    SLVLog(@"音频: 体检（%s）—— AudioUnitRender bus=1 %d 次 · AVCapture 音频 %d 帧 · AudioQueue 队列 %d 个（收到回调 %d 个）",
+          when, sBus1Calls, av, gSLAQContextCount, aqFired);
+    if (sBus1Calls == 0 && av == 0 && aqFired == 0) {
+        SLVLog(@"音频: 三条入口都没有数据 —— 宿主的麦克风不经过它们，替换音频不会生效（画面不受影响）");
+    }
+}
+
 // 崩溃哨兵。
 // 扫符号表这一步是整个插件里唯一「可能把宿主搞死」的操作 —— 一旦算错地址就是
 // EXC_BAD_ACCESS，用户看到的就是「装了插件 App 打不开」。
@@ -642,6 +665,21 @@ void SLVCamInstallAudioUnitHook(void) {
 
         // 走完了，撤哨兵 —— 下次正常启动不该再看到它
         [fm removeItemAtPath:guard error:NULL];
+
+        // 0.3.55：音频链路体检。
+        //
+        // 微信的麦克风一条入口都不走（日志里 AudioUnitRender 0 次、AudioQueue 也没有
+        // 回调），表现就是「插件装上了、画面换了、但对方听不到素材的声音」，而此前
+        // 日志里一个字都没有。20 秒后把三条链路各自的流量数一次，一眼就能看出
+        // 是「宿主根本不经过我们的入口」还是「进来了但没替换」。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            SLVAudioCensus("20 秒");
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            SLVAudioCensus("60 秒");
+        });
         return;
     }
 

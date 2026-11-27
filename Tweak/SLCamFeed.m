@@ -18,8 +18,33 @@
 #import <unistd.h>
 #import <math.h>
 
-#pragma mark - 渲染到 YUV 的正确姿势（0.3.5）
+#pragma mark - 宿主音频链路的活动状态（0.3.55）
 
+// 「宿主此刻是不是正在走 AVCapture / AudioQueue 那条音频链」。
+//
+// 以前这是 SLCamInject 里一个永久标志（见过 AVCapture 音频就置上，永不清除），
+// 于是「先录一段语音消息、再打视频通话」的 App（微信、QQ 都这样）通话整场都在让路，
+// 结果谁也不注入 —— 微信里「替换音频没反应」就是这么来的。
+//
+// 现在只认「1 秒内真的来拿过数据」。这里用原子读写而不是 _lock：这个判据要在
+// 实时音频线程里用，那边绝对不能等锁。存成毫秒整数 —— 整数原子操作在所有架构上
+// 都是内联的，不会牵出 libatomic。
+static int64_t gSLExternalAudioAtMs = 0;
+
+static inline int64_t SLVNowMs(void) {
+    return (int64_t)(CFAbsoluteTimeGetCurrent() * 1000.0);
+}
+
+static inline void SLVMarkExternalAudio(void) {
+    __atomic_store_n(&gSLExternalAudioAtMs, SLVNowMs(), __ATOMIC_RELAXED);
+}
+
+static inline BOOL SLVExternalAudioActiveNow(void) {
+    int64_t t = __atomic_load_n(&gSLExternalAudioAtMs, __ATOMIC_RELAXED);
+    return t > 0 && (SLVNowMs() - t) < 1000;
+}
+
+#pragma mark - 渲染到 YUV 的正确姿势（0.3.5）
 // 背景：宿主要的是 420f / 420v 双平面（NV12），而 CoreImage 的默认 CIContext 是
 // Metal 的 —— 往这种双平面 buffer 上 render，**亮度平面写对了、色度平面写错了**。
 // 症状是白底 + 亮绿的人形轮廓（色度里混进了亮度信息），只在「必须过 CoreImage」
@@ -363,6 +388,17 @@ typedef struct {
     double pts;             // 这个偏移处的素材时间（秒）
 } SLVAudioTS;
 
+// 0.3.55：目标格式的迟滞时间。
+//
+// 微信视频通话里同时挂着「预览」和「通话」两个 AVCaptureVideoDataOutput，
+// 它们的分辨率不同（日志里 1920x1080 与 1280x720 交替出现），两路帧混在同一个
+// hook 里进来，管线 key 就会来回变。每变一次都重建 reader —— 解码器重开、
+// 画面从头解一遍、卡一下。交替几次，整场通话就等于一直在重启。
+//
+// 新的 key 必须连续稳定这么久才真的切；这段等待里继续用旧管线出帧，
+// 因为渲染那一步本来就能把任意尺寸铺到宿主 buffer 上，尺寸变了并不需要换解码器。
+static const CFAbsoluteTime SLV_KEY_STABLE_SEC = 0.8;
+
 // 偏差超过这个就一刀对齐。正常稳态只有「生产端领跑水位」那 100ms 左右的固定
 // 差，超过 120ms 说明真的错开了。
 static const double SLV_AUDIO_SYNC_TOL = 0.12;
@@ -428,6 +464,11 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     CVPixelBufferRef _latestVideo;
     NSString *_pipelineKey;              // "875704422:1920x1080"，变了就要重建 reader
     BOOL _reconfigRequested;
+    // 0.3.55：目标格式迟滞（见 SLV_KEY_STABLE_SEC）
+    NSString *_pendingKey;
+    CFAbsoluteTime _pendingKeyAt;
+    CFAbsoluteTime _lastKeySwitchAt;
+    int _keySwitchCount;                 // 累计真正切换管线的次数（诊断用）
     NSMutableData *_audioPCM;
     // 0.3.49：按消费者分开的游标（key 是 AudioUnit 指针，NULL = AVCapture/AudioQueue 那条链）
     SLVAudioConsumer _audioConsumers[SLV_AUDIO_CONSUMERS];
@@ -816,6 +857,17 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
             }
 
             if (reconfig || !_reader) {
+                // 0.3.55：格式变化不该让画面回到素材开头。
+                //
+                // 以前 _resumeValid 只在「补挂音轨」那一处置上，任何其它重建都从 0 秒
+                // 重新解。陌陌一场通话只重建一两次，看不出来；微信会时不时重配采集
+                // 会话（日志里 1920x1080 / 1280x720 来回切），每重配一次画面就从开头
+                // 播一遍 —— 表现就是「视频一直重头开始 / 根本不像在通话」。
+                if (_reader) {
+                    [_lock lock];
+                    _resumeValid = CMTIME_IS_VALID(_lastVideoPTS) && CMTIME_IS_NUMERIC(_lastVideoPTS);
+                    [_lock unlock];
+                }
                 [self sl_buildReaderForKey:key];
                 if (!_reader) { usleep(30 * 1000); continue; }
             }
@@ -1007,6 +1059,21 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
 /// 生产端就停在那儿不动，而画面按墙钟继续走，差距永久留下。
 - (BOOL)sl_audioNeedMoreLocked {
     if (_audioBytesPerSecond == 0) return YES;      // 目标格式还没确定，先别停
+
+    // 0.3.55：没人在拉就不要再解。
+    //
+    // 旧判据只看「解到画面之后 120ms」，跟有没有消费者无关 —— 于是宿主每次重建
+    // 采集会话的那一秒空档里，生产端照样按画面时刻解了一秒音频；下一个 AudioUnit
+    // 接上时这些内容全都「已经过去了」，只能整段扔掉。日志里
+    // `丢掉已播过的 4898ms` 就是白解 4.9 秒换来的。
+    //
+    // 池子还空着的时候（刚起播）仍然先填一发，否则第一个消费者接上时前 120ms
+    // 一定是静音。
+    [self sl_pruneConsumersLocked];
+    if (_audioConsumerCount == 0) {
+        return _audioPCM.length < (NSUInteger)(_audioBytesPerSecond * SLV_AUDIO_HIGH_SEC);
+    }
+
     double vpts = [self sl_videoPTSLocked];
     if (!isnan(vpts) && !isnan(_audioHeadPTS)) {
         return _audioHeadPTS < vpts + SLV_AUDIO_HIGH_SEC;
@@ -1052,6 +1119,7 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
             double blk = _audioBytesPerSecond
                        ? (double)converted.length / (double)_audioBytesPerSecond : 0.0;
             double vpts = [self sl_videoPTSLocked];
+            AudioStreamBasicDescription srcA = _audioSrcASBD;
             // 无论这块要不要，生产端的位置都要前移 —— 否则「丢弃追帧」会永远以为
             // 自己还在原处，一轮 8 包全扔掉，白烧解码。
             if (!isnan(pts)) _audioHeadPTS = pts + blk;
@@ -1106,6 +1174,17 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
                     SLVLog(@"音频: 素材解出 未知格式（第 %lu 块 %luB · bits=%u flags=0x%x）",
                           (unsigned long)_audioPumped, (unsigned long)converted.length,
                           (unsigned)_audioDstASBD.mBitsPerChannel, (unsigned)_audioDstASBD.mFormatFlags);
+                } else if (db <= -90.0) {
+                    // 0.3.55：输出全零时把输入也量一遍。
+                    // 只报「-120 dBFS」分不清是「素材这一段本来就是静音」还是
+                    //「转码把声音弄丢了」，而微信那次就是卡在这个歧义上。
+                    double inDB = SLVPCMLoudnessdBFS(raw.bytes, raw.length, &srcA);
+                    SLVLog(@"音频: 素材解出 = 静音（第 %lu 块 %luB · 输入 %.1f dBFS · 源 %.0fHz %uch / 目标 %.0fHz %uch %uB/帧）%@",
+                          (unsigned long)_audioPumped, (unsigned long)converted.length,
+                          inDB, srcA.mSampleRate, (unsigned)srcA.mChannelsPerFrame,
+                          _audioDstASBD.mSampleRate, (unsigned)_audioDstASBD.mChannelsPerFrame,
+                          (unsigned)_audioDstASBD.mBytesPerFrame,
+                          (inDB > -90.0 ? @" ← 转码丢了声音" : @""));
                 } else {
                     SLVLog(@"音频: 素材解出 %.1f dBFS（第 %lu 块 %luB）",
                           db, (unsigned long)_audioPumped, (unsigned long)converted.length);
@@ -1142,29 +1221,43 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     memcpy(inBuf.mutableAudioBufferList->mBuffers[0].mData, input.bytes, input.length);
 
     AVAudioFrameCount cap = (AVAudioFrameCount)((double)frames * dstFmt.sampleRate / srcFmt.sampleRate) + 128;
-    AVAudioPCMBuffer *outBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:dstFmt frameCapacity:cap];
-    if (!outBuf) return nil;
 
-    __block BOOL supplied = NO;
-    NSError *err = nil;
-    AVAudioConverterOutputStatus st = [conv convertToBuffer:outBuf error:&err
-        withInputFromBlock:^AVAudioBuffer *(AVAudioPacketCount n, AVAudioConverterInputStatus *status) {
-            if (supplied) { *status = AVAudioConverterInputStatus_NoDataNow; return nil; }
-            supplied = YES;
-            *status = AVAudioConverterInputStatus_HaveData;
-            return inBuf;
-        }];
-    if (st == AVAudioConverterOutputStatus_Error || outBuf.frameLength == 0) return nil;
-
-    const AudioBufferList *abl = outBuf.audioBufferList;
-    if (abl->mNumberBuffers == 1) {
-        return [NSData dataWithBytes:abl->mBuffers[0].mData length:abl->mBuffers[0].mDataByteSize];
-    }
-    // 非交错多声道：拼成一块，配合 mFormatFlags 里的 NonInterleaved 由下游按 plane 读
+    // 0.3.55：一次 convertToBuffer 只取一轮输出是不够的。
+    //
+    // 采样率下降（44.1k → 16k，微信通话就是这个格式）时，转换器要先把内部的重采样
+    // 滤波器和 priming 喂满，第一轮常常只吐出一小段、甚至整段是零。以前只看第一轮，
+    // 于是微信日志里出现 `素材解出 -120.0 dBFS`（全零）—— 看起来像「素材没声音」，
+    // 其实只是转换器还没热身。现在一直取到 inputRanDry 为止，多轮结果拼起来。
     NSMutableData *out = [NSMutableData data];
-    for (UInt32 i = 0; i < abl->mNumberBuffers; i++) {
-        [out appendBytes:abl->mBuffers[i].mData length:abl->mBuffers[i].mDataByteSize];
+    __block BOOL supplied = NO;
+    for (int round = 0; round < 8; round++) {
+        AVAudioPCMBuffer *outBuf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:dstFmt frameCapacity:cap];
+        if (!outBuf) break;
+        NSError *err = nil;
+        AVAudioConverterOutputStatus st = [conv convertToBuffer:outBuf error:&err
+            withInputFromBlock:^AVAudioBuffer *(AVAudioPacketCount n, AVAudioConverterInputStatus *status) {
+                if (supplied) { *status = AVAudioConverterInputStatus_NoDataNow; return nil; }
+                supplied = YES;
+                *status = AVAudioConverterInputStatus_HaveData;
+                return inBuf;
+            }];
+        if (st == AVAudioConverterOutputStatus_Error) break;
+
+        const AudioBufferList *abl = outBuf.audioBufferList;
+        BOOL multiPlane = NO;
+        if (outBuf.frameLength > 0 && abl) {
+            multiPlane = (abl->mNumberBuffers > 1);
+            for (UInt32 i = 0; i < abl->mNumberBuffers; i++) {
+                if (abl->mBuffers[i].mData && abl->mBuffers[i].mDataByteSize > 0) {
+                    [out appendBytes:abl->mBuffers[i].mData length:abl->mBuffers[i].mDataByteSize];
+                }
+            }
+        }
+        // 非交错多声道是按 plane 拼接的，多轮拼会把 plane 交错 —— 那种格式只取第一轮。
+        if (multiPlane) break;
+        if (st != AVAudioConverterOutputStatus_HaveData) break;
     }
+    if (out.length == 0) return nil;
     return out;
 }
 
@@ -1407,13 +1500,56 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     NSString *key = [NSString stringWithFormat:@"%u:%zux%zu:q%d",
                      (unsigned)hpf, hw, hh,
                      (self.squareCropEnabled && SLVCamIsMomoProcess()) ? 1 : 0];
+    CFAbsoluteTime nowKey = CFAbsoluteTimeGetCurrent();
+    NSString *switchNote = nil;
+    int keySwitches = 0;
     [_lock lock];
-    BOOL changed = ![_pipelineKey isEqualToString:key];
-    if (changed) { _pipelineKey = key; _reconfigRequested = YES; }
     BOOL hasFrame = (_latestVideo != NULL);
+    BOOL changed = ![_pipelineKey isEqualToString:key];
+    if (changed) {
+        NSString *prevKey = _pipelineKey;
+        BOOL accept = NO;
+        if (!hasFrame) {
+            // 手里一帧都没有：一般要立刻切（首帧必须尽快出画面）。
+            //
+            // 但刚切过 2 秒还没出帧，说明上一次重建正在解第一帧 —— 这时再切只会让
+            // 重建永远跑不完。微信的 1080p / 720p 两路混在一个 hook 里就是这种情形：
+            // 谁都没有帧，然后 key 每来一帧变一次。
+            accept = (_pipelineKey == nil) || (nowKey - _lastKeySwitchAt > 2.0);
+        } else if ([_pendingKey isEqualToString:key] &&
+                   nowKey - _pendingKeyAt >= SLV_KEY_STABLE_SEC) {
+            // 新格式连续稳定了这么久，认定是真切换（换分辨率 / 换会话）
+            accept = YES;
+        } else {
+            // 刚冒出来还没站稳 —— 大概率是另一路采集混进来的（微信预览 720p /
+            // 通话 1080p 交替）。先不切，继续用旧管线出帧：渲染那一步会把素材
+            // 铺到宿主这一帧的尺寸上，尺寸变化并不需要换解码器。
+            if (![_pendingKey isEqualToString:key]) {
+                _pendingKey = key;
+                _pendingKeyAt = nowKey;
+            }
+            changed = NO;
+        }
+        if (accept) {
+            _pipelineKey = key;
+            _pendingKey = nil;
+            _reconfigRequested = YES;
+            _keySwitchCount++;
+            _lastKeySwitchAt = nowKey;
+            keySwitches = _keySwitchCount;
+            // 只在头几次和每 10 次打一行：这是判断「宿主是不是在反复重配采集」的证据
+            if (keySwitches <= 5 || keySwitches % 10 == 0) {
+                switchNote = [NSString stringWithFormat:@"视频: 管线切换 #%d → %@（原 %@）",
+                              keySwitches, key, prevKey ?: @"(空)"];
+            }
+        }
+    } else {
+        _pendingKey = nil;
+    }
     [_lock unlock];
+    if (switchNote) SLVLog(@"%@", switchNote);
 
-    // 目标格式刚变、手里还没有任何帧：放行这一帧真画面，让解码线程按新格式重建
+    // 目标格式真的变了、手里还没有任何帧：放行这一帧真画面，等解码线程按新格式重建
     if (changed && !hasFrame) return NULL;
 
     [_lock lock];
@@ -1967,8 +2103,7 @@ BOOL SLVCamIsMomoProcess(void) {
 
 /// 找到（或新建）某个消费者的游标槽。调用方必须已持有 _lock。
 ///
-/// 新建时起点跟「最靠前的那个消费者」对齐：它刚接上，不该先补 180ms 历史，
-/// 否则新 unit 一挂上就比别的链路慢半拍。
+/// 新建时起点对齐「画面此刻的素材时刻」（见下面的 0.3.55 说明）。
 - (int)sl_consumerSlotLocked:(const void * _Nullable)key {
     [self sl_pruneConsumersLocked];
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -1980,9 +2115,35 @@ BOOL SLVCamIsMomoProcess(void) {
         }
     }
 
+    // 0.3.55：新消费者的起点直接用「画面此刻的时刻」。
+    //
+    // 以前起点取「其它消费者游标的最大值」，一个都没有就取 0 —— 也就是池子里最老
+    // 的那一块。于是每次 AudioUnit 换代，对端都会先听到 0.25~0.5 秒旧位置的声音，
+    // 等到下一次对齐检查（每 0.25 秒才做一次）才被拽回画面。0.3.54 日志里那六次
+    // 「音画对齐 音频 0.00s / 画面 4.37s → 挪 -4367ms」全是这一条造成的。
     NSUInteger start = 0;
-    for (int i = 0; i < _audioConsumerCount; i++) {
-        if (_audioConsumers[i].cursor > start) start = _audioConsumers[i].cursor;
+    BOOL startResolved = NO;
+    double vpts = [self sl_videoPTSLocked];
+
+    // 生产端落在画面后面 1 秒以上：说明这段没人拉（0.3.55 起没人拉就不解码），
+    // 画面却按墙钟走掉了。这时候让解码线程重建 reader、直接从画面时刻接上，
+    // 不要一包一包追 —— 追 5 秒音频要几十轮，那几十轮里新消费者听到的全是静音。
+    if (!isnan(vpts) && !isnan(_audioHeadPTS) && (vpts - _audioHeadPTS) > 1.0) {
+        _resumeValid = CMTIME_IS_VALID(_lastVideoPTS) && CMTIME_IS_NUMERIC(_lastVideoPTS);
+        _reconfigRequested = YES;
+    }
+
+    if (!isnan(vpts) && _audioTSCount > 0) {
+        NSInteger at = [self sl_offsetAtPTSLocked:vpts];
+        if (at >= 0 && (NSUInteger)at <= _audioPCM.length) {
+            start = (NSUInteger)at;
+            startResolved = YES;
+        }
+    }
+    if (!startResolved) {
+        for (int i = 0; i < _audioConsumerCount; i++) {
+            if (_audioConsumers[i].cursor > start) start = _audioConsumers[i].cursor;
+        }
     }
     if (start > _audioPCM.length) start = _audioPCM.length;
 
@@ -2035,6 +2196,8 @@ BOOL SLVCamIsMomoProcess(void) {
     NSUInteger got = 0;
 
     int slot = [self sl_consumerSlotLocked:consumer];
+    // consumer == NULL 就是 AVCapture 那条链在拿数据（见 audioForFormat:numBytes:）
+    if (consumer == NULL) SLVMarkExternalAudio();
     NSUInteger *cursor = &_audioConsumers[slot].cursor;
     if (*cursor > _audioPCM.length) *cursor = _audioPCM.length;
 
@@ -2196,6 +2359,12 @@ BOOL SLVCamIsMomoProcess(void) {
     }
     [_lock unlock];
     return found;
+}
+
+/// 宿主是否正走 AVCapture / AudioQueue 那条音频链（1 秒内来过数据）。
+/// 实时音频线程专用：不加锁、不分配内存。
+- (BOOL)externalAudioActive {
+    return SLVExternalAudioActiveNow();
 }
 
 /// 一行状态串，给注入层打「静音」时带上现场。

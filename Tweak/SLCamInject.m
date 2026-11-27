@@ -33,6 +33,7 @@ static IMP    gSLHookIMPs[SLV_MAX_HOOKS];
 static BOOL sSLCamInjecting = NO;
 static BOOL sSLCamHooksInstalled = NO;
 static BOOL sSLCamAVCaptureAudioSeen = NO;
+static int  sSLCamAVCaptureAudioFrames = 0;   // 0.3.55：走 AVCapture 音频链的帧数（体检用）
 static int  sSLCamHookCount = 0;
 static BOOL sLoggedMissingOrig = NO;
 static BOOL sLoggedFirstVideo = NO;
@@ -447,6 +448,7 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
         // 只要这里有音频流过，就说明宿主的采集音频是走 AVCapture 的，
         // AudioUnit 那条链路必须让路（否则同一个 PCM 池被两处消费，声音会碎）
         sSLCamAVCaptureAudioSeen = YES;
+        sSLCamAVCaptureAudioFrames++;
 
         // 只处理未压缩 PCM；AAC 之类的压缩音频直接放行，避免格式错乱
         if (CMFormatDescriptionGetMediaSubType(fmt) == kAudioFormatLinearPCM) {
@@ -1034,4 +1036,8 @@ int SLVCamHookCount(void) {
 
 BOOL SLVCamAVCaptureAudioSeen(void) {
     return sSLCamAVCaptureAudioSeen;
+}
+
+int SLVCamAVCaptureAudioFrameCount(void) {
+    return sSLCamAVCaptureAudioFrames;
 }
