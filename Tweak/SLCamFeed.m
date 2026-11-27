@@ -349,10 +349,36 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
 // 心跳照涨、丢 0 字节、接管成功。所以必须按时间去认「谁还在拉」。
 static const CFAbsoluteTime SLV_AUDIO_CONSUMER_TTL = 1.0;
 
+// 0.3.53：音画对齐。
+//
+// 视频和音频是两条完全独立的轨：视频只留「最新一帧」，宿主来要就给；音频则是
+// 一个 FIFO 池顺序往外吐。两边没有任何共同的时间基准 —— 池子每被剪一次（重建
+// 采集会话、切素材、换格式），音频内容就整体前移一段，而画面照旧，偏差一旦出现
+// 就永久留着，后面还会越滚越大。
+//
+// 修法：给池子里的 PCM 记上素材 PTS，于是「游标读到第几秒」和「画面显示第几秒」
+// 可以直接比。差得多了就把游标挪过去，两边重新咬合。
+typedef struct {
+    NSUInteger off;         // 相对 _audioPCM 的字节偏移
+    double pts;             // 这个偏移处的素材时间（秒）
+} SLVAudioTS;
+
+// 偏差超过这个就一刀对齐。正常稳态只有「生产端领跑水位」那 100ms 左右的固定
+// 差，超过 120ms 说明真的错开了。
+static const double SLV_AUDIO_SYNC_TOL = 0.12;
+// 每个消费者最多这么频繁检查一次（音频实时线程，别每包都算）
+static const double SLV_AUDIO_SYNC_CHECK = 0.25;
+#define SLV_AUDIO_TS_MAX 512
+
+// 视频追赶：一次最多连解几帧。视频落后时（解码慢、系统忙）不能只解一帧就睡，
+// 否则会越落越远，最后整段变成慢放 —— 那才是「音画不同步」里最难察觉的一种。
+#define SLV_VIDEO_CATCHUP_MAX 6
+
 typedef struct {
     const void *key;        // AudioUnit 指针；NULL = AVCapture / AudioQueue 那条链
     NSUInteger cursor;      // 相对 _audioPCM 的读位置
     CFAbsoluteTime lastCall;
+    CFAbsoluteTime lastSync; // 上次做音画对齐检查的时间
 } SLVAudioConsumer;
 
 /// 一段 PCM 的响度（dBFS），NAN = 格式不认识。
@@ -403,6 +429,12 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     NSUInteger _audioCalls;              // 消费端被调用次数（水位心跳用）
     NSUInteger _audioPumped;             // 生产端写入的 PCM 块数（素材解出电平日志用）
     CMTime _lastVideoPTS;                // 0.3.50：重建 reader 时从这里续播，画面不跳回开头
+
+    // 0.3.53：音频池的「字节偏移 → 素材时间」映射，音画对齐全靠它
+    SLVAudioTS _audioTS[SLV_AUDIO_TS_MAX];
+    int _audioTSCount;
+    NSUInteger _audioSyncJumps;          // 累计做了多少次音画对齐（诊断用）
+    CFAbsoluteTime _audioSyncLogAt;
     BOOL _resumeValid;
     CGSize _naturalSize;
 
@@ -413,6 +445,13 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     AudioStreamBasicDescription _audioSrcASBD;
     double _frameInterval;               // 秒/帧，按素材自身帧率算，用来给解码线程节流
     int _idleRounds;                     // 连续空转次数，用来区分「读完了」和「音频池满了」
+
+    // 0.3.53：视频按墙钟播。以前是「解一帧 + 睡 1/fps」，实际周期里还带着解码
+    // 耗时，1080p 以上素材就会整体慢放；慢放不会被看出来，但会和实时推进的
+    // 音频越错越开。现在定一个「墙钟 ↔ 素材时间」的锚，落后就补解帧追上来。
+    double _playWall;                    // 锚点：当时墙钟
+    double _playPTS;                     // 锚点：对应素材时间（秒）
+    BOOL _playValid;
 
     CIContext *_ciContext;
     NSUInteger _generation;
@@ -443,6 +482,10 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
                 configure:(BOOL)configure consumer:(const void * _Nullable)consumer;
 - (int)sl_consumerSlotLocked:(const void * _Nullable)key;
 - (NSUInteger)sl_bufferedLocked;
+- (double)sl_videoPTSLocked;
+- (double)sl_ptsAtOffsetLocked:(NSUInteger)off;
+- (NSInteger)sl_offsetAtPTSLocked:(double)pts;
+- (void)sl_trimPoolLocked:(NSUInteger)cut;
 - (NSData *)sl_convertAudio:(NSData *)input;
 - (NSInteger)sl_normalizedRotation;
 - (nullable CIImage *)sl_image:(CIImage *)img
@@ -561,6 +604,7 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     if (_hostStill) { CVPixelBufferRelease(_hostStill); _hostStill = NULL; }
     _hostStillKey = nil;
     [_audioPCM setLength:0];
+    _audioTSCount = 0;
     // 换素材必须把所有人的游标一起归零，否则旧位置会落在新池子外面
     for (int i = 0; i < _audioConsumerCount; i++) _audioConsumers[i].cursor = 0;
     _running = (_sourcePath.length > 0);
@@ -755,27 +799,59 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
             BOOL videoEnded = NO;
 
             if (_videoOut) {
-                CMSampleBufferRef sb = [_videoOut copyNextSampleBuffer];
-                if (sb) {
+                // 0.3.53：按墙钟播，不再「解一帧睡 1/fps」。
+                //
+                // 旧写法每帧实际耗时 = 解码耗时 + 1/fps，1080p 以上素材光解码就
+                // 十几毫秒，于是视频内容比真实时间慢；音频那边是硬件时钟，严格
+                // 实时。两者差值会一直累积 —— 表现就是通话越久越对不上。
+                //
+                // 现在先算「此刻素材应该播到第几秒」，落后就连续补解几帧追上来，
+                // 追上了就睡到下一帧该出现的时间点。
+                double now = CFAbsoluteTimeGetCurrent();
+                double target = _playValid ? (_playPTS + (now - _playWall)) : NAN;
+                double lastPTS = NAN;
+
+                for (int k = 0; k < SLV_VIDEO_CATCHUP_MAX; k++) {
+                    CMSampleBufferRef sb = [_videoOut copyNextSampleBuffer];
+                    if (!sb) {
+                        videoEnded = YES;
+                        break;
+                    }
                     gotAny = YES;
+                    CMTime ts = CMSampleBufferGetPresentationTimeStamp(sb);
+                    double t = (CMTIME_IS_VALID(ts) && CMTIME_IS_NUMERIC(ts))
+                             ? CMTimeGetSeconds(ts) : NAN;
                     CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sb);
                     if (pb) {
                         CVPixelBufferRetain(pb);
-                        CMTime ts = CMSampleBufferGetPresentationTimeStamp(sb);
                         [_lock lock];
                         CVPixelBufferRef old = _latestVideo;
                         _latestVideo = pb;
-                        if (CMTIME_IS_VALID(ts) && CMTIME_IS_NUMERIC(ts)) _lastVideoPTS = ts;
+                        if (!isnan(t)) _lastVideoPTS = ts;
                         [_lock unlock];
                         if (old) CVPixelBufferRelease(old);
                     }
                     CFRelease(sb);
-                    // 按素材自身帧率节流：不节流会全速解码，画面变成快进
-                    if (_frameInterval > 0) {
-                        usleep((useconds_t)(_frameInterval * 1000000.0));
+                    if (isnan(t)) break;
+                    lastPTS = t;
+
+                    if (!_playValid) {
+                        // 首帧（或重建 reader 后的首帧）定锚：从这里开始按实时走
+                        _playValid = YES;
+                        _playWall = CFAbsoluteTimeGetCurrent();
+                        _playPTS = t;
+                        break;
                     }
-                } else {
-                    videoEnded = YES;
+                    if (t >= target - 0.002) break;   // 追上了，这帧就是此刻该显示的
+                    // 落后：这帧已经过期，丢掉继续解下一帧（最多补 6 帧）
+                }
+
+                if (_playValid && !isnan(lastPTS) && _frameInterval > 0) {
+                    double due = _playWall + (lastPTS + _frameInterval - _playPTS);
+                    double wait = due - CFAbsoluteTimeGetCurrent();
+                    if (wait > 0.002) {
+                        usleep((useconds_t)(MIN(wait, 0.05) * 1000000.0));
+                    }
                 }
             }
 
@@ -831,19 +907,31 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     _audioConsumerCount = w;
     _audioConsumerPruned += dropped;
 
-    // 一个都不剩了：把池子的历史前缀全扔掉，只留最后高水位那一小段。
+    // 一个都不剩了：把池子里「画面已经播过」的那段扔掉。
     //
-    // 不扔会出事：池子里已经积累了几十秒的已播数据（裁剪只在有消费者消费时才做），
-    // 下一个 unit 接上时从 cursor 0 开始读，等于一口气把 3 秒前的旧音频灌进去。
-    // 日志里那行「缓冲 3126ms 严重偏高（卡顿后遗留），硬切 290520 字节」就是这么来的。
+    // 0.3.53 之前这里都留最后 120ms、其余全砍 —— 砍掉的其实是**还没播的内容**
+    //（没人在拉，生产端照样在解），下一个 unit 接上时内容就整体前移 0.6~1.9 秒，
+    // 听感就是「声音突然跑到画面前面」，而画面那边一点没变。日志里那行
+    //「清掉池里 1865ms 旧数据」就是这次跳变的记录。
+    //
+    // 现在按素材时间剪：只丢「比画面当前时刻还早」的部分。那部分永远不会再被
+    // 播到，剪掉不影响任何内容的位置。
     NSUInteger trimmedMs = 0;
     if (_audioConsumerCount == 0 && _audioPCM.length > 0 && _audioBytesPerSecond > 0) {
-        NSUInteger keep = (NSUInteger)(_audioBytesPerSecond * SLV_AUDIO_HIGH_SEC);
-        if (keep < 4096) keep = 4096;
-        if (_audioPCM.length > keep) {
-            NSUInteger cut = _audioPCM.length - keep;
+        NSUInteger cut = 0;
+        double vpts = [self sl_videoPTSLocked];
+        if (!isnan(vpts) && _audioTSCount > 0) {
+            NSInteger from = [self sl_offsetAtPTSLocked:vpts - SLV_AUDIO_SYNC_TOL];
+            if (from > 0) cut = (NSUInteger)MIN((NSUInteger)from, _audioPCM.length);
+        } else {
+            // 还没有时间轴（刚开始 / 素材没音轨）：退回「只留高水位」
+            NSUInteger keep = (NSUInteger)(_audioBytesPerSecond * SLV_AUDIO_HIGH_SEC);
+            if (keep < 4096) keep = 4096;
+            if (_audioPCM.length > keep) cut = _audioPCM.length - keep;
+        }
+        if (cut) {
             trimmedMs = cut * 1000 / _audioBytesPerSecond;
-            [_audioPCM replaceBytesInRange:NSMakeRange(0, cut) withBytes:NULL length:0];
+            [self sl_trimPoolLocked:cut];
         }
     }
 
@@ -853,7 +941,7 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     if (now - sLastPruneLog > 5.0) {
         sLastPruneLog = now;
         if (trimmedMs) {
-            SLVLog(@"音频: 摘掉 %d 个不再来拉数据的消费者（剩 %d 个 · 累计 %d 个）· 清掉池里 %lums 旧数据",
+            SLVLog(@"音频: 摘掉 %d 个不再来拉数据的消费者（剩 %d 个 · 累计 %d 个）· 丢掉已播过的 %lums",
                   dropped, _audioConsumerCount, _audioConsumerPruned, (unsigned long)trimmedMs);
         } else {
             SLVLog(@"音频: 摘掉 %d 个不再来拉数据的消费者（剩 %d 个 · 累计 %d 个）",
@@ -897,6 +985,7 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     CMSampleBufferRef sb = [_audioOut copyNextSampleBuffer];
     if (!sb) return NO;
 
+    CMTime sbPTS = CMSampleBufferGetPresentationTimeStamp(sb);
     CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
     size_t len = bb ? CMBlockBufferGetDataLength(bb) : 0;
     if (len > 0) {
@@ -907,7 +996,26 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
             double db = NAN;
             BOOL probe = NO;
             [_lock lock];
+            NSUInteger at = _audioPCM.length;
             [_audioPCM appendData:converted];
+            // 0.3.53：记下这块 PCM 在池子里的位置和它对应的素材时间。
+            // 音画对齐就是拿它反推「游标读到第几秒」。
+            if (CMTIME_IS_VALID(sbPTS) && CMTIME_IS_NUMERIC(sbPTS)) {
+                double pts = CMTimeGetSeconds(sbPTS);
+                if (_audioTSCount == 0 || pts > _audioTS[_audioTSCount - 1].pts + 0.0005) {
+                    if (_audioTSCount >= SLV_AUDIO_TS_MAX) {
+                        // 满了就抽稀一半，保留偶数位（时间上仍单调）
+                        int w = 0;
+                        for (int i = 0; i < _audioTSCount; i += 2) _audioTS[w++] = _audioTS[i];
+                        _audioTSCount = w;
+                    }
+                    if (_audioTSCount < SLV_AUDIO_TS_MAX) {
+                        _audioTS[_audioTSCount].off = at;
+                        _audioTS[_audioTSCount].pts = pts;
+                        _audioTSCount++;
+                    }
+                }
+            }
             _audioPumped++;
             if (_audioPumped == 1 || _audioPumped % 600 == 0) {
                 probe = YES;
@@ -991,8 +1099,14 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     _videoOut = nil;
     _audioOut = nil;
     _idleRounds = 0;
+    _playValid = NO;                     // 0.3.53：新 reader 的时间轴从新锚点算起
     [_lock lock];
     _audioTrackAttached = NO;
+    // 0.3.53：重建 reader 后音频从新的位置重新解，池子里的旧内容和旧映射全部作废。
+    // 不清会出事 —— 旧映射指向的是上一轮的素材时间，对齐时会把游标挪到错误位置。
+    [_audioPCM setLength:0];
+    _audioTSCount = 0;
+    for (int i = 0; i < _audioConsumerCount; i++) _audioConsumers[i].cursor = 0;
     [_lock unlock];
 
     NSString *path;
@@ -1634,6 +1748,82 @@ BOOL SLVCamIsMomoProcess(void) {
     return ok;
 }
 
+#pragma mark - 音频时间轴（0.3.53）
+
+/// 画面此刻显示的是素材第几秒。调用方必须已持有 _lock。NAN = 还不知道。
+- (double)sl_videoPTSLocked {
+    if (!CMTIME_IS_VALID(_lastVideoPTS) || !CMTIME_IS_NUMERIC(_lastVideoPTS)) return NAN;
+    return CMTimeGetSeconds(_lastVideoPTS);
+}
+
+/// 池子里第 off 个字节对应素材第几秒。调用方必须已持有 _lock。NAN = 没有时间轴。
+- (double)sl_ptsAtOffsetLocked:(NSUInteger)off {
+    if (_audioTSCount <= 0 || _audioBytesPerSecond == 0) return NAN;
+    SLVAudioTS m = _audioTS[0];
+    for (int i = 0; i < _audioTSCount; i++) {
+        if (_audioTS[i].off <= off) m = _audioTS[i];
+        else break;
+    }
+    double t = m.pts + (double)(off > m.off ? off - m.off : 0) / (double)_audioBytesPerSecond;
+    return t;
+}
+
+/// 素材第 pts 秒对应池子里的哪个字节偏移。调用方必须已持有 _lock。
+/// 返回 -1 表示没有时间轴；超出池子范围会被夹到 [0, length]。
+- (NSInteger)sl_offsetAtPTSLocked:(double)pts {
+    if (_audioTSCount <= 0 || _audioBytesPerSecond == 0) return -1;
+    SLVAudioTS m = _audioTS[0];
+    BOOL found = NO;
+    for (int i = 0; i < _audioTSCount; i++) {
+        if (_audioTS[i].pts <= pts) { m = _audioTS[i]; found = YES; }
+        else break;
+    }
+    if (!found) return 0;            // 目标比池子里最早的内容还早：从头开始
+    double d = (pts - m.pts) * (double)_audioBytesPerSecond;
+    if (d < 0) d = 0;
+    NSUInteger off = m.off + (NSUInteger)d;
+    if (off > _audioPCM.length) off = _audioPCM.length;
+    return (NSInteger)off;
+}
+
+/// 从池子头部剪掉 cut 个字节。时间轴标记和所有消费者游标一起平移。
+/// 调用方必须已持有 _lock。
+- (void)sl_trimPoolLocked:(NSUInteger)cut {
+    if (cut == 0 || cut > _audioPCM.length) return;
+    [_audioPCM replaceBytesInRange:NSMakeRange(0, cut) withBytes:NULL length:0];
+
+    int w = 0;
+    SLVAudioTS head;
+    BOOL hasHead = NO;
+    for (int i = 0; i < _audioTSCount; i++) {
+        SLVAudioTS m = _audioTS[i];
+        if (m.off < cut) {
+            // 落在被剪区域里：留最后一个当新的 0 点，插值才准
+            head = m;
+            hasHead = YES;
+            continue;
+        }
+        m.off -= cut;
+        _audioTS[w++] = m;
+    }
+    if (hasHead) {
+        head.off = 0;
+        if (w < SLV_AUDIO_TS_MAX) {
+            memmove(&_audioTS[1], &_audioTS[0], (size_t)w * sizeof(SLVAudioTS));
+            _audioTS[0] = head;
+            w++;
+        } else {
+            _audioTS[0] = head;
+        }
+    }
+    _audioTSCount = w;
+
+    for (int i = 0; i < _audioConsumerCount; i++) {
+        _audioConsumers[i].cursor = (_audioConsumers[i].cursor > cut)
+                                  ? _audioConsumers[i].cursor - cut : 0;
+    }
+}
+
 #pragma mark - 出音频
 
 /// 登记宿主音频格式并建好转换器。调用方必须已持有 _lock。
@@ -1731,6 +1921,7 @@ BOOL SLVCamIsMomoProcess(void) {
     _audioConsumers[slot].key = key;
     _audioConsumers[slot].cursor = start;
     _audioConsumers[slot].lastCall = now;
+    _audioConsumers[slot].lastSync = 0;   // 0.3.53：新消费者第一次调用就做一次音画对齐
     return slot;
 }
 
@@ -1768,6 +1959,38 @@ BOOL SLVCamIsMomoProcess(void) {
     int slot = [self sl_consumerSlotLocked:consumer];
     NSUInteger *cursor = &_audioConsumers[slot].cursor;
     if (*cursor > _audioPCM.length) *cursor = _audioPCM.length;
+
+    // 0.3.53：音画对齐。
+    //
+    // 音频是顺序读的，视频是「最新一帧」，两者没有共同基准 —— 池子每被剪一次，
+    // 音频内容就整体挪一段，画面却不动。这里用池子里记的 PTS 直接比一下
+    //「游标读到第几秒」和「画面显示第几秒」，差超过阈值就把游标挪过去。
+    //
+    // 只做「跳」，不做慢慢追：稳态两边的速率本来就一致（都跟硬件时钟走），
+    // 需要跳的场合全是重建 / 切换这类台阶，一次跳完最干净。
+    CFAbsoluteTime syncNow = CFAbsoluteTimeGetCurrent();
+    if (_audioConsumers[slot].lastSync == 0 ||
+        syncNow - _audioConsumers[slot].lastSync >= SLV_AUDIO_SYNC_CHECK) {
+        _audioConsumers[slot].lastSync = syncNow;
+        double vpts = [self sl_videoPTSLocked];
+        double apts = [self sl_ptsAtOffsetLocked:*cursor];
+        if (!isnan(vpts) && !isnan(apts)) {
+            double drift = apts - vpts;       // >0：音频跑在画面前面
+            if (fabs(drift) > SLV_AUDIO_SYNC_TOL) {
+                NSInteger want = [self sl_offsetAtPTSLocked:vpts];
+                if (want >= 0) {
+                    *cursor = (NSUInteger)want;
+                    _audioSyncJumps++;
+                    if (syncNow - _audioSyncLogAt > 1.0) {
+                        _audioSyncLogAt = syncNow;
+                        SLVLogRT(@"音频: 音画对齐 音频 %.2fs / 画面 %.2fs → 挪 %+.0fms（累计 %lu 次）",
+                                 apts, vpts, drift * 1000.0, (unsigned long)_audioSyncJumps);
+                    }
+                }
+            }
+        }
+    }
+
     NSUInteger avail = _audioPCM.length - *cursor;
 
     // 水位控制。
@@ -1809,16 +2032,18 @@ BOOL SLVCamIsMomoProcess(void) {
         *cursor += got;
 
         // 池子按「最落后的那个消费者」剪前缀 —— 用最靠前的会把别人还没读的数据一起删掉。
+        //
+        // 0.3.53：只剪足够久远的历史（留 0.3 秒给时间轴插值用）。以前是攒到 2 秒
+        // 才剪一刀，并且剪完把别人的游标一起减掉，逻辑上没错，但和「无人消费就砍到
+        // 120ms」那条组合起来，就成了「内容整段前移」的跳变源。现在两边都只剪
+        // 已经播过的部分，游标由 sl_trimPoolLocked 一并平移。
         NSUInteger minCursor = *cursor;
         for (int i = 0; i < _audioConsumerCount; i++) {
             if (_audioConsumers[i].cursor < minCursor) minCursor = _audioConsumers[i].cursor;
         }
-        NSUInteger trimAt = _audioBytesPerSecond ? _audioBytesPerSecond * 2 : (44100 * 32);
-        if (minCursor > trimAt) {
-            [_audioPCM replaceBytesInRange:NSMakeRange(0, minCursor) withBytes:NULL length:0];
-            for (int i = 0; i < _audioConsumerCount; i++) {
-                _audioConsumers[i].cursor -= minCursor;
-            }
+        NSUInteger keepBack = _audioBytesPerSecond ? (NSUInteger)(_audioBytesPerSecond * 0.3) : 13230;
+        if (minCursor > keepBack) {
+            [self sl_trimPoolLocked:minCursor - keepBack];
         }
     }
 
@@ -1826,10 +2051,14 @@ BOOL SLVCamIsMomoProcess(void) {
     _audioCalls++;
     if (_audioCalls % 3000 == 0 && _audioBytesPerSecond > 0) {
         NSUInteger mine = _audioPCM.length - *cursor;
+        double vpts = [self sl_videoPTSLocked];
+        double apts = [self sl_ptsAtOffsetLocked:*cursor];
+        double driftMs = (isnan(vpts) || isnan(apts)) ? 0.0 : (apts - vpts) * 1000.0;
         // 0.3.52：这是音频实时线程（AudioUnitRender 里调进来的），走 RT 版
-        SLVLogRT(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包 · 消费者 %d 个",
+        SLVLogRT(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包 · 消费者 %d 个 · 音画偏差 %+.0fms · 对齐 %lu 次",
                 (unsigned long)(mine * 1000 / _audioBytesPerSecond),
-                (unsigned long)_audioDropped, (unsigned long)_audioCalls, _audioConsumerCount);
+                (unsigned long)_audioDropped, (unsigned long)_audioCalls, _audioConsumerCount,
+                driftMs, (unsigned long)_audioSyncJumps);
     }
 
     BOOL hasAudio = _assetHasAudio;
@@ -1880,10 +2109,17 @@ BOOL SLVCamIsMomoProcess(void) {
     [self sl_pruneConsumersLocked];
     NSUInteger buffered = [self sl_bufferedLocked];
     NSUInteger ms = _audioBytesPerSecond ? (buffered * 1000 / _audioBytesPerSecond) : 0;
-    NSString *s = [NSString stringWithFormat:@"池 %lums · 消费者 %d · 音轨 %@ · 素材音轨 %@",
+    // 0.3.53：带上音画偏差。这是判断「同步有没有跑掉」最直接的一个数，
+    // 池子大小只能反映延迟，偏差才反映错位。
+    double vpts = [self sl_videoPTSLocked];
+    double apts = [self sl_ptsAtOffsetLocked:_audioPCM.length];
+    NSString *drift = (isnan(vpts) || isnan(apts))
+        ? @"偏差 -"
+        : [NSString stringWithFormat:@"偏差 %+.0fms", (apts - vpts) * 1000.0];
+    NSString *s = [NSString stringWithFormat:@"池 %lums · 消费者 %d · 音轨 %@ · 素材音轨 %@ · %@",
                    (unsigned long)ms, _audioConsumerCount,
                    _audioTrackAttached ? @"已挂" : @"未挂",
-                   _assetHasAudio ? @"有" : @"无"];
+                   _assetHasAudio ? @"有" : @"无", drift];
     [_lock unlock];
     return s;
 }
