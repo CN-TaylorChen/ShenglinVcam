@@ -94,7 +94,7 @@ static double SLVCamFrameIntervalMs(const void *out, CMTime pts) {
         CMTime prev = sSLCamTSPrev[slot];
         if (CMTIME_IS_VALID(prev)) {
             CMTime d = CMTimeSubtract(pts, prev);
-            if (CMTIME_IS_VALID(d) && CMTIME_IS_POSITIVE(d)) {
+            if (CMTIME_IS_VALID(d) && CMTimeCompare(d, kCMTimeZero) > 0) {
                 ms = CMTimeGetSeconds(d) * 1000.0;
             }
         }
