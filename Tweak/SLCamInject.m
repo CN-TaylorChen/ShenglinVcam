@@ -88,10 +88,23 @@ static void SLVCamVideoBeat(CMFormatDescriptionRef fmt, double procMs, BOOL serv
         sSLCamProcTotalMs += procMs;
         if (procMs > sSLCamProcMaxMs) sSLCamProcMaxMs = procMs;
     }
-    // 300 帧 ≈ 30fps 下的 10 秒。按帧数而不是按时间触发，掉帧时也能看出真实节奏。
-    if (sSLCamVideoAsked % 300 != 0) return;
-
+    // 0.3.60：改成按时间触发（5 秒），不再按帧数。
+    //
+    // 之前是每 300 帧打一行 —— 15fps 下要 20 秒。陌陌的视频通话常常只有 15~20 秒，
+    // 结果整场一次都没打出来（0.3.59 那两场就是），等于这段统计白做，
+    // 连「帧率到底有没有变成 24」都看不到。
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (sSLCamVideoBeatAt <= 0) {
+        // 首帧只立锚点。不然会打一行「0.0s / 0 帧 / 0.0fps」的噪音。
+        sSLCamVideoBeatAt = now;
+        sSLCamBeatAsked = sSLCamVideoAsked;
+        sSLCamBeatServed = sSLCamVideoServed;
+        sSLCamBeatBypass = sSLCamVideoBypass;
+        sSLCamBeatTotalMs = sSLCamProcTotalMs;
+        return;
+    }
+    if (now - sSLCamVideoBeatAt < 5.0) return;
+
     uint64_t asked = sSLCamVideoAsked - sSLCamBeatAsked;
     uint64_t servedN = sSLCamVideoServed - sSLCamBeatServed;
     uint64_t bypassN = sSLCamVideoBypass - sSLCamBeatBypass;
@@ -715,7 +728,11 @@ static BOOL SLVCamRtcHook(Class cls, NSString *name, IMP imp) {
 //
 // 默认关 —— 高码率在弱网下会更卡、更耗电，得让用户自己决定要不要。
 #define SLV_ENC_MIN_FPS       24
-#define SLV_ENC_MIN_KBPS    1600
+// 0.3.60 验证版：故意抬到 4000，不是最终值。
+// 1600 那次对面看不出区别，只有两种可能 —— 要么码率没落地（被通后重置 / 被 SDK clamp），
+// 要么落地了但 1600 对这个素材还不够。4000 拉到一个明显失衡的值，
+// 就能一刀切开：有变化 = 链路通，没变化 = 根本没落地。
+#define SLV_ENC_MIN_KBPS    4000
 #define SLV_ENC_SHORT_SIDE    720    // 短边至少 720（竖屏 720x1280 / 横屏 1280x720）
 #define SLV_ENC_LONG_MAX     1280    // 长边不再往上加，免得一路顶到 4K 白耗带宽
 
