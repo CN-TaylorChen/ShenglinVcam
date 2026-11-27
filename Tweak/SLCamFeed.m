@@ -495,7 +495,7 @@ static BOOL SLVASBDSame(const AudioStreamBasicDescription *a, const AudioStreamB
         && a->mBitsPerChannel == b->mBitsPerChannel;
 }
 
-#pragma mark - 接缝淡入 + 峰值限幅（0.3.56）
+#pragma mark - 响度规整 + 接缝淡入（0.3.57）
 
 /// 一个样本读成归一化 float（int16 / float32 都支持）。
 static inline float SLVGetSample(const uint8_t *b, size_t i, BOOL isFloat) {
@@ -512,12 +512,23 @@ static inline void SLVSetSample(uint8_t *b, size_t i, BOOL isFloat, float v) {
     ((int16_t *)b)[i] = (int16_t)lrintf(v * 32767.0f);
 }
 
-/// 就地处理一包已经填好的 PCM：先整体峰值限幅，再在接缝处淡入。
+/// 送话音量目标：-18 dBFS RMS。
+///
+/// 素材是短视频音乐，RMS 常在 -5 dBFS 上下（几乎满刻度）。这个电平直接进语音
+/// 编码器（单声道、低码率）会被压碎，再经对端 AGC / 降噪就是破音、机器人音、
+/// 嗡嗡声 —— 也就是用户说的「很大的杂音」。降到语音域，编码器才工作在它设计的
+/// 位置上；同时峰值也自动远离满刻度，硬削波不再发生。
+static const float SLV_TALK_RMS = 0.1259f;      // 10^(-18/20)
+static const float SLV_TALK_GAIN_MIN = 0.15f;   // 最多衰减 16dB（再低说明素材本来就很轻）
+static const float SLV_TALK_GAIN_MAX = 3.0f;    // 最多放大 9.5dB
+static const float SLV_PEAK_CEIL = 0.891f;      // -1 dBFS
+
+/// 就地处理一包已经填好的 PCM：先做响度规整，再在接缝处淡入。
 ///
 /// 为什么是「就地」：这包数据是我们自己 memcpy 出来的副本，改它不影响池子，
 /// 也不会让下一个消费者读到被改过的内容。
 ///
-/// 返回位掩码：1 = 做了接缝淡入，2 = 做了限幅，0 = 这包本来就很干净。
+/// 返回位掩码：1 = 做了接缝淡入，2 = 触发了峰值兜底，0 = 这包本来就很干净。
 static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
                                 const AudioStreamBasicDescription *a,
                                 int32_t *lastVal, BOOL *hasLast, float *gainInOut) {
@@ -540,21 +551,56 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
 
     NSUInteger did = 0;
 
-    // ---- ① 峰值限幅：只做「超过 -1 dBFS 就整块缩小」，不做压缩/增益，音色不变 ----
+    // ---- ① 响度规整：把这一包拉到语音域 ----
     //
-    // 为什么要它：注入电平日志里有一段长期停在 -4.6 dBFS RMS（几乎满刻度）。
-    // 这种电平送进通话，对端任何一点增益就是数字削波 —— 听感就是破音/杂音。
-    const float target = 0.891f;       // -1 dBFS
+    // 0.3.56 做的是「超过 -1 dBFS 就整块缩小」。但素材 RMS 本来就是 -5 dBFS，
+    // 峰值≈1.0，那套逻辑只降 1dB —— 削波是没了，响度一点没降，对端听到的
+    // 依然是被编码器压碎的近满幅音乐。
+    //
+    // 现在按 RMS 求增益，并且用非对称时间常数：素材太响时 40ms 就压下去，
+    // 太轻时 260ms 慢慢抬。关键是块内增益基本恒定 —— 0.3.56 那种逐包
+    // 0.9↔0.95 抖动等于给信号加 50Hz 幅度调制，听感是沙沙/发颤。
+    double sum = 0;
     float peak = 0.0f;
     size_t nsamp = len / bps;
     for (size_t i = 0; i < nsamp; i++) {
         float v = SLVGetSample(bytes, i, isFloat);
-        if (v < 0) v = -v;
-        if (v > peak) peak = v;
+        sum += (double)v * v;
+        float av = v < 0 ? -v : v;
+        if (av > peak) peak = av;
     }
-    float want = (peak > target) ? (target / peak) : 1.0f;
-    float prev = (*gainInOut > 0.0f) ? *gainInOut : 1.0f;
-    if (want < 0.999f || prev < 0.999f) {
+    double rms = nsamp ? sqrt(sum / (double)nsamp) : 0.0;
+
+    float ideal = 1.0f;
+    if (rms > 1e-4) {
+        ideal = (float)(SLV_TALK_RMS / rms);
+        if (ideal < SLV_TALK_GAIN_MIN) ideal = SLV_TALK_GAIN_MIN;
+        if (ideal > SLV_TALK_GAIN_MAX) ideal = SLV_TALK_GAIN_MAX;
+    }
+
+    // gainInOut <= 0 表示「这个消费者还没定过增益」（新接上的 unit）——
+    // 直接用它自己的 ideal，不要让前 100ms 顶着满幅音乐出声。
+    float prev = (*gainInOut > 0.0f) ? *gainInOut : ideal;
+    float want = prev;
+    if (rms > 1e-4) {
+        double tau = (ideal < prev) ? 0.040 : 0.260;
+        double alpha = 1.0 - exp(-(double)frames / (a->mSampleRate * tau));
+        if (alpha > 1.0) alpha = 1.0;
+        want = prev + (ideal - prev) * (float)alpha;
+    }
+
+    // ---- ② 峰值兜底 ----
+    // 规整之后峰值一般远低于满刻度，只有极短促的瞬态（鼓、镲）才会顶到。
+    // 这里把整包增益压到刚好不削波，并把状态一起压下去；下一包靠 ① 的慢放
+    // 回升，所以不会每包在 0.9↔0.95 之间反复。
+    if (peak > 1e-6f && peak * want > SLV_PEAK_CEIL) {
+        want = SLV_PEAK_CEIL / peak;
+        did |= 2;
+    }
+
+    // ---- ③ 施加增益（块内从上一包线性过渡到本包）----
+    // want 本身就是慢变量，这一步只是把包边界的微小差值抹平，不会产生调制。
+    if (fabsf(want - 1.0f) > 1e-4f || fabsf(prev - 1.0f) > 1e-4f) {
         for (size_t f = 0; f < frames; f++) {
             float g = prev + (want - prev) * (float)(f + 1) / (float)frames;
             for (UInt32 c = 0; c < ch; c++) {
@@ -562,21 +608,22 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
                 SLVSetSample(bytes, i, isFloat, SLVGetSample(bytes, i, isFloat) * g);
             }
         }
-        did |= 2;
     }
     *gainInOut = want;
 
-    // ---- ② 接缝淡入 ----
+    // ---- ④ 接缝淡入 ----
     //
     // 判据只看一个数：这一包的第 0 个样本跟上一包的最后一个样本差多少。
-    // 差得远 = 中间断过（重建、换格式、对齐跳位、追帧丢弃），波形在这里有个台阶，
-    // 编码出来就是「啪」。做法是从上一包的值出发、8ms 内平滑过渡到本包内容，
-    // 台阶被抹成一段斜坡，听感上就是「没听见」。
+    // 差得远 = 中间断过（重建、换格式、对齐跳位、追帧丢弃），波形在这里有个台阶。
+    //
+    // 0.3.56 用的是 8ms —— 那只够抹掉「台阶造成的爆音」，对「内容从第 3 秒跳到
+    // 第 9 秒」这种跳段几乎没用，听感还是一声突兀的「咔」。现在放到 40ms
+    //（一包 20~23ms，实际效果是整包从上一包的值渐入），跳段变成一次快速渐强。
     float cur0 = SLVGetSample(bytes, 0, isFloat);
-    // 阈值 0.25（≈ -12 dBFS 的相邻样本跳变）。定得再低会误伤鼓点这类真实瞬态
-    //（8ms 淡入会把起音磨钝），定得再高真断点就漏过去了 —— 断点通常是整幅跳变。
+    // 阈值 0.25（≈ -12 dBFS 的相邻样本跳变）。定得再低会误伤鼓点这类真实瞬态，
+    // 定得再高真断点就漏过去了 —— 断点通常是整幅跳变。
     if (*hasLast && fabsf(cur0 - lastVal[0] / 32768.0f) > 0.25f) {
-        uint32_t fade = (uint32_t)(a->mSampleRate * 0.008);
+        uint32_t fade = (uint32_t)(a->mSampleRate * 0.040);
         if (fade < 16) fade = 16;
         if (fade > frames) fade = (uint32_t)frames;
         for (uint32_t f = 0; f < fade; f++) {
@@ -625,7 +672,8 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
     BOOL _assetHasAudio;                 // 素材本身有没有音轨：决定「没数据」时是静音还是放行真麦克风
     BOOL _audioTrackAttached;            // 当前 reader 到底把音轨挂上了没有（0.3.50 诊断用）
     NSUInteger _audioDropped;            // 累计丢弃字节（诊断用）
-    BOOL _audioDropLogged;
+    NSUInteger _audioHardCuts;           // 0.3.57：累计「缓冲过高硬切」次数
+    CFAbsoluteTime _audioDropLogAt;      // 硬切日志限流（以前是一次性标志，之后全静默）
     BOOL _audioPassLogged;               // 「放行真麦克风」只打一次，诊断用
     NSUInteger _audioCalls;              // 消费端被调用次数（水位心跳用）
     NSUInteger _audioPumped;             // 生产端写入的 PCM 块数（素材解出电平日志用）
@@ -1216,25 +1264,22 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
 - (BOOL)sl_audioNeedMoreLocked {
     if (_audioBytesPerSecond == 0) return YES;      // 目标格式还没确定，先别停
 
-    // 0.3.55：没人在拉就不要再解。
+    // 0.3.57：**撤回** 0.3.55 的「没人拉就不要再解」。
     //
-    // 旧判据只看「解到画面之后 120ms」，跟有没有消费者无关 —— 于是宿主每次重建
-    // 采集会话的那一秒空档里，生产端照样按画面时刻解了一秒音频；下一个 AudioUnit
-    // 接上时这些内容全都「已经过去了」，只能整段扔掉。日志里
-    // `丢掉已播过的 4898ms` 就是白解 4.9 秒换来的。
+    // 那条本意是省解码，代价却全落到对端耳朵上：宿主每 10~16 秒重建一次采集会话，
+    // 那一两秒没人拉数据，生产端就停在原地，画面按墙钟继续走。新 unit 接上时音频
+    // 已经落后 2~5 秒，只能一路「丢弃追帧」把中间内容整段扔（0.3.56 日志里 33 块），
+    // 每丢一块都是一次内容层面的跳段 —— 就是「咔、咔」那串杂音。
     //
-    // 池子还空着的时候（刚起播）仍然先填一发，否则第一个消费者接上时前 120ms
-    // 一定是静音。
-    [self sl_pruneConsumersLocked];
-    if (_audioConsumerCount == 0) {
-        return _audioPCM.length < (NSUInteger)(_audioBytesPerSecond * SLV_AUDIO_HIGH_SEC);
-    }
-
+    // 现在不管有没有消费者都按画面时刻解。多出来的代价是一条单声道 44.1k 音轨的
+    // 解码 + memcpy（每秒约 176KB），可以忽略；换来的是池子里永远是画面此刻前后
+    // 120ms 的内容，重连时不需要 seek、不需要丢块。
     double vpts = [self sl_videoPTSLocked];
     if (!isnan(vpts) && !isnan(_audioHeadPTS)) {
         return _audioHeadPTS < vpts + SLV_AUDIO_HIGH_SEC;
     }
     // 画面时刻还不知道（图片素材 / 首帧还没出来）：退回水位判断
+    [self sl_pruneConsumersLocked];
     NSUInteger buffered = [self sl_bufferedLocked];
     return buffered < (NSUInteger)(_audioBytesPerSecond * SLV_AUDIO_HIGH_SEC);
 }
@@ -2336,10 +2381,10 @@ BOOL SLVCamIsMomoProcess(void) {
     BOOL startResolved = NO;
     double vpts = [self sl_videoPTSLocked];
 
-    // 生产端落在画面后面 1 秒以上：说明这段没人拉（0.3.55 起没人拉就不解码），
-    // 画面却按墙钟走掉了。这时候让解码线程重建 reader、直接从画面时刻接上，
-    // 不要一包一包追 —— 追 5 秒音频要几十轮，那几十轮里新消费者听到的全是静音。
-    if (!isnan(vpts) && !isnan(_audioHeadPTS) && (vpts - _audioHeadPTS) > 1.0) {
+    // 生产端落在画面后面 2.5 秒以上：解码真跟不上了（不是「没人拉」——0.3.57 起
+    // 没人拉也照解）。这时候让解码线程重建 reader、直接从画面时刻接上，不要一包
+    // 一包追 —— 追 5 秒音频要几十轮，那几十轮里新消费者听到的全是静音。
+    if (!isnan(vpts) && !isnan(_audioHeadPTS) && (vpts - _audioHeadPTS) > 2.5) {
         _resumeValid = CMTIME_IS_VALID(_lastVideoPTS) && CMTIME_IS_NUMERIC(_lastVideoPTS);
         _reconfigRequested = YES;
     }
@@ -2374,8 +2419,10 @@ BOOL SLVCamIsMomoProcess(void) {
     _audioConsumers[slot].lastSync = 0;   // 0.3.53：新消费者第一次调用就做一次音画对齐
     // 0.3.56：新消费者是从池子中间起读的，第一个样本和「上一包」没有关系 ——
     // 不能拿别人留下的 lastVal 去比，否则第一包就被淡入成一小段渐强。
+    // 0.3.57：gain 置 0 表示「增益还没定过」，SLVPolishChunk 会直接用这一包的
+    // 理想增益，免得新 unit 接上前 100ms 顶着满幅音乐出声。
     _audioConsumers[slot].hasLast = NO;
-    _audioConsumers[slot].gain = 1.0f;
+    _audioConsumers[slot].gain = 0.0f;
     _audioConsumers[slot].lastVal[0] = 0;
     _audioConsumers[slot].lastVal[1] = 0;
     _audioConsumers[slot].splices = 0;
@@ -2527,12 +2574,18 @@ BOOL SLVCamIsMomoProcess(void) {
             *cursor += drop;
             avail -= drop;
             _audioDropped += drop;
-            if (!_audioDropLogged) {
-                _audioDropLogged = YES;
-                SLVLog(@"音频: 缓冲 %lums 严重偏高（卡顿后遗留），硬切 %lu 字节回 %lums",
-                      (unsigned long)((avail + drop) * 1000 / _audioBytesPerSecond),
-                      (unsigned long)drop,
-                      (unsigned long)(target * 1000 / _audioBytesPerSecond));
+            _audioHardCuts++;
+            // 0.3.56 这里是一次性标志：第一次打过就永远静默，于是池子后面又切了
+            // 多少次日志上都看不见。改成 2 秒限流 + 累计次数，切几次一目了然。
+            // 这一行在音频实时线程上，必须走 SLVLogRT（只入队，不 NSLog）。
+            CFAbsoluteTime cutNow = CFAbsoluteTimeGetCurrent();
+            if (cutNow - _audioDropLogAt > 2.0) {
+                _audioDropLogAt = cutNow;
+                SLVLogRT(@"音频: 缓冲 %lums 严重偏高，硬切 %lu 字节回 %lums（累计 %lu 次）",
+                         (unsigned long)((avail + drop) * 1000 / _audioBytesPerSecond),
+                         (unsigned long)drop,
+                         (unsigned long)(target * 1000 / _audioBytesPerSecond),
+                         (unsigned long)_audioHardCuts);
             }
         }
     }
@@ -2558,9 +2611,12 @@ BOOL SLVCamIsMomoProcess(void) {
         }
     }
 
-    // 心跳：每 3000 包打一次水位，下次再出问题不用靠推算
+    // 心跳：每 500 包（约 10 秒）打一次水位。
+    //
+    // 0.3.56 是 3000 包 = 60 秒，而实际通话常常只有 20~40 秒，加上新加的
+    // 「接缝/限幅」两个指标，等于这一版全程没自证过一次。降到 500 包。
     _audioCalls++;
-    if (_audioCalls % 3000 == 0 && _audioBytesPerSecond > 0) {
+    if (_audioCalls % 500 == 0 && _audioBytesPerSecond > 0) {
         NSUInteger mine = _audioPCM.length - *cursor;
         double vpts = [self sl_videoPTSLocked];
         double apts = [self sl_ptsAtOffsetLocked:*cursor];
@@ -2569,11 +2625,15 @@ BOOL SLVCamIsMomoProcess(void) {
         // 明显 <0 表示解不过来（解码跟不上），这时才会出现持续的口型错位。
         double prodMs = (isnan(vpts) || isnan(_audioHeadPTS)) ? 0.0 : (_audioHeadPTS - vpts) * 1000.0;
         // 0.3.52：这是音频实时线程（AudioUnitRender 里调进来的），走 RT 版
-        SLVLogRT(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包 · 消费者 %d 个 · 音画偏差 %+.0fms · 生产 %+.0fms · 对齐 %lu 次 · 跳帧 %lu · 接缝 %lu · 限幅 %lu",
+        // 0.3.57：把响度规整的增益也打出来 —— 「增益 -13dB」说明素材原本是满幅，
+        // 「增益 0dB」说明素材已经落在语音域。这是判断送话音量对不对最直接的一个数。
+        float g = _audioConsumers[slot].gain;
+        double gainDb = (g > 1e-4f) ? 20.0 * log10((double)g) : 0.0;
+        SLVLogRT(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包 · 消费者 %d 个 · 音画偏差 %+.0fms · 生产 %+.0fms · 增益 %+.1fdB · 对齐 %lu 次 · 跳帧 %lu · 硬切 %lu · 接缝 %lu · 限幅 %lu",
                 (unsigned long)(mine * 1000 / _audioBytesPerSecond),
                 (unsigned long)_audioDropped, (unsigned long)_audioCalls, _audioConsumerCount,
-                driftMs, prodMs, (unsigned long)_audioSyncJumps,
-                (unsigned long)_audioSkipBlocks,
+                driftMs, prodMs, gainDb, (unsigned long)_audioSyncJumps,
+                (unsigned long)_audioSkipBlocks, (unsigned long)_audioHardCuts,
                 (unsigned long)_audioSplices, (unsigned long)_audioLimits);
     }
 

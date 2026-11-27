@@ -1376,8 +1376,46 @@ static BOOL SLVIsSystemOverlayWindow(UIWindow *w) {
 // v0.4.37：不再只认 ForegroundActive + isKeyWindow。陌陌启动早期常是启动页 / 广告窗，
 // 球挂上去那窗一关就跟着没了；另一种是球被更高层的窗压住，viewWithTag 还能找到，
 // 于是永不重建、也永不可见。现在改成「所有场景里挑最顶层且可见的那个窗」，球永远住最上面。
+// 0.3.57：这个窗口能不能当悬浮球的宿主。
+//
+// 起因是微信通话里球「跑到屏幕中央、点不动」。日志证据：
+//   SL-VCAM: float button moved to top window (MMVoipToastWindow)
+// 之后再也没有 moved to —— 球整场都挂在来电横幅那个小窗上。三件事叠在一起：
+//   ① 选窗只看 windowLevel，toast/横幅窗永远比主窗高，必然被选中；
+//   ② SLVHostSizeFor 取 MIN(窗口, 屏幕)，可用区域被压成横幅那一小块；
+//   ③ clamp 有一条「窗口装不下球就直接居中」的兜底，于是 x/y 双双被设成窗口中心。
+// 至于点不动：toast 窗通常 userInteractionEnabled = NO，或者 hitTest 只覆盖横幅
+// 自己那条，球画在 bounds 之外，触摸根本到不了。
+//
+// 所以宿主必须是「够大、能交互、不透明、不是系统浮层」的窗口。
+static BOOL SLVIsHostableWindow(UIWindow *w) {
+    if (!w || w.hidden || w.alpha < 0.5) return NO;
+    if (!w.isUserInteractionEnabled) return NO;
+
+    CGSize scr = SLVScreenSize();
+    CGSize sz = w.bounds.size;
+    if (scr.width > 0 && scr.height > 0) {
+        // 面积不到屏幕 55% 的窗装不住球：贴着边夹一下就会跑到中间，
+        // 而且子视图画不出父视图，球的可点区域也会缺一大块。
+        if (sz.width * sz.height < scr.width * scr.height * 0.55) return NO;
+    }
+
+    static NSArray<NSString *> *ban = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        ban = @[@"Toast", @"Console", @"Alert", @"ActionSheet", @"Banner",
+                @"HUD", @"StatusBar", @"Keyboard", @"Autofill", @"Transition"];
+    });
+    NSString *cls = NSStringFromClass([w class]);
+    for (NSString *k in ban) {
+        if ([cls rangeOfString:k options:NSCaseInsensitiveSearch].length > 0) return NO;
+    }
+    return YES;
+}
+
 static UIWindow *SLVKeyWindow(void) {
-    NSMutableArray<UIWindow *> *list = [NSMutableArray array];
+    NSMutableArray<UIWindow *> *list = [NSMutableArray array];      // 全部可见窗（兜底用）
+    NSMutableArray<UIWindow *> *hosts = [NSMutableArray array];     // 够格当宿主的
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
@@ -1386,6 +1424,7 @@ static UIWindow *SLVKeyWindow(void) {
                 if (!w || w.hidden || w.alpha < 0.02) continue;
                 if (SLVIsSystemOverlayWindow(w)) continue;
                 [list addObject:w];
+                if (SLVIsHostableWindow(w)) [hosts addObject:w];
             }
         }
     }
@@ -1393,19 +1432,39 @@ static UIWindow *SLVKeyWindow(void) {
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     if (list.count == 0) {
         UIWindow *kw = [UIApplication sharedApplication].keyWindow;
-        if (kw && !kw.hidden && !SLVIsSystemOverlayWindow(kw)) [list addObject:kw];
+        if (kw && !kw.hidden && !SLVIsSystemOverlayWindow(kw)) {
+            [list addObject:kw];
+            if (SLVIsHostableWindow(kw)) [hosts addObject:kw];
+        }
         id del = [UIApplication sharedApplication].delegate;
         if ([del respondsToSelector:NSSelectorFromString(@"window")]) {
             id dw = [del valueForKey:@"window"];
             if ([dw isKindOfClass:[UIWindow class]]) {
                 UIWindow *w = (UIWindow *)dw;
-                if (!w.hidden && ![list containsObject:w]) [list addObject:w];
+                if (!w.hidden && ![list containsObject:w]) {
+                    [list addObject:w];
+                    if (SLVIsHostableWindow(w)) [hosts addObject:w];
+                }
             }
         }
     }
 #pragma clang diagnostic pop
+
+    // 0.3.57：一个够格的都没有时，退回「面积最大的那个」——
+    // 按 windowLevel 挑会挑到横幅/toast 窗，那正是球跑到中间的根源。
+    if (hosts.count == 0) {
+        UIWindow *big = nil;
+        CGFloat bestArea = 0;
+        for (UIWindow *w in list) {
+            CGSize a = w.bounds.size;
+            CGFloat ar = a.width * a.height;
+            if (ar > bestArea) { bestArea = ar; big = w; }
+        }
+        return big;
+    }
+
     UIWindow *best = nil;
-    for (UIWindow *w in list) {
+    for (UIWindow *w in hosts) {
         if (!best) { best = w; continue; }
         if (w.windowLevel > best.windowLevel) { best = w; continue; }
         if (w.windowLevel < best.windowLevel) continue;
@@ -1436,7 +1495,16 @@ void SLVRaiseFloatButton(void) {
         UIWindow *top = SLVKeyWindow();
         UIWindow *cur = btn.window;
         if (top && cur && top != cur && top.windowLevel >= cur.windowLevel) {
+            // 0.3.57：同样要换算坐标。SLVKeyWindow 现在只会给出「够格的宿主」，
+            // 所以这次迁移不会再把球挂到横幅/toast 窗上。
+            CGPoint target = btn.center;
+            UIView *from = btn.superview;
+            if (from) {
+                CGPoint p = [from convertPoint:btn.center toView:top];
+                if (isfinite(p.x) && isfinite(p.y)) target = p;
+            }
             [btn removeFromSuperview];
+            btn.center = SLVClampFloatPos(target, SLVHostSizeFor(top));
             [top addSubview:btn];
         }
         // v0.4.61：present 的呈现容器是在球之后才加到 window 上的，对 window 自己
@@ -1505,10 +1573,13 @@ static CGPoint SLVClampFloatPos(CGPoint c, CGSize size) {
     CGFloat maxX = size.width - half - SLVBallEdgeInset;
     CGFloat minY = half + 56.0;                 // 让开状态栏 / 刘海
     CGFloat maxY = size.height - half - 34.0;   // 让开底部安全区
-    if (maxX < minX) { c.x = size.width / 2.0; }
-    else { if (c.x < minX) c.x = minX; if (c.x > maxX) c.x = maxX; }
-    if (maxY < minY) { c.y = size.height / 2.0; }
-    else { if (c.y < minY) c.y = minY; if (c.y > maxY) c.y = maxY; }
+    // 0.3.57：窗口装不下球时**保持原坐标**，不再自己居中。
+    //
+    // 以前这两条兜底是 `c.x = size.width / 2.0` —— 加到横幅那么高的窗口上，
+    // 球就被摆到窗口正中，看起来就是「球飘到屏幕中间」。位置不对该换窗口，
+    // 不该由 clamp 偷偷改；换不了就让它留在原地，至少用户知道球在哪。
+    if (maxX >= minX) { if (c.x < minX) c.x = minX; if (c.x > maxX) c.x = maxX; }
+    if (maxY >= minY) { if (c.y < minY) c.y = minY; if (c.y > maxY) c.y = maxY; }
     return c;
 }
 
@@ -1660,8 +1731,18 @@ void SLVEnsureFloatButton(void) {
     if (btn && btn.superview != w) {
         // v0.4.37：窗口被换（启动页 / 广告窗关掉、场景重建）时把球迁到新的顶层窗口，
         // 否则球跟着旧窗一起消失，而且在新窗口里找不到 tag、只能等下次冷启动。
+        //
+        // 0.3.57：迁移必须做坐标换算。以前是摘掉之后直接把旧窗口的 center 赋给新窗口，
+        // 两个窗口的 bounds.origin 不一致就会累计偏移 —— 一场通话迁四次，球就漂到
+        // 屏幕外面去了（微信里「球跑到中央」也叠了这一条）。
+        CGPoint target = btn.center;
+        UIView *from = btn.superview;
+        if (from) {
+            CGPoint p = [from convertPoint:btn.center toView:w];
+            if (isfinite(p.x) && isfinite(p.y)) target = p;
+        }
         [btn removeFromSuperview];
-        btn.center = SLVClampFloatPos(btn.center, SLVHostSizeFor(w));
+        btn.center = SLVClampFloatPos(target, SLVHostSizeFor(w));
         [w addSubview:btn];
         // 抖音这类 App 的遮罩窗一秒能换好几次，逐次打日志会把整份日志顶满。
         // 同一类窗口只记第一次，之后每 50 次补一行心跳。
