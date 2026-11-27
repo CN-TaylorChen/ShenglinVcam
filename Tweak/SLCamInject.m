@@ -747,6 +747,112 @@ static NSString *SLVCamKVSize(id obj, NSString *key) {
     }
 }
 
+// ---- 0.3.63：dimension 是 C struct，KVC 拿不到，改用 NSInvocation ----
+//
+// 0.3.59 起每一版日志都在打「dimension=-」，一直没当回事 —— 但它意味着
+// valueForKey: 在这条属性上直接抛异常（CGSize 不是 KVC 认的那几种包装），
+// 于是 0.3.59~0.3.62 这四版里我们只改了 fps 和 bitrate，**分辨率一次都没碰过**。
+//
+// 而 fps=15 / bitrate=500 这一对，正好是 Agora 480P 档位的预设值
+// （640x480 · 15fps · 500Kbps）。陌陌要是照这个档位建的配置，编码器输入就只有
+// 640x480：我们把码率抬到 4000，只是把 480p 压得更干净，一放大到全屏照样糊。
+//
+// 这一个假设同时解释了三条已经确认的现象：
+//   · 抬码率 500→1600→4000，对面毫无感觉（天花板在分辨率，不在码率）
+//   · 零拷贝直出、像素一个字节没动，依然糊（糊发生在编码器缩小的那一步）
+//   · 同一网络下安卓端更清楚（安卓端档位不同）
+//
+// 所以这里绕开 KVC，直接用 NSInvocation 读写 struct 属性。返回长度/参数长度都先
+// 探一遍：CGSize 是 16 字节，也可能是个 int width/height 的 8 字节小结构，两种都接。
+
+static BOOL SLVCamSizeGetter(id obj, SEL sel, CGSize *out);
+static BOOL SLVCamSizeSetter(id obj, SEL sel, CGSize want);
+
+/// 依次试 dimension / videoDimension / size 三种叫法。命中就返回 YES 并带上 key。
+static BOOL SLVCamReadDimension(id cfg, CGSize *out, NSString **outKey) {
+    NSString *keys[] = { @"dimension", @"videoDimension", @"size" };
+    for (int i = 0; i < 3; i++) {
+        CGSize s = CGSizeZero;
+        if (!SLVCamSizeGetter(cfg, NSSelectorFromString(keys[i]), &s)) continue;
+        if (s.width < 2 || s.height < 2) continue;
+        *out = s;
+        if (outKey) *outKey = keys[i];
+        return YES;
+    }
+    return NO;
+}
+
+static NSString *SLVCamSettersName(NSString *key) {
+    return [NSString stringWithFormat:@"set%@%@:",
+            [[key substringToIndex:1] uppercaseString], [key substringFromIndex:1]];
+}
+
+static BOOL SLVCamSizeGetter(id obj, SEL sel, CGSize *out) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return NO;
+    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
+    if (!sig) return NO;
+    NSUInteger len = [sig methodReturnLength];
+    if (len != sizeof(CGSize) && len != 8) return NO;
+
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:obj];
+    [inv setSelector:sel];
+    @try { [inv invoke]; } @catch (__unused NSException *e) { return NO; }
+
+    if (len == sizeof(CGSize)) {
+        CGSize s = CGSizeZero;
+        [inv getReturnValue:&s];
+        *out = s;
+    } else {
+        int32_t wh[2] = { 0, 0 };
+        [inv getReturnValue:wh];
+        *out = CGSizeMake(wh[0], wh[1]);
+    }
+    return YES;
+}
+
+static BOOL SLVCamSizeSetter(id obj, SEL sel, CGSize want) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return NO;
+    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
+    if (!sig || sig.numberOfArguments < 3) return NO;
+
+    NSUInteger argSz = 0;
+    NSGetSizeAndAlignment([sig getArgumentTypeAtIndex:2], &argSz, NULL);
+    if (argSz != sizeof(CGSize) && argSz != 8) return NO;
+
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:obj];
+    [inv setSelector:sel];
+    if (argSz == sizeof(CGSize)) {
+        [inv setArgument:&want atIndex:2];
+    } else {
+        int32_t wh[2] = { (int32_t)want.width, (int32_t)want.height };
+        [inv setArgument:wh atIndex:2];
+    }
+    @try { [inv invoke]; } @catch (__unused NSException *e) { return NO; }
+    return YES;
+}
+
+/// 写 dimension：三个叫法挨个试，成功的写进 outKey。
+static BOOL SLVCamWriteDimension(id cfg, CGSize want, NSString **outKey) {
+    NSString *keys[] = { @"dimension", @"videoDimension", @"size" };
+    for (int i = 0; i < 3; i++) {
+        if (SLVCamSizeSetter(cfg, NSSelectorFromString(SLVCamSettersName(keys[i])), want)) {
+            if (outKey) *outKey = keys[i];
+            return YES;
+        }
+    }
+    // NSInvocation 走不通时退回 KVC（有的版本把 struct 包成 NSValue 存）
+    for (int i = 0; i < 3; i++) {
+        @try {
+            [cfg setValue:[NSValue valueWithCGSize:want] forKey:keys[i]];
+            if (outKey) *outKey = keys[i];
+            return YES;
+        } @catch (__unused NSException *e) { }
+    }
+    return NO;
+}
+
 // ---- 0.3.62：真实上行统计（给 delegate 套一层代理） ----
 //
 // 到 0.3.61 为止，能改的都改完了：duration 已如实写成 66.7ms（日志确认）、
@@ -908,12 +1014,9 @@ static id SLVCamKVFirst(id obj, NSArray<NSString *> *keys, NSString **hitKey) {
 /// 全部只改这份配置对象：宿主本来就是要把它交给引擎的，改它等于改了它的意图，
 /// 但不会碰到引擎之外的任何状态。
 static BOOL SLVCamRaiseEncoderConfig(id cfg, NSInteger *outFps, NSInteger *outKbps,
-                                     CGSize *outDim, BOOL *hasDim,
+                                     CGSize *outDim, BOOL *hasDim, BOOL *dimWrote,
                                      NSInteger *inFps, NSInteger *inKbps, CGSize *inDim) {
     if (!cfg) return NO;
-
-    NSString *dimKey = nil;
-    id dimVal = SLVCamKVFirst(cfg, @[@"dimension", @"videoDimension", @"size"], &dimKey);
 
     id fpsVal = SLVCamKVFirst(cfg, @[@"frameRate"], NULL);
     id kbpsVal = SLVCamKVFirst(cfg, @[@"bitrate"], NULL);
@@ -923,13 +1026,23 @@ static BOOL SLVCamRaiseEncoderConfig(id cfg, NSInteger *outFps, NSInteger *outKb
     *inKbps = kbps;
     *inDim = CGSizeZero;
     *hasDim = NO;
+    *dimWrote = NO;
 
+    // 0.3.63：先走 NSInvocation（KVC 在这条 struct 属性上一直抛异常，读到的一直是 nil）
     CGSize dim = CGSizeZero;
-    if ([dimVal isKindOfClass:[NSValue class]]) {
-        const char *t = [(NSValue *)dimVal objCType];
-        if (t && strcmp(t, @encode(CGSize)) == 0) dim = [(NSValue *)dimVal CGSizeValue];
+    NSString *dimKey = nil;
+    BOOL read = SLVCamReadDimension(cfg, &dim, &dimKey);
+    if (!read) {
+        id dimVal = SLVCamKVFirst(cfg, @[@"dimension", @"videoDimension", @"size"], &dimKey);
+        if ([dimVal isKindOfClass:[NSValue class]]) {
+            const char *t = [(NSValue *)dimVal objCType];
+            if (t && strcmp(t, @encode(CGSize)) == 0) {
+                CGSize s = [(NSValue *)dimVal CGSizeValue];
+                if (s.width >= 2 && s.height >= 2) { dim = s; read = YES; }
+            }
+        }
     }
-    if (dim.width >= 2 && dim.height >= 2) {
+    if (read) {
         *hasDim = YES;
         *inDim = dim;
     }
@@ -937,8 +1050,9 @@ static BOOL SLVCamRaiseEncoderConfig(id cfg, NSInteger *outFps, NSInteger *outKb
     NSInteger tFps = MAX(fps, SLV_ENC_MIN_FPS);
     NSInteger tKbps = MAX(kbps, SLV_ENC_MIN_KBPS);
     CGSize tDim = dim;
+    BOOL needDim = NO;
 
-    if (*hasDim) {
+    if (read) {
         CGFloat mn = MIN(dim.width, dim.height);
         CGFloat mx = MAX(dim.width, dim.height);
         CGFloat k = 1.0;
@@ -948,7 +1062,13 @@ static BOOL SLVCamRaiseEncoderConfig(id cfg, NSInteger *outFps, NSInteger *outKb
             // 编码器只吃偶数边长，差 1 像素会被拒
             tDim = CGSizeMake(round(dim.width * k / 2.0) * 2.0,
                               round(dim.height * k / 2.0) * 2.0);
+            needDim = YES;
         }
+    } else {
+        // 读不到就按采集朝向补一个：orientationMode 1 = 固定横屏，其余按竖屏
+        NSInteger om = [SLVCamKV(cfg, @"orientationMode") integerValue];
+        tDim = (om == 1) ? CGSizeMake(1280, 720) : CGSizeMake(720, 1280);
+        needDim = YES;
     }
 
     BOOL changed = NO;
@@ -960,9 +1080,12 @@ static BOOL SLVCamRaiseEncoderConfig(id cfg, NSInteger *outFps, NSInteger *outKb
         @try { [cfg setValue:@(tKbps) forKey:@"bitrate"]; changed = YES; }
         @catch (__unused NSException *e) { }
     }
-    if (*hasDim && !CGSizeEqualToSize(tDim, dim) && dimKey) {
-        @try { [cfg setValue:[NSValue valueWithCGSize:tDim] forKey:dimKey]; changed = YES; }
-        @catch (__unused NSException *e) { }
+    if (needDim) {
+        NSString *wroteKey = nil;
+        if (SLVCamWriteDimension(cfg, tDim, &wroteKey)) {
+            *dimWrote = YES;
+            changed = YES;
+        }
     }
 
     *outFps = tFps;
@@ -971,24 +1094,33 @@ static BOOL SLVCamRaiseEncoderConfig(id cfg, NSInteger *outFps, NSInteger *outKb
     return changed;
 }
 
-static int SLVCamRtcVideoConfig(id self, SEL _cmd, id cfg) {
+/// 只读分支用的显示串：NSInvocation 读得到就用它，读不到退回 KVC。
+static NSString *SLVCamDimText(id cfg) {
+    CGSize s = CGSizeZero;
+    if (SLVCamReadDimension(cfg, &s, NULL)) {
+        return [NSString stringWithFormat:@"%.0fx%.0f", s.width, s.height];
+    }
     NSString *dimKey = nil;
     (void)SLVCamKVFirst(cfg, @[@"dimension", @"videoDimension", @"size"], &dimKey);
-    NSString *dimText = dimKey ? SLVCamKVSize(cfg, dimKey) : @"-";
+    return dimKey ? SLVCamKVSize(cfg, dimKey) : @"-";
+}
 
+static int SLVCamRtcVideoConfig(id self, SEL _cmd, id cfg) {
     if (!SLVCamEncodeBoostOn()) {
         SLVLog(@"RTC: 编码档位 dimension=%@ · fps=%@ · bitrate=%@ · orientation=%@ · degradation=%@ · mirror=%@",
-              dimText, SLVCamKV(cfg, @"frameRate"), SLVCamKV(cfg, @"bitrate"),
+              SLVCamDimText(cfg), SLVCamKV(cfg, @"frameRate"), SLVCamKV(cfg, @"bitrate"),
               SLVCamKV(cfg, @"orientationMode"), SLVCamKV(cfg, @"degradationPreference"),
               SLVCamKV(cfg, @"mirrorMode"));
     } else {
         NSInteger iFps = 0, iKbps = 0, tFps = 0, tKbps = 0;
         CGSize iDim = CGSizeZero, tDim = CGSizeZero;
-        BOOL hasDim = NO;
-        BOOL changed = SLVCamRaiseEncoderConfig(cfg, &tFps, &tKbps, &tDim, &hasDim,
+        BOOL hasDim = NO, dimWrote = NO;
+        BOOL changed = SLVCamRaiseEncoderConfig(cfg, &tFps, &tKbps, &tDim, &hasDim, &dimWrote,
                                                 &iFps, &iKbps, &iDim);
-        NSString *dimFrom = hasDim ? [NSString stringWithFormat:@"%.0fx%.0f", iDim.width, iDim.height] : @"-";
-        NSString *dimTo = hasDim ? [NSString stringWithFormat:@"%.0fx%.0f", tDim.width, tDim.height] : @"-";
+        NSString *dimFrom = hasDim ? [NSString stringWithFormat:@"%.0fx%.0f", iDim.width, iDim.height]
+                                   : @"读不到";
+        NSString *dimTo = dimWrote ? [NSString stringWithFormat:@"%.0fx%.0f", tDim.width, tDim.height]
+                                   : @"未改";
         if (changed) {
             SLVLog(@"RTC: 编码档位 抬高 %ldfps/%ldkbps/%@ → %ldfps/%ldkbps/%@（已改写，再转发给引擎）",
                   (long)iFps, (long)iKbps, dimFrom, (long)tFps, (long)tKbps, dimTo);
