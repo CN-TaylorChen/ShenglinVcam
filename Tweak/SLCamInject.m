@@ -751,8 +751,10 @@ static BOOL SLVCamRaiseEncoderConfig(id cfg, NSInteger *outFps, NSInteger *outKb
     NSString *dimKey = nil;
     id dimVal = SLVCamKVFirst(cfg, @[@"dimension", @"videoDimension", @"size"], &dimKey);
 
-    NSInteger fps = [[SLVCamKVFirst(cfg, @[@"frameRate"], NULL) ?: @0] integerValue];
-    NSInteger kbps = [[SLVCamKVFirst(cfg, @[@"bitrate"], NULL) ?: @0] integerValue];
+    id fpsVal = SLVCamKVFirst(cfg, @[@"frameRate"], NULL);
+    id kbpsVal = SLVCamKVFirst(cfg, @[@"bitrate"], NULL);
+    NSInteger fps = fpsVal ? [fpsVal integerValue] : 0;
+    NSInteger kbps = kbpsVal ? [kbpsVal integerValue] : 0;
     *inFps = fps;
     *inKbps = kbps;
     *inDim = CGSizeZero;
@@ -807,7 +809,7 @@ static BOOL SLVCamRaiseEncoderConfig(id cfg, NSInteger *outFps, NSInteger *outKb
 
 static int SLVCamRtcVideoConfig(id self, SEL _cmd, id cfg) {
     NSString *dimKey = nil;
-    id dimVal = SLVCamKVFirst(cfg, @[@"dimension", @"videoDimension", @"size"], &dimKey);
+    (void)SLVCamKVFirst(cfg, @[@"dimension", @"videoDimension", @"size"], &dimKey);
     NSString *dimText = dimKey ? SLVCamKVSize(cfg, dimKey) : @"-";
 
     if (!SLVCamEncodeBoostOn()) {
