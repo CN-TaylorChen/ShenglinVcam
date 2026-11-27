@@ -610,20 +610,67 @@ static void SLVCamHookSessionOutputs(void) {
 static void (*gSLTapOrig)(id, SEL, NSUInteger, AVAudioFrameCount, AVAudioFormat *, id);
 static BOOL (*gSLRecorderOrig)(id, SEL);
 static void (*gSLMovieStartOrig)(id, SEL, NSURL *, id);
+// 0.3.56：两个新探针 —— 一个看「是不是往文件里直写」，一个看「音轨交给了谁」
+static id (*gSLRecorderInitOrig)(id, SEL, NSURL *, NSDictionary *, NSError **);
+static void (*gSLWriterAddInputOrig)(id, SEL, id);
 
+static int sSLCamTapCount = 0;      // tap 收到过多少个 buffer（体检用）
+static int sSLCamTapReplaced = 0;   // 其中成功换成素材音频的次数
+
+int SLVCamAudioTapCount(void) { return sSLCamTapCount; }
+
+typedef void (^SLVCamTapBlock)(AVAudioPCMBuffer *buffer, AVAudioTime *when);
+
+/// AVAudioEngine tap 接管（0.3.56）。
+///
+/// 微信拍摄是唯一一个「四条入口全都不经过」的场景：AudioUnitRender 0 次、
+/// AVCapture 音频 0 帧、AudioQueue 建了队列但一次回调都没有。这种情况下唯一
+/// 还能碰到 PCM 的地方就是 inputNode 的 tap block —— buffer 是宿主给的可写内存，
+/// 我们往里填素材音频，宿主读到的就是素材，时序和长度一点没变。
+///
+/// 以前这里只打一行日志就放行，等于眼睁睁看着一条能换的路不用。
 static void SLVCamAudioTapProbe(id self, SEL _cmd, NSUInteger bus, AVAudioFrameCount frames,
                                AVAudioFormat *fmt, id block) {
+    if (!gSLTapOrig) return;
+
+    // 注意：**不能**在这里判断 SLVCamInjecting()。tap 只装一次，宿主一旦拿到的是
+    // 我们的原封 block，之后用户再打开「替换」也换不进去了 —— 那样「先开相机、
+    // 后开替换」就永远没声音。所以永远包一层，开关的判断挪进 block 里。
+    if (!block || !fmt) {
+        gSLTapOrig(self, _cmd, bus, frames, fmt, block);
+        return;
+    }
+
+    AudioStreamBasicDescription a;
+    memset(&a, 0, sizeof(a));
+    if (fmt.streamDescription) a = *fmt.streamDescription;
     static BOOL logged = NO;
     if (!logged) {
         logged = YES;
-        AudioStreamBasicDescription a;
-        memset(&a, 0, sizeof(a));
-        if (fmt && fmt.streamDescription) a = *fmt.streamDescription;
-        SLVLog(@"音频: 命中 AVAudioEngine tap bus=%lu %.0fHz %uch %uB/帧 · 录制走这条",
-              (unsigned long)bus, a.mSampleRate,
-              (unsigned)a.mChannelsPerFrame, (unsigned)a.mBytesPerFrame);
+        SLVLog(@"音频: 命中 AVAudioEngine tap bus=%lu %.0fHz %uch %uB/帧 交错=%@ · 已在 tap 里接管",
+              (unsigned long)bus, a.mSampleRate, (unsigned)a.mChannelsPerFrame,
+              (unsigned)a.mBytesPerFrame,
+              (a.mFormatFlags & kAudioFormatFlagIsNonInterleaved) ? @"N" : @"Y");
     }
-    if (gSLTapOrig) gSLTapOrig(self, _cmd, bus, frames, fmt, block);
+
+    SLVCamTapBlock orig = (SLVCamTapBlock)block;
+    // __weak 是有意的：tap block 由 node 持有，block 里再强引用 node 就是环，
+    // 通话结束引擎销毁了 node 也不会释放 —— 麦克风会一直开着。
+    __weak id weakNode = self;
+    SLVCamTapBlock wrapped = ^(AVAudioPCMBuffer *buf, AVAudioTime *when) {
+        sSLCamTapCount++;
+        id node = weakNode;
+        if (node && buf && buf.frameLength > 0 && SLVCamInjecting()) {
+            if ([[SLVCamFeed shared] fillTapBuffer:buf consumer:(__bridge const void *)node]) {
+                if (sSLCamTapReplaced++ == 0) {
+                    SLVLog(@"音频: 已接管 AVAudioEngine tap 麦克风（%.0fHz %uch）",
+                          buf.format.sampleRate, (unsigned)buf.format.channelCount);
+                }
+            }
+        }
+        if (orig) orig(buf, when);
+    };
+    gSLTapOrig(self, _cmd, bus, frames, fmt, (id)wrapped);
 }
 
 static BOOL SLVCamRecorderProbe(id self, SEL _cmd) {
@@ -643,6 +690,39 @@ static void SLVCamMovieStartProbe(id self, SEL _cmd, NSURL *url, id delegate) {
               url.lastPathComponent ?: @"?");
     }
     if (gSLMovieStartOrig) gSLMovieStartOrig(self, _cmd, url, delegate);
+}
+
+/// AVAudioRecorder 的**构造函数**（0.3.56）。
+///
+/// 之前只挂了 `-record`，看不到「它到底按什么格式往哪个文件写」。微信拍摄如果是
+/// 这条路径，画面走 VideoDataOutput、声音直接进文件，我们连一次 PCM 都摸不到 ——
+/// 那就只剩下「把 AVAudioRecorder 换掉」这一条路，代价完全不同，得先认出来。
+static id SLVCamRecorderInitProbe(id self, SEL _cmd, NSURL *url, NSDictionary *settings, NSError **err) {
+    static BOOL logged = NO;
+    id obj = gSLRecorderInitOrig ? gSLRecorderInitOrig(self, _cmd, url, settings, err) : nil;
+    if (!logged) {
+        logged = YES;
+        NSString *fmt = settings[AVFormatIDKey] ? [settings[AVFormatIDKey] description] : @"?";
+        SLVLog(@"音频: 命中 AVAudioRecorder 建实例（%@ · fmt=%@ · %.0fHz %@ch · %@）· 声音直写文件，PCM 摸不到",
+              url.lastPathComponent ?: @"?",
+              fmt,
+              [settings[AVSampleRateKey] doubleValue],
+              settings[AVNumberOfChannelsKey] ?: @"?",
+              obj ? @"创建成功" : @"创建失败");
+    }
+    return obj;
+}
+
+/// AVAssetWriter 加输入（0.3.56）：一句话区分「音轨是写文件那条」还是「就是采集那条」。
+static void SLVCamWriterAddInputProbe(id self, SEL _cmd, id input) {
+    static int logged = 0;
+    if (logged < 4) {
+        logged++;
+        NSString *media = @"?";
+        if ([input respondsToSelector:@selector(mediaType)]) media = [(AVAssetWriterInput *)input mediaType];
+        SLVLog(@"音频: AVAssetWriter 加输入 #%d → %@", logged, media);
+    }
+    if (gSLWriterAddInputOrig) gSLWriterAddInputOrig(self, _cmd, input);
 }
 
 // AVFAudio 是 iOS 14 起独立出来的框架，宿主不一定会主动加载。
@@ -674,13 +754,21 @@ static void SLVCamInstallRecordingProbes(void) {
 
     Class rec = SLVCamLoadClass("AVAudioRecorder", avf);
     SLVCamHookSel(rec, @selector(record), (IMP)SLVCamRecorderProbe, (IMP *)&gSLRecorderOrig);
+    SLVCamHookSel(rec, NSSelectorFromString(@"initWithURL:settings:error:"),
+                 (IMP)SLVCamRecorderInitProbe, (IMP *)&gSLRecorderInitOrig);
 
     Class movie = objc_getClass("AVCaptureMovieFileOutput");
     SLVCamHookSel(movie, NSSelectorFromString(@"startRecordingToOutputFileURL:recordingDelegate:"),
                  (IMP)SLVCamMovieStartProbe, (IMP *)&gSLMovieStartOrig);
 
-    SLVLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d",
-          inputNode != nil, rec != nil, movie != nil);
+    // 0.3.56：微信拍摄如果真的「声音直写文件」，音轨会交给 AVAssetWriter。
+    // 这一行日志就能把「到底谁在收音频」钉死，不用再猜。
+    Class writer = objc_getClass("AVAssetWriter");
+    SLVCamHookSel(writer, @selector(addInput:),
+                 (IMP)SLVCamWriterAddInputProbe, (IMP *)&gSLWriterAddInputOrig);
+
+    SLVLog(@"探测: 录制链路已布点 tap=%d recorder=%d movie=%d writer=%d",
+          inputNode != nil, rec != nil, movie != nil, writer != nil);
 }
 
 #pragma mark - 拍照接管（0.2.15）

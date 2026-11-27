@@ -14,6 +14,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <CoreMedia/CoreMedia.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <AVFoundation/AVFoundation.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -138,6 +139,16 @@ BOOL SLVCamIsMomoProcess(void);
 - (nullable NSData *)tryAudioForFormat:(const AudioStreamBasicDescription *)asbd
                               numBytes:(size_t)numBytes
                               consumer:(const void * _Nullable)consumer;
+
+/// AVAudioEngine tap 专用（0.3.56）：把宿主 tap 回调里的 PCMBuffer **原地**换成素材音频。
+///
+/// 微信拍摄这类「不经过 AudioUnit / AudioQueue / AVCapture」的录音，唯一碰得到的点
+/// 就是 inputNode 的 tap block —— buffer 是宿主给的可写内存，填进去就等于换了麦克风。
+/// 实时线程调用，内部只走 tryAudioForFormat:（拿不到锁就返回 NO，宿主照常用真麦克风）。
+///
+/// 非交错多声道按「单声道铺满所有 plane」处理：素材本来就是单声道，这样既不会让
+/// 字节率和帧数对不上，也不会把左右声道拌在一起。
+- (BOOL)fillTapBuffer:(AVAudioPCMBuffer *)buf consumer:(const void * _Nullable)consumer;
 
 /// 回到第一帧（切换素材、重新打开相机时调）
 - (void)rewind;

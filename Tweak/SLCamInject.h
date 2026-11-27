@@ -42,4 +42,8 @@ BOOL SLVCamAVCaptureAudioSeen(void);
 /// 走 AVCapture 音频链的帧数（0.3.55 音频体检用）
 int SLVCamAVCaptureAudioFrameCount(void);
 
+/// AVAudioEngine tap 收到的 buffer 数（0.3.56 音频体检用）。
+/// >0 = 宿主的录音走的是 AVAudioEngine，这条链已经在 tap block 里被替换。
+int SLVCamAudioTapCount(void);
+
 NS_ASSUME_NONNULL_END

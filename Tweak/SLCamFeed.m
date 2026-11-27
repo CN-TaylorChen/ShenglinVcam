@@ -357,6 +357,16 @@ static CVPixelBufferRef SLVConvertBGRAtoNV12(CVPixelBufferRef src, OSType dstFmt
 #define SLV_AUDIO_HIGH_SEC   0.12
 #define SLV_AUDIO_HARD_SEC   0.60
 
+// 0.3.56：目标格式的定型时间。
+//
+// 池子只能有一种布局，但宿主可能同时有两套格式在拉：陌陌的日志里 AVCapture 音频是
+// 1ch/2B、AudioUnit 是 2ch/4B。如果每来一个请求就跟着翻一次格式，池子会被反复清空 ——
+// 比原来的噪声更糟（变成整场静音）。
+//
+// 所以：格式定型后 1.5 秒内不接受「另一种格式」的请求（那几包放行真麦克风）。
+// 采集会话装配那几秒的临时格式自然会过去，真正长期在拉的那条会赢得定型。
+static const CFAbsoluteTime SLV_AUDIO_FORMAT_STABLE = 1.5;
+
 // 0.3.49：每个消费者一条独立游标。
 //
 // 视频通话里宿主经常同时开两个 AudioUnit（RTC 上行一个、本地电平/试音一个），
@@ -431,6 +441,18 @@ typedef struct {
     NSUInteger cursor;      // 相对 _audioPCM 的读位置
     CFAbsoluteTime lastCall;
     CFAbsoluteTime lastSync; // 上次做音画对齐检查的时间
+
+    // 0.3.56：接缝处理。
+    //
+    // 0.3.55 的日志里，一场 98 秒的通话有 7 次「重建立管 + 池子清零」，每次注入流都
+    // 从波形上某一点瞬间跳到另一点。对端听到的就是「啪」——连跳几次就是一串爆响，
+    // 也就是用户说的「有的时候有很大的杂音」。这里给每个消费者记住上一包最后一个
+    // 样本，下一包开头和它差得远就做 8ms 淡入，把台阶抹平。
+    int32_t lastVal[2];     // 上一包最后一个样本（最多两声道，按 int16 满刻度归一）
+    BOOL hasLast;
+    float gain;             // 上一包用的限幅增益（1.0 = 没限幅），做块间渐变用
+    NSUInteger splices;     // 这个消费者累计做了多少次接缝淡入
+    NSUInteger limits;      // 累计限幅次数
 } SLVAudioConsumer;
 
 /// 一段 PCM 的响度（dBFS），NAN = 格式不认识。
@@ -455,6 +477,128 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     if (rms <= 1e-9) return -120.0;
     double db = 20.0 * log10(rms);
     return db < -120.0 ? -120.0 : db;
+}
+
+/// 两个 ASBD 是不是同一种「字节布局」。
+///
+/// 不用 memcmp：ASBD 里有 mReserved 这种保留字段，宿主填什么都有可能；
+/// 一次误判就够把池子清空一次，来回几次整场通话就全是静音了。
+static BOOL SLVASBDSame(const AudioStreamBasicDescription *a, const AudioStreamBasicDescription *b) {
+    if (!a || !b) return NO;
+    return a->mSampleRate == b->mSampleRate
+        && a->mFormatID == b->mFormatID
+        && a->mFormatFlags == b->mFormatFlags
+        && a->mBytesPerPacket == b->mBytesPerPacket
+        && a->mFramesPerPacket == b->mFramesPerPacket
+        && a->mBytesPerFrame == b->mBytesPerFrame
+        && a->mChannelsPerFrame == b->mChannelsPerFrame
+        && a->mBitsPerChannel == b->mBitsPerChannel;
+}
+
+#pragma mark - 接缝淡入 + 峰值限幅（0.3.56）
+
+/// 一个样本读成归一化 float（int16 / float32 都支持）。
+static inline float SLVGetSample(const uint8_t *b, size_t i, BOOL isFloat) {
+    if (isFloat) return ((const float *)b)[i];
+    return ((const int16_t *)b)[i] / 32768.0f;
+}
+
+static inline void SLVSetSample(uint8_t *b, size_t i, BOOL isFloat, float v) {
+    if (isFloat) {
+        ((float *)b)[i] = (v > 1.0f) ? 1.0f : ((v < -1.0f) ? -1.0f : v);
+        return;
+    }
+    if (v > 1.0f) v = 1.0f; else if (v < -1.0f) v = -1.0f;
+    ((int16_t *)b)[i] = (int16_t)lrintf(v * 32767.0f);
+}
+
+/// 就地处理一包已经填好的 PCM：先整体峰值限幅，再在接缝处淡入。
+///
+/// 为什么是「就地」：这包数据是我们自己 memcpy 出来的副本，改它不影响池子，
+/// 也不会让下一个消费者读到被改过的内容。
+///
+/// 返回位掩码：1 = 做了接缝淡入，2 = 做了限幅，0 = 这包本来就很干净。
+static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
+                                const AudioStreamBasicDescription *a,
+                                int32_t *lastVal, BOOL *hasLast, float *gainInOut) {
+    if (!bytes || !len || !a || a->mBytesPerFrame == 0) return 0;
+
+    BOOL isFloat = (a->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    UInt32 bits = a->mBitsPerChannel;
+    if (!((isFloat && bits == 32) || (!isFloat && bits == 16))) return 0;  // 不认识的格式不碰
+
+    UInt32 ch = a->mChannelsPerFrame ? a->mChannelsPerFrame : 1;
+    UInt32 bps = bits / 8;
+    // 只处理「交错」和「单声道」。非交错多声道的 plane 长度跟帧数对不上，
+    // 硬算会把左右声道拌在一起 —— 那是比爆音更难听的噪声。
+    if ((a->mFormatFlags & kAudioFormatFlagIsNonInterleaved) && ch > 1) return 0;
+    if (ch > 2) return 0;
+    if (a->mBytesPerFrame != ch * bps) return 0;
+
+    size_t frames = len / a->mBytesPerFrame;
+    if (frames < 2) return 0;
+
+    NSUInteger did = 0;
+
+    // ---- ① 峰值限幅：只做「超过 -1 dBFS 就整块缩小」，不做压缩/增益，音色不变 ----
+    //
+    // 为什么要它：注入电平日志里有一段长期停在 -4.6 dBFS RMS（几乎满刻度）。
+    // 这种电平送进通话，对端任何一点增益就是数字削波 —— 听感就是破音/杂音。
+    const float target = 0.891f;       // -1 dBFS
+    float peak = 0.0f;
+    size_t nsamp = len / bps;
+    for (size_t i = 0; i < nsamp; i++) {
+        float v = SLVGetSample(bytes, i, isFloat);
+        if (v < 0) v = -v;
+        if (v > peak) peak = v;
+    }
+    float want = (peak > target) ? (target / peak) : 1.0f;
+    float prev = (*gainInOut > 0.0f) ? *gainInOut : 1.0f;
+    if (want < 0.999f || prev < 0.999f) {
+        for (size_t f = 0; f < frames; f++) {
+            float g = prev + (want - prev) * (float)(f + 1) / (float)frames;
+            for (UInt32 c = 0; c < ch; c++) {
+                size_t i = f * ch + c;
+                SLVSetSample(bytes, i, isFloat, SLVGetSample(bytes, i, isFloat) * g);
+            }
+        }
+        did |= 2;
+    }
+    *gainInOut = want;
+
+    // ---- ② 接缝淡入 ----
+    //
+    // 判据只看一个数：这一包的第 0 个样本跟上一包的最后一个样本差多少。
+    // 差得远 = 中间断过（重建、换格式、对齐跳位、追帧丢弃），波形在这里有个台阶，
+    // 编码出来就是「啪」。做法是从上一包的值出发、8ms 内平滑过渡到本包内容，
+    // 台阶被抹成一段斜坡，听感上就是「没听见」。
+    float cur0 = SLVGetSample(bytes, 0, isFloat);
+    // 阈值 0.25（≈ -12 dBFS 的相邻样本跳变）。定得再低会误伤鼓点这类真实瞬态
+    //（8ms 淡入会把起音磨钝），定得再高真断点就漏过去了 —— 断点通常是整幅跳变。
+    if (*hasLast && fabsf(cur0 - lastVal[0] / 32768.0f) > 0.25f) {
+        uint32_t fade = (uint32_t)(a->mSampleRate * 0.008);
+        if (fade < 16) fade = 16;
+        if (fade > frames) fade = (uint32_t)frames;
+        for (uint32_t f = 0; f < fade; f++) {
+            float w = (float)(f + 1) / (float)fade;
+            w = w * w * (3.0f - 2.0f * w);        // smoothstep，两端都不带折角
+            for (UInt32 c = 0; c < ch; c++) {
+                size_t i = (size_t)f * ch + c;
+                float pv = (c < 2 ? lastVal[c] : lastVal[0]) / 32768.0f;
+                float v = SLVGetSample(bytes, i, isFloat);
+                SLVSetSample(bytes, i, isFloat, pv + (v - pv) * w);
+            }
+        }
+        did |= 1;
+    }
+
+    // ---- 记住本包最后一个样本，下一包拿它比 ----
+    for (UInt32 c = 0; c < ch; c++) {
+        float v = SLVGetSample(bytes, (frames - 1) * ch + c, isFloat);
+        lastVal[c < 2 ? c : 0] = (int32_t)lrintf(v * 32768.0f);
+    }
+    *hasLast = YES;
+    return did;
 }
 
 @interface SLVCamFeed () {
@@ -501,6 +645,14 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     double _audioHeadPTS;
     NSUInteger _audioSkipBlocks;         // 被「丢弃追帧」扔掉的块数（诊断用）
     CFAbsoluteTime _audioSkipLogAt;
+
+    // 0.3.56：目标格式切换次数 / 接缝淡入次数 / 限幅次数（诊断用）
+    NSUInteger _audioFormatJumps;
+    NSUInteger _audioSplices;
+    NSUInteger _audioLimits;
+    BOOL _primePending;                  // 已有一件「后台登记格式」的活在路上
+    BOOL _audioMismatchLogged;
+    CFAbsoluteTime _audioFormatAt;       // 当前目标格式是哪一刻定型的（迟滞用）
 
     // ---- 解码线程独占 ----
     AVAssetReader *_reader;
@@ -672,7 +824,11 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     _audioTSCount = 0;
     _audioHeadPTS = NAN;                 // 0.3.54：池子清空了，生产端位置也没了
     // 换素材必须把所有人的游标一起归零，否则旧位置会落在新池子外面
-    for (int i = 0; i < _audioConsumerCount; i++) _audioConsumers[i].cursor = 0;
+    for (int i = 0; i < _audioConsumerCount; i++) {
+        _audioConsumers[i].cursor = 0;
+        _audioConsumers[i].hasLast = NO;      // 换了素材，上一包的样本值不再有意义
+        _audioConsumers[i].gain = 1.0f;
+    }
     _running = (_sourcePath.length > 0);
     BOOL run = _running;
     [_lock unlock];
@@ -1107,6 +1263,14 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
     CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
     size_t len = bb ? CMBlockBufferGetDataLength(bb) : 0;
     if (len > 0) {
+        // 0.3.56：转码前先记下「按哪个目标格式转」。转码是慢活（几毫秒），
+        // 这期间宿主完全可能换格式；拼进池子时必须还是同一个格式，否则池子里
+        // 会同时躺着两种布局的字节 —— 读端只能按一种标尺读，另一半就是噪声。
+        [_lock lock];
+        AudioStreamBasicDescription dstBefore = _audioDstASBD;
+        BOOL hadDstBefore = _hasAudioDstASBD;
+        [_lock unlock];
+
         NSMutableData *raw = [NSMutableData dataWithLength:len];
         OSStatus copySt = CMBlockBufferCopyDataBytes(bb, 0, len, raw.mutableBytes);
         NSData *converted = (copySt == noErr) ? [self sl_convertAudio:raw] : nil;
@@ -1116,6 +1280,14 @@ static double SLVPCMLoudnessdBFS(const void *bytes, size_t len, const AudioStrea
             BOOL skipped = NO;
             double skipSec = 0;
             [_lock lock];
+            if (!hadDstBefore || !_hasAudioDstASBD ||
+                !SLVASBDSame(&dstBefore, &_audioDstASBD)) {
+                // 转码期间格式变了：这包按旧格式转的字节已经作废。
+                // 丢掉它比塞进池子便宜得多 —— 生产端位置不动，下一包会按新格式重解。
+                [_lock unlock];
+                CFRelease(sb);
+                return YES;
+            }
             double blk = _audioBytesPerSecond
                        ? (double)converted.length / (double)_audioBytesPerSecond : 0.0;
             double vpts = [self sl_videoPTSLocked];
@@ -2041,10 +2213,49 @@ BOOL SLVCamIsMomoProcess(void) {
 #pragma mark - 出音频
 
 /// 登记宿主音频格式并建好转换器。调用方必须已持有 _lock。
-/// 返回 YES 表示格式是新的（或变了），解码管线需要重建。
+/// **返回 YES 表示池子现在就是这种格式，可以往里取数据**。
+/// 返回 NO = 拒绝切换（迟滞期内来了另一种格式），调用方这一包必须放行。
 - (BOOL)sl_configureAudioLocked:(const AudioStreamBasicDescription *)asbd {
     if (!asbd || asbd->mBytesPerFrame == 0 || asbd->mSampleRate == 0) return NO;
-    if (_hasAudioDstASBD && memcmp(asbd, &_audioDstASBD, sizeof(*asbd)) == 0) return NO;
+    if (_hasAudioDstASBD && SLVASBDSame(asbd, &_audioDstASBD)) return YES;
+
+    // 迟滞：刚定型不久，而且此刻还有人正在按旧格式读 —— 不跟着翻。
+    // 翻了就要清池子，两套格式来回翻的结果是两边都拿不到数据。
+    if (_hasAudioDstASBD) {
+        [self sl_pruneConsumersLocked];
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (_audioConsumerCount > 0 && (now - _audioFormatAt) < SLV_AUDIO_FORMAT_STABLE) {
+            return NO;
+        }
+    }
+
+    // 0.3.56：格式一变，池子必须**当场**清空，不能等解码线程下一轮重建。
+    //
+    // 池子里的字节是按旧格式排的，而 _audioBytesPerSecond 这一行一改，读端立刻
+    // 按新标尺去算偏移。0.3.55 的日志里就有这么一段：11:47:21 目标 1ch/2B，
+    // 11:47:41 突然变成 2ch/4B（AudioUnit 那条链接管了），池子里还是 1ch 的字节。
+    // 按 2ch 读等于把「相邻两个单声道样本」当成左右声道 —— 对端听到的是严重失真，
+    // 用户的话就是「很大的杂音」。而真正的清池要等解码线程处理 _reconfigRequested，
+    // 中间这几百毫秒是纯粹的垃圾数据。
+    //
+    // 现在改标尺和清池是同一个原子的动作：格式换了就当作「这段音频作废」，
+    // 接下来宁可给这一小段静音，也不给错位的字节。
+    BOOL hadPool = (_audioPCM.length > 0 || _audioTSCount > 0);
+    if (hadPool) {
+        [_audioPCM setLength:0];
+        _audioTSCount = 0;
+        _audioHeadPTS = NAN;
+        for (int i = 0; i < _audioConsumerCount; i++) {
+            _audioConsumers[i].cursor = 0;
+            _audioConsumers[i].hasLast = NO;      // 新格式的第一个样本没有可比对象
+            _audioConsumers[i].gain = 1.0f;
+        }
+        _audioFormatJumps++;
+        SLVLog(@"音频: 目标格式切换 #%lu → %.0fHz %uch %uB/帧（池已清空：旧格式字节不能按新标尺读）",
+              (unsigned long)_audioFormatJumps, asbd->mSampleRate,
+              (unsigned)asbd->mChannelsPerFrame, (unsigned)asbd->mBytesPerFrame);
+    }
+    _audioFormatAt = CFAbsoluteTimeGetCurrent();   // 迟滞的起点（首次登记也算）
 
     _audioDstASBD = *asbd;
     _hasAudioDstASBD = YES;
@@ -2161,7 +2372,33 @@ BOOL SLVCamIsMomoProcess(void) {
     _audioConsumers[slot].cursor = start;
     _audioConsumers[slot].lastCall = now;
     _audioConsumers[slot].lastSync = 0;   // 0.3.53：新消费者第一次调用就做一次音画对齐
+    // 0.3.56：新消费者是从池子中间起读的，第一个样本和「上一包」没有关系 ——
+    // 不能拿别人留下的 lastVal 去比，否则第一包就被淡入成一小段渐强。
+    _audioConsumers[slot].hasLast = NO;
+    _audioConsumers[slot].gain = 1.0f;
+    _audioConsumers[slot].lastVal[0] = 0;
+    _audioConsumers[slot].lastVal[1] = 0;
+    _audioConsumers[slot].splices = 0;
+    _audioConsumers[slot].limits = 0;
     return slot;
+}
+
+/// 实时线程用：把「宿主换了一种格式」这件事丢给后台去登记，自己立刻返回。
+///
+/// 不能在音频线程上建 AVAudioConverter（几十毫秒），那会把宿主的录音回调卡住。
+/// 这里只做一件事：保证同一时间只有一件登记活在路上，避免格式来回变时堆一队。
+- (void)sl_primeAsyncLocked:(const AudioStreamBasicDescription *)asbd {
+    if (!asbd || _primePending) return;
+    _primePending = YES;
+    AudioStreamBasicDescription copy = *asbd;
+    NSLock *lk = _lock;
+    SLVCamFeed *me = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [me primeAudioFormat:&copy];
+        [lk lock];
+        me->_primePending = NO;
+        [lk unlock];
+    });
 }
 
 /// 取一包 PCM。调用方必须已持有 _lock。
@@ -2178,9 +2415,12 @@ BOOL SLVCamIsMomoProcess(void) {
     }
 
     if (configure) {
-        [self sl_configureAudioLocked:asbd];
-    } else if (!_hasAudioDstASBD) {
-        // 实时线程不建转换器 —— 那是几十毫秒的活，让 primeAudioFormat: 去做。
+        if (![self sl_configureAudioLocked:asbd]) {
+            // 0.3.56：迟滞期内的「另一种格式」。这包放行真麦克风，池子保持原样——
+            // 跟着翻会把正在按旧格式读的那条链一起打断，两边都没声音。
+            return nil;
+        }
+    } else if (!_hasAudioDstASBD) {        // 实时线程不建转换器 —— 那是几十毫秒的活，让 primeAudioFormat: 去做。
         // 但这条路以前是静默返回 nil 的，而 nil 在三条注入链路里都等于
         // 「放行真麦克风」。所以「录制时音频没被替换」在日志上完全看不见，
         // 现在第一次撞上就留一行痕。
@@ -2188,6 +2428,22 @@ BOOL SLVCamIsMomoProcess(void) {
             _audioPassLogged = YES;
             SLVLog(@"音频: 放行真麦克风 —— 目标格式还没配置（素材 %.0fHz %uch，宿主未登记）",
                   asbd->mSampleRate, (unsigned)asbd->mChannelsPerFrame);
+        }
+        return nil;
+    } else if (!SLVASBDSame(asbd, &_audioDstASBD)) {
+        // 0.3.56：实时线程要求一种「池子不是这个布局」的格式。
+        //
+        // 池子只能按一种标尺读 —— 按别的格式去 memcpy，拿到的就是错位的字节，
+        // 对端听到的是噪声而不是声音。这时候唯一正确的做法是放行这一包（宿主
+        // 拿到真麦克风），同时把新格式丢到后台登记；下一包起池子就是对的。
+        // AudioQueue（16k/1ch）和 AudioUnit（48k/2ch）同时活着时走的就是这里。
+        [self sl_primeAsyncLocked:asbd];
+        if (!_audioMismatchLogged) {
+            _audioMismatchLogged = YES;
+            SLVLog(@"音频: 格式不一致 —— 宿主这次要 %.0fHz %uch %uB/帧，池子是 %.0fHz %uch %uB/帧（这一包放行，格式已丢到后台重配）",
+                  asbd->mSampleRate, (unsigned)asbd->mChannelsPerFrame, (unsigned)asbd->mBytesPerFrame,
+                  _audioDstASBD.mSampleRate, (unsigned)_audioDstASBD.mChannelsPerFrame,
+                  (unsigned)_audioDstASBD.mBytesPerFrame);
         }
         return nil;
     }
@@ -2313,11 +2569,12 @@ BOOL SLVCamIsMomoProcess(void) {
         // 明显 <0 表示解不过来（解码跟不上），这时才会出现持续的口型错位。
         double prodMs = (isnan(vpts) || isnan(_audioHeadPTS)) ? 0.0 : (_audioHeadPTS - vpts) * 1000.0;
         // 0.3.52：这是音频实时线程（AudioUnitRender 里调进来的），走 RT 版
-        SLVLogRT(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包 · 消费者 %d 个 · 音画偏差 %+.0fms · 生产 %+.0fms · 对齐 %lu 次 · 跳帧 %lu",
+        SLVLogRT(@"音频: 水位 %lums · 丢 %lu 字节 · 第 %lu 包 · 消费者 %d 个 · 音画偏差 %+.0fms · 生产 %+.0fms · 对齐 %lu 次 · 跳帧 %lu · 接缝 %lu · 限幅 %lu",
                 (unsigned long)(mine * 1000 / _audioBytesPerSecond),
                 (unsigned long)_audioDropped, (unsigned long)_audioCalls, _audioConsumerCount,
                 driftMs, prodMs, (unsigned long)_audioSyncJumps,
-                (unsigned long)_audioSkipBlocks);
+                (unsigned long)_audioSkipBlocks,
+                (unsigned long)_audioSplices, (unsigned long)_audioLimits);
     }
 
     BOOL hasAudio = _assetHasAudio;
@@ -2342,6 +2599,23 @@ BOOL SLVCamIsMomoProcess(void) {
         return chunk;   // dataWithLength 出来就是全零
     }
     if (got < numBytes) memset((uint8_t *)chunk.mutableBytes + got, 0, numBytes - got);  // 不够补静音
+
+    // 0.3.56：接缝淡入 + 峰值限幅。
+    //
+    // 放在最后一步、对**这一包副本**做，池子里的数据保持原样 —— 下一个消费者
+    // 读同一段内容时看到的还是原始波形，只是各自在自己那一段的接缝处补了斜坡。
+    NSUInteger polished = SLVPolishChunk((uint8_t *)chunk.mutableBytes, numBytes, asbd,
+                                         _audioConsumers[slot].lastVal,
+                                         &_audioConsumers[slot].hasLast,
+                                         &_audioConsumers[slot].gain);
+    if (polished & 1) {
+        _audioConsumers[slot].splices++;
+        _audioSplices++;
+    }
+    if (polished & 2) {
+        _audioConsumers[slot].limits++;
+        _audioLimits++;
+    }
     return chunk;
 }
 
@@ -2422,6 +2696,50 @@ BOOL SLVCamIsMomoProcess(void) {
     NSData *d = [self sl_audioLocked:asbd numBytes:numBytes configure:NO consumer:consumer];
     [_lock unlock];
     return d;
+}
+
+#pragma mark - AVAudioEngine tap（0.3.56）
+
+- (BOOL)fillTapBuffer:(AVAudioPCMBuffer *)buf consumer:(const void * _Nullable)consumer {
+    if (!buf || buf.frameLength == 0) return NO;
+    const AudioStreamBasicDescription *sd = buf.format.streamDescription;
+    if (!sd || sd->mBytesPerFrame == 0 || sd->mSampleRate == 0) return NO;
+
+    AudioBufferList *abl = buf.mutableAudioBufferList;
+    if (!abl) return NO;
+
+    AudioStreamBasicDescription a = *sd;
+    UInt32 planes = abl->mNumberBuffers;
+    if (planes == 0) return NO;
+    size_t bps = a.mBitsPerChannel / 8;
+    if (bps == 0) return NO;
+
+    if (a.mFormatFlags & kAudioFormatFlagIsNonInterleaved) {
+        // 每个 plane 一条声道。素材是单声道，直接铺到所有 plane 上：
+        //   ① 交给池子的标尺必须是「1 声道」的字节率，否则游标会按 2 倍速走；
+        //   ② 铺同一份数据不会有左右声道相位差，比拆包安全得多。
+        a.mChannelsPerFrame = 1;
+        a.mBytesPerFrame = (UInt32)bps;
+        a.mBytesPerPacket = (UInt32)bps;
+        size_t n = (size_t)buf.frameLength * bps;
+        NSData *pcm = [self tryAudioForFormat:&a numBytes:n consumer:consumer];
+        if (pcm.length != n) return NO;
+        for (UInt32 i = 0; i < planes; i++) {
+            AudioBuffer *b = &abl->mBuffers[i];
+            if (b->mData && b->mDataByteSize >= n) memcpy(b->mData, pcm.bytes, n);
+        }
+        return YES;
+    }
+
+    AudioBuffer *b0 = &abl->mBuffers[0];
+    if (!b0->mData) return NO;
+    size_t n = (size_t)buf.frameLength * a.mBytesPerFrame;
+    if (b0->mDataByteSize < n) n = b0->mDataByteSize;
+    if (n == 0) return NO;
+    NSData *pcm = [self tryAudioForFormat:&a numBytes:n consumer:consumer];
+    if (pcm.length != n) return NO;
+    memcpy(b0->mData, pcm.bytes, n);
+    return YES;
 }
 
 @end

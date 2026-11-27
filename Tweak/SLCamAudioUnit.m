@@ -21,9 +21,15 @@ typedef OSStatus (*SLVAudioUnitRenderFn)(AudioUnit, AudioUnitRenderActionFlags *
 typedef OSStatus (*SLVAudioQueueNewInputFn)(const AudioStreamBasicDescription *,
                                            AudioQueueInputCallback, void *, CFRunLoopRef,
                                            CFStringRef, UInt32, AudioQueueRef *);
+// 0.3.56：AudioQueue 的第二个建队列入口（回调走 dispatch queue，不挂 RunLoop）。
+typedef OSStatus (*SLVAudioQueueNewInputDQFn)(const AudioStreamBasicDescription *,
+                                             AudioQueueInputCallback, void *,
+                                             dispatch_queue_t, CFStringRef, UInt32,
+                                             AudioQueueRef *);
 
 static SLVAudioUnitRenderFn gSLRenderOrig = NULL;
 static SLVAudioQueueNewInputFn gSLAQOrig = NULL;
+static SLVAudioQueueNewInputDQFn gSLAQDQOrig = NULL;
 
 static BOOL gSLHooked = NO;
 static BOOL gSLRegistered = NO;
@@ -500,6 +506,49 @@ static BOOL SLVAQFormatUsable(const AudioStreamBasicDescription *fmt) {
         && fmt->mBytesPerFrame < 64;      // 明显不对的值直接放弃，别拿它算字节数
 }
 
+/// 建一个可用于替换的上下文；不值得替换时返回 NULL（调用方直接放行原函数）。
+///
+/// 0.3.56 抽出来是因为 AudioQueue 有两个建队列入口（runloop / dispatch queue），
+/// 两份完全相同的判断逻辑分开写迟早会走样。
+static SLVAQContext *SLVAQContextCreate(const AudioStreamBasicDescription *fmt,
+                                       AudioQueueInputCallback cb, void *ud) {
+    if (!cb || !SLVAQFormatUsable(fmt) || gSLAQContextCount >= 8) {
+        if (!gSLAQProbeLogged) {
+            gSLAQProbeLogged = YES;
+            SLVLog(@"音频: AudioQueue 录音格式不可替换（%.0fHz %uch fmt=%u），放行真实麦克风",
+                  fmt ? fmt->mSampleRate : 0, fmt ? (unsigned)fmt->mChannelsPerFrame : 0,
+                  fmt ? (unsigned)fmt->mFormatID : 0);
+        }
+        return NULL;
+    }
+    SLVAQContext *ctx = calloc(1, sizeof(SLVAQContext));
+    if (!ctx) return NULL;
+    ctx->origCb = cb;
+    ctx->origUd = ud;
+    ctx->asbd = *fmt;
+    ctx->usable = YES;
+    return ctx;
+}
+
+/// 队列已经建好：登记上下文、异步预登记格式、打一行日志。
+static void SLVAQContextCommit(SLVAQContext *ctx, const AudioStreamBasicDescription *fmt,
+                               const char *via) {
+    gSLAQContexts[gSLAQContextCount++] = ctx;
+
+    // 提前登记格式：解码线程要据此把音轨挂上，否则开头一段只能出静音。
+    // 但**不能在宿主线程上同步做** —— 里面要建 AVAudioConverter，而抖音是在
+    // 打开录像页的主线程上调 AudioQueueNewInput 的，同步做会把 UI 卡住。
+    AudioStreamBasicDescription fmtCopy = *fmt;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [[SLVCamFeed shared] primeAudioFormat:&fmtCopy];
+    });
+
+    SLVLog(@"音频: 已接管 AudioQueue 录音（%.0fHz %uch %uB/帧 · %s）· 素材音 %@",
+          fmt->mSampleRate, (unsigned)fmt->mChannelsPerFrame, (unsigned)fmt->mBytesPerFrame,
+          via ? via : "?",
+          [[SLVCamFeed shared] isReady] ? @"已就绪" : @"待命");
+}
+
 static void SLVCamAudioQueueInputCallback(void *inUserData, AudioQueueRef inAQ,
                                          AudioQueueBufferRef inBuffer,
                                          const AudioTimeStamp *inStartTime,
@@ -557,47 +606,41 @@ static OSStatus SLVCamAudioQueueNewInput(const AudioStreamBasicDescription *fmt,
                                         UInt32 flags, AudioQueueRef *outAQ) {
     if (!gSLAQOrig) return -1;
 
-    // 格式拿不到、或不是线性 PCM（压缩格式没法逐包替换）就原样放行
-    if (!cb || !SLVAQFormatUsable(fmt) || gSLAQContextCount >= 8) {
-        if (!gSLAQProbeLogged) {
-            gSLAQProbeLogged = YES;
-            SLVLog(@"音频: AudioQueue 录音格式不可替换（%.0fHz %uch fmt=%u），放行真实麦克风",
-                  fmt ? fmt->mSampleRate : 0, fmt ? (unsigned)fmt->mChannelsPerFrame : 0,
-                  fmt ? (unsigned)fmt->mFormatID : 0);
-        }
-        return gSLAQOrig(fmt, cb, ud, rl, mode, flags, outAQ);
-    }
-
-    SLVAQContext *ctx = calloc(1, sizeof(SLVAQContext));
+    SLVAQContext *ctx = SLVAQContextCreate(fmt, cb, ud);
     if (!ctx) return gSLAQOrig(fmt, cb, ud, rl, mode, flags, outAQ);
-    ctx->origCb = cb;
-    ctx->origUd = ud;
-    ctx->asbd = *fmt;
-    ctx->usable = YES;
 
     // 关键一步：交给系统的是我们的回调和上下文，不是宿主的。
     // 宿主原来那对 (cb, ud) 存在 ctx 里，由包装函数在替换完数据后再叫起来。
     OSStatus st = gSLAQOrig(fmt, SLVCamAudioQueueInputCallback, ctx, rl, mode, flags, outAQ);
+    if (st != noErr) {
+        free(ctx);                 // 建队列失败说明宿主自己都用不了，把上下文还回去
+        return st;
+    }
+    SLVAQContextCommit(ctx, fmt, "runloop");
+    return st;
+}
 
-    // 建队列失败说明宿主自己都用不了，把上下文还回去，别占坑
+/// 0.3.56：`AudioQueueNewInputWithDispatchQueue` 是**另一个导出符号**，不挂它等于漏一条路。
+///
+/// 微信拍摄的日志里出现过最典型的一幕：`已接管 AudioQueue 录音（16000Hz 1ch）`，
+/// 然后 20 秒 / 60 秒两次体检都是「队列 1 个（收到回调 0 个）」—— 队列建好了、
+/// 从来没响过。这说明那个 16k 队列只是语音引擎的探路，真正录音的那条走的是
+/// dispatch queue 变体，而它从来没经过我们的钩子（连计数都没有）。
+static OSStatus SLVCamAudioQueueNewInputDispatch(const AudioStreamBasicDescription *fmt,
+                                                AudioQueueInputCallback cb, void *ud,
+                                                dispatch_queue_t dq, CFStringRef mode,
+                                                UInt32 flags, AudioQueueRef *outAQ) {
+    if (!gSLAQDQOrig) return -1;
+
+    SLVAQContext *ctx = SLVAQContextCreate(fmt, cb, ud);
+    if (!ctx) return gSLAQDQOrig(fmt, cb, ud, dq, mode, flags, outAQ);
+
+    OSStatus st = gSLAQDQOrig(fmt, SLVCamAudioQueueInputCallback, ctx, dq, mode, flags, outAQ);
     if (st != noErr) {
         free(ctx);
         return st;
     }
-
-    gSLAQContexts[gSLAQContextCount++] = ctx;
-
-    // 提前登记格式：解码线程要据此把音轨挂上，否则开头一段只能出静音。
-    // 但**不能在宿主线程上同步做** —— 里面要建 AVAudioConverter，而抖音是在
-    // 打开录像页的主线程上调 AudioQueueNewInput 的，同步做会把 UI 卡住。
-    AudioStreamBasicDescription fmtCopy = *fmt;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [[SLVCamFeed shared] primeAudioFormat:&fmtCopy];
-    });
-
-    SLVLog(@"音频: 已接管 AudioQueue 录音（%.0fHz %uch %uB/帧）· 素材音 %@",
-          fmt->mSampleRate, (unsigned)fmt->mChannelsPerFrame, (unsigned)fmt->mBytesPerFrame,
-          [[SLVCamFeed shared] isReady] ? @"已就绪" : @"待命");
+    SLVAQContextCommit(ctx, fmt, "dispatch");
     return st;
 }
 
@@ -612,10 +655,11 @@ static void SLVAudioCensus(const char *when) {
         if (gSLAQContexts[i] && gSLAQContexts[i]->fired) aqFired++;
     }
     int av = SLVCamAVCaptureAudioFrameCount();
-    SLVLog(@"音频: 体检（%s）—— AudioUnitRender bus=1 %d 次 · AVCapture 音频 %d 帧 · AudioQueue 队列 %d 个（收到回调 %d 个）",
-          when, sBus1Calls, av, gSLAQContextCount, aqFired);
-    if (sBus1Calls == 0 && av == 0 && aqFired == 0) {
-        SLVLog(@"音频: 三条入口都没有数据 —— 宿主的麦克风不经过它们，替换音频不会生效（画面不受影响）");
+    int tap = SLVCamAudioTapCount();
+    SLVLog(@"音频: 体检（%s）—— AudioUnitRender bus=1 %d 次 · AVCapture 音频 %d 帧 · AudioQueue 队列 %d 个（收到回调 %d 个）· AVAudioEngine tap %d 次",
+          when, sBus1Calls, av, gSLAQContextCount, aqFired, tap);
+    if (sBus1Calls == 0 && av == 0 && aqFired == 0 && tap == 0) {
+        SLVLog(@"音频: 四条入口都没有数据 —— 宿主的麦克风不经过它们，替换音频不会生效（画面不受影响）");
     }
 }
 
@@ -658,6 +702,13 @@ void SLVCamInstallAudioUnitHook(void) {
 
         SLVSymbolHook("AudioQueueNewInput", (void *)SLVCamAudioQueueNewInput,
                      (void **)&gSLAQOrig);
+        // 0.3.56：dispatch queue 变体是另一个符号。微信拍摄那条「建了队列却一次
+        // 回调都没有」的路，很可能就是从这里进的 —— 不挂它连计数都看不到。
+        int aqDQ = SLVSymbolHook("AudioQueueNewInputWithDispatchQueue",
+                                 (void *)SLVCamAudioQueueNewInputDispatch,
+                                 (void **)&gSLAQDQOrig);
+        SLVLog(@"音频: AudioQueue 两个入口已挂（NewInput=%@ · WithDispatchQueue 命中 %d 处）",
+              gSLAQOrig ? @"Y" : @"N", aqDQ);
 
         // 后加载的 framework 自动补扫：QQ 的拍摄模块是启动之后才 dlopen 的，
         // 启动那一遍扫描根本看不到它（日志里「扫过 6 个 App 镜像」就是证据）
