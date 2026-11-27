@@ -767,8 +767,11 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
 + (BOOL)sl_isImagePath:(NSString *)p;
 - (void)sl_loadStillImage;
 - (void)sl_decodeLoopWithGeneration:(NSUInteger)gen;
-- (void)sl_buildReaderForKey:(NSString *)key generation:(NSUInteger)gen;
-- (BOOL)sl_pumpAudio;
+// 0.3.59：返回值给解码线程自己持有。
+// 以前 reader 只挂在 ivar 上，换一代时新线程一赋值就把旧 reader 释放掉 ——
+// 而旧线程可能正阻塞在 copyNextSampleBuffer 里，读到一半对象没了 → 闪退。
+- (AVAssetReader * _Nullable)sl_buildReaderForKey:(NSString *)key generation:(NSUInteger)gen;
+- (BOOL)sl_pumpAudio:(AVAssetReaderTrackOutput *)out;
 - (BOOL)sl_audioNeedMore;
 - (BOOL)sl_audioNeedMoreLocked;
 - (NSData *)sl_audioLocked:(const AudioStreamBasicDescription *)asbd numBytes:(size_t)numBytes
@@ -886,6 +889,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
 
 - (void)sl_restart {
     NSUInteger gen;
+    AVAssetReader *retired = nil;
     [_lock lock];
     gen = ++_generation;
     _reconfigRequested = YES;
@@ -896,6 +900,18 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
     // 注入缓存也是按旧素材渲的，换素材必须一起扔掉
     if (_hostStill) { CVPixelBufferRelease(_hostStill); _hostStill = NULL; }
     _hostStillKey = nil;
+    // 0.3.59：换素材 = 换了一条时间轴，续播点必须作废。
+    //
+    // 以前这里什么都不清，于是新素材会拿**上一部片**的 PTS 去 timeRange 续播
+    // （日志里「feed 从 8.05 秒续播」就是这么来的）。新片比这个点短的话，
+    // timeRange 直接落在片尾之后 → startReading 失败「这项操作无法完成」。
+    _resumeValid = NO;
+    _lastVideoPTS = kCMTimeInvalid;
+    _playValid = NO;
+    // 旧 reader 在这里就摘掉并停掉：它那一代的线程还在 decodeLoop 里，
+    // 不 cancel 它会一直读到片尾；cancel 之后它在下一次 copyNextSampleBuffer
+    // 立刻拿到 nil，看到 generation 变了就退出。
+    if (_reader) { retired = _reader; _reader = nil; }
     [_audioPCM setLength:0];
     _audioTSCount = 0;
     _audioJumpEpoch++;                   // 0.3.58：池子清空 = 内容断点，下一个包必须渐入
@@ -909,6 +925,8 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
     _running = (_sourcePath.length > 0);
     BOOL run = _running;
     [_lock unlock];
+
+    if (retired) [retired cancelReading];
 
     if (run) {
         [NSThread detachNewThreadWithBlock:^{
@@ -1058,6 +1076,26 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
         [NSThread currentThread].qualityOfService = NSQualityOfServiceUserInitiated;
     }
 
+    // 0.3.59：本线程自己持有 reader / 输出，不再直接拿 ivar 当调用目标。
+    //
+    // 崩溃现场（企业微信，视频通话中换素材，必现）：
+    //   15:40:10 feed source -> xxx.mov
+    //   15:40:10 feed startReading 失败
+    //   15:40:13 === 进程重启 ===
+    // 换素材时 sl_restart 会 detach 一个新线程，新线程在 buildReader 里
+    // `_reader = reader` 这一句就把**旧 reader 释放**了；而旧线程这时多半
+    // 正阻塞在 `[_videoOut copyNextSampleBuffer]` 里 —— 对象在自己的调用栈上
+    // 被释放，下一次访问就是野指针。旧 ivar 里存的 AVAssetReaderTrackOutput
+    // 又只由那个 reader 持有，跟着一起没。
+    //
+    // 现在：reader 由本线程的强引用保命，ivar 只做「给新线程看/给日志看」，
+    // 谁也不能把别人正在用的对象free掉。
+    AVAssetReader *ownReader = nil;
+    // 输出对象也按「本线程」持有：它们在 buildReader 成功后跟 ownReader 一一对应，
+    // 之后每次解码调用用的都是自己这一份，不会因为别的线程重建而指到别人的管线上去。
+    AVAssetReaderTrackOutput *vOut = nil;
+    AVAssetReaderTrackOutput *aOut = nil;
+
     while (YES) {
         @autoreleasepool {
             [_lock lock];
@@ -1068,7 +1106,11 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
             BOOL loop = _loopEnabled;
             BOOL isImage = _isImage;
             [_lock unlock];
-            if (!alive) break;
+            if (!alive) {
+                // 自己这一代的 reader 自己收尾，别指望别人替你 cancel
+                if (ownReader) [ownReader cancelReading];
+                break;
+            }
 
             // ---- 图片素材：解一次就够，之后一直挂着同一帧 ----
             // 不建 reader（图片没有视频轨，建了也是空的），也不节流到帧率 ——
@@ -1089,26 +1131,34 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
                 continue;
             }
 
-            if (reconfig || !_reader) {
+            if (reconfig || !ownReader) {
                 // 0.3.55：格式变化不该让画面回到素材开头。
                 //
                 // 以前 _resumeValid 只在「补挂音轨」那一处置上，任何其它重建都从 0 秒
                 // 重新解。陌陌一场通话只重建一两次，看不出来；微信会时不时重配采集
                 // 会话（日志里 1920x1080 / 1280x720 来回切），每重配一次画面就从开头
                 // 播一遍 —— 表现就是「视频一直重头开始 / 根本不像在通话」。
-                if (_reader) {
+                if (ownReader) {
                     [_lock lock];
                     _resumeValid = CMTIME_IS_VALID(_lastVideoPTS) && CMTIME_IS_NUMERIC(_lastVideoPTS);
                     [_lock unlock];
+                    // 同一代内部换格式：先把旧的停掉再建新的，否则两个 reader
+                    // 同时读同一个文件，解码器那边会报「无法完成」。
+                    [ownReader cancelReading];
+                    ownReader = nil;
                 }
-                [self sl_buildReaderForKey:key generation:gen];
-                if (!_reader) { usleep(30 * 1000); continue; }
+                ownReader = [self sl_buildReaderForKey:key generation:gen];
+                if (!ownReader) { usleep(30 * 1000); continue; }
+                [_lock lock];
+                vOut = _videoOut;
+                aOut = _audioOut;
+                [_lock unlock];
             }
 
             BOOL gotAny = NO;
             BOOL videoEnded = NO;
 
-            if (_videoOut) {
+            if (vOut) {
                 // 0.3.53：按墙钟播，不再「解一帧睡 1/fps」。
                 //
                 // 旧写法每帧实际耗时 = 解码耗时 + 1/fps，1080p 以上素材光解码就
@@ -1122,7 +1172,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
                 double lastPTS = NAN;
 
                 for (int k = 0; k < SLV_VIDEO_CATCHUP_MAX; k++) {
-                    CMSampleBufferRef sb = [_videoOut copyNextSampleBuffer];
+                    CMSampleBufferRef sb = [vOut copyNextSampleBuffer];
                     if (!sb) {
                         videoEnded = YES;
                         break;
@@ -1171,7 +1221,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
             // 0.3.54：补到「画面时刻 + 120ms」为止（判据在 sl_audioNeedMore 里）。
             // 落后多的时候一轮多补几包 —— 这段是追赶，不是稳态，不能按 8 包憋着
             // 慢慢追，否则一次 1 秒的断档要 1 秒才补回来，听起来就是持续的口型错位。
-            if (_audioOut) {
+            if (aOut) {
                 int maxBlocks = 8;
                 [_lock lock];
                 double headPTS = _audioHeadPTS;
@@ -1181,7 +1231,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
                     maxBlocks = SLV_AUDIO_CATCHUP_MAX;
                 }
                 for (int i = 0; i < maxBlocks; i++) {
-                    if (![self sl_pumpAudio]) break;
+                    if (![self sl_pumpAudio:aOut]) break;
                     gotAny = YES;
                     if (![self sl_audioNeedMore]) break;
                 }
@@ -1202,8 +1252,19 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
                 _idleRounds = 0;
                 if (loop) {
                     // 一轮播完 —— 重建 reader 实现循环播放
-                    [self sl_buildReaderForKey:key generation:gen];
-                    if (!_reader) usleep(50 * 1000);
+                    [ownReader cancelReading];
+                    ownReader = nil;
+                    vOut = nil;
+                    aOut = nil;
+                    ownReader = [self sl_buildReaderForKey:key generation:gen];
+                    if (!ownReader) {
+                        usleep(50 * 1000);
+                    } else {
+                        [_lock lock];
+                        vOut = _videoOut;
+                        aOut = _audioOut;
+                        [_lock unlock];
+                    }
                 } else {
                     usleep(120 * 1000);
                 }
@@ -1322,13 +1383,15 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
 }
 
 /// 解码线程内调用：按画面时刻补齐音频
-- (BOOL)sl_pumpAudio {
+/// 0.3.59：输出对象由调用方传进来（强引用），不再直接摸 ivar —— 见 decodeLoop 里的说明。
+- (BOOL)sl_pumpAudio:(AVAssetReaderTrackOutput *)out {
+    if (!out) return NO;
     [_lock lock];
     BOOL need = [self sl_audioNeedMoreLocked];
     [_lock unlock];
     if (!need) return NO;
 
-    CMSampleBufferRef sb = [_audioOut copyNextSampleBuffer];
+    CMSampleBufferRef sb = [out copyNextSampleBuffer];
     if (!sb) return NO;
 
     CMTime sbPTS = CMSampleBufferGetPresentationTimeStamp(sb);
@@ -1510,7 +1573,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
 
 #pragma mark - Reader 构建（只在解码线程调用）
 
-- (void)sl_buildReaderForKey:(NSString *)key generation:(NSUInteger)gen {
+- (AVAssetReader * _Nullable)sl_buildReaderForKey:(NSString *)key generation:(NSUInteger)gen {
     // 0.3.58：换素材会 detach 新线程，旧线程在 buildReader 里还会再跑一段。
     // 以前它无条件 `[_reader cancelReading]` —— 正好把新线程刚 startReading 成功的
     // 那个 reader 取消掉，日志里就是「startReading 失败: 这项操作无法完成」，
@@ -1519,7 +1582,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
     [_lock lock];
     if (gen != _generation) {
         [_lock unlock];
-        return;
+        return nil;
     }
     // 只取消「自己这一代」的 reader。别人的由它自己的线程收拾。
     AVAssetReader *old = (_readerGen == gen) ? _reader : nil;
@@ -1546,7 +1609,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
     [_lock lock];
     path = _sourcePath;
     [_lock unlock];
-    if (!path.length) return;
+    if (!path.length) return nil;
 
     OSType pf = kCVPixelFormatType_32BGRA;
     if (key.length) {
@@ -1560,7 +1623,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
     AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&err];
     if (!reader) {
         SLVLog(@"feed reader 创建失败: %@", err.localizedDescription ?: @"?");
-        return;
+        return nil;
     }
 
     BOOL wantAudio;
@@ -1608,13 +1671,16 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
         o.alwaysCopiesSampleData = NO;
         if ([reader canAddOutput:o]) {
             [reader addOutput:o];
-            _videoOut = o;
+            [_lock lock]; _videoOut = o; [_lock unlock];
         } else {
             // 目标格式解码器不认，退回 BGRA，交给 CoreImage 转
             NSDictionary *bg = @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA) };
             AVAssetReaderTrackOutput *o2 = [[AVAssetReaderTrackOutput alloc] initWithTrack:vt outputSettings:bg];
             o2.alwaysCopiesSampleData = NO;
-            if ([reader canAddOutput:o2]) { [reader addOutput:o2]; _videoOut = o2; }
+            if ([reader canAddOutput:o2]) {
+                [reader addOutput:o2];
+                [_lock lock]; _videoOut = o2; [_lock unlock];
+            }
         }
         CGSize ns = vt.naturalSize;
         float fps = vt.nominalFrameRate;
@@ -1653,8 +1719,8 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
             o.alwaysCopiesSampleData = NO;
             if ([reader canAddOutput:o]) {
                 [reader addOutput:o];
-                _audioOut = o;
                 [_lock lock];
+                _audioOut = o;
                 _audioSrcASBD = src;
                 _audioTrackAttached = YES;
                 [_lock unlock];
@@ -1681,21 +1747,28 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
 
     if (![reader startReading]) {
         SLVLog(@"feed startReading 失败: %@", reader.error.localizedDescription ?: @"?");
-        return;
+        return nil;
     }
     // startReading 这段可能又换了素材：这一代已经不是最新的，reader 直接作废，
     // 不挂到共享变量上 —— 否则下一轮会被别的线程 cancel 掉，白跑一趟还留一行错误。
     [_lock lock];
     BOOL stillCurrent = (gen == _generation);
+    AVAssetReader *prev = nil;
     if (stillCurrent) {
+        // 0.3.59：把上一代还挂在 ivar 上的 reader 摘下来，稍后 cancel。
+        // sl_restart 现在会先把 _reader 置 nil，这里兜的是「同代换格式但
+        // 上一代线程还没退完」的情况。不 cancel 它就一直读到片尾，
+        // 两个 reader 同时读同一个文件时 startReading 也会互相顶。
+        if (_reader && _reader != reader) prev = _reader;
         _reader = reader;
         _readerGen = gen;
     }
     [_lock unlock];
+    if (prev) [prev cancelReading];
     if (!stillCurrent) {
         [reader cancelReading];
         SLVLog(@"feed 重建完成时素材已换，丢弃这一代 reader（gen %lu）", (unsigned long)gen);
-        return;
+        return nil;
     }
 
     // 循环播放每轮都要重建 reader，每 11 秒刷一行会把日志淹掉。
@@ -1720,6 +1793,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
               ns.width, ns.height, (unsigned)decPf,
               keyChanged ? @"" : [NSString stringWithFormat:@" · 第 %d 轮", sLoopRounds]);
     }
+    return reader;
 }
 
 #pragma mark - 出帧

@@ -25,7 +25,6 @@ NSString *const kSLCamMirrorKey  = @"SLVCamMirror";
 NSString *const kSLCamRotateKey  = @"SLVCamRotate";
 NSString *const kSLCamAudioKey   = @"SLVCamAudio";
 NSString *const kSLCamSquareCropKey = @"SLVCamSquareCrop";
-NSString *const kSLCamEncodeBoostKey = @"SLVCamEncodeBoost";
 
 NSString *const SLVCamConfigChangedNotification = @"SLVCamConfigChangedNotification";
 

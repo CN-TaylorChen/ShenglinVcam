@@ -57,10 +57,4 @@ extern NSString *const kSLCamAudioKey;
 /// 只对陌陌进程有意义，别的 App 判断不过去。
 extern NSString *const kSLCamSquareCropKey;
 
-/// 上行档位抬高，BOOL，默认 NO。
-/// 开 = 把宿主交给 Agora 的 fps / bitrate / dimension 抬到「看得清」的水平再转发；
-/// 关 = 原样透传（宿主自己的档位）。
-/// 只对走 AgoraRtcEngineKit 的宿主有效（陌陌），企业微信那条链不经过它。
-extern NSString *const kSLCamEncodeBoostKey;
-
 NS_ASSUME_NONNULL_END

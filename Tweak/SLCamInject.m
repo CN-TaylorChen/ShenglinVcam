@@ -42,24 +42,13 @@ static BOOL sLoggedFirstAudio = NO;
 static int  sSLCamFailCount = 0;
 static int  sSLCamAudioFailCount = 0;
 static int  sSLCamBadPTS = 0;
+static int  sSLCamTimingFixLogged = 0;
 static int  sSLCamOwnFmtLogged = 0;
 static int  sSLCamDTSFixLogged = 0;
 static int  sSLCamAttachLogged = 0;
 static int  sSLCamSetAttachFailLogged = 0;
 static int  sSLCamOwnFmtExtFailLogged = 0;
 static int  sSLCamOwnFmtRejectedLogged = 0;
-
-// ---- 0.3.61：按 output 分槽记上一帧 PTS，用来算真实帧间隔 ----
-//
-// 为什么不是一个全局变量：微信会同时挂预览/通话两路 AVCaptureVideoDataOutput，
-// 两路 PTS 交错到达，用全局变量会把 66ms 的间隔算成 33ms —— 误报 30fps，
-// 恰好又掉回这次「码率白抬」的同一个坑里。按 output 对象分槽，各算各的。
-#define SLV_TS_SLOTS 4
-static const void *sSLCamTSSelf[SLV_TS_SLOTS];
-static CMTime      sSLCamTSPrev[SLV_TS_SLOTS];
-static os_unfair_lock sSLCamTSLock = OS_UNFAIR_LOCK_INIT;
-static double sSLCamDurLastMs = 0;      // 最近一帧填进去的间隔（心跳直接打这个）
-static int    sSLCamDurFixLogged = 0;
 
 /// 四字符码转可读串（'BGRA' / '420f'），日志里比裸数字好认
 static NSString *SLVFourCC(OSType v) {
@@ -73,37 +62,6 @@ static NSString *SLVFourCC(OSType v) {
     return @(c);
 }
 
-/// 本帧与「同一 output 上一帧」的间隔（毫秒）。
-/// 没有上一帧、或不属于同一路流、或时基不单调时返回 -1（调用方自己兜底）。
-static double SLVCamFrameIntervalMs(const void *out, CMTime pts) {
-    if (!out || !CMTIME_IS_VALID(pts)) return -1;
-
-    double ms = -1;
-    os_unfair_lock_lock(&sSLCamTSLock);
-    int slot = -1, empty = -1;
-    for (int i = 0; i < SLV_TS_SLOTS; i++) {
-        if (sSLCamTSSelf[i] == out) { slot = i; break; }
-        if (!sSLCamTSSelf[i] && empty < 0) empty = i;
-    }
-    if (slot < 0 && empty >= 0) {
-        slot = empty;
-        sSLCamTSSelf[slot] = out;
-        sSLCamTSPrev[slot] = kCMTimeInvalid;
-    }
-    if (slot >= 0) {
-        CMTime prev = sSLCamTSPrev[slot];
-        if (CMTIME_IS_VALID(prev)) {
-            CMTime d = CMTimeSubtract(pts, prev);
-            if (CMTIME_IS_VALID(d) && CMTimeCompare(d, kCMTimeZero) > 0) {
-                ms = CMTimeGetSeconds(d) * 1000.0;
-            }
-        }
-        sSLCamTSPrev[slot] = pts;
-    }
-    os_unfair_lock_unlock(&sSLCamTSLock);
-    return ms;
-}
-
 // ---- 0.3.58：视频心跳 ----
 //
 // 0.3.57 的日志里音频有六七个指标，视频一个都没有 —— 所以「对面看着糊」只能靠猜。
@@ -112,7 +70,6 @@ static double SLVCamFrameIntervalMs(const void *out, CMTime pts) {
 //   · 我们替换成功多少帧  → 少了说明打包失败或没数据，宿主拿到的是重复帧
 //   · 每帧处理花多久      → 超 33ms 就掉到 30fps 以下
 //   · 直出 / 渲染         → 直出 = 我们一个像素都没动，糊就怨不到这层
-// 0.3.61 补第五个：帧间隔 —— 就是写进 duration 的那个值，也是码控摊预算的依据
 static uint64_t sSLCamVideoAsked = 0;
 static uint64_t sSLCamVideoServed = 0;
 static uint64_t sSLCamVideoBypass = 0;
@@ -131,23 +88,10 @@ static void SLVCamVideoBeat(CMFormatDescriptionRef fmt, double procMs, BOOL serv
         sSLCamProcTotalMs += procMs;
         if (procMs > sSLCamProcMaxMs) sSLCamProcMaxMs = procMs;
     }
-    // 0.3.60：改成按时间触发（5 秒），不再按帧数。
-    //
-    // 之前是每 300 帧打一行 —— 15fps 下要 20 秒。陌陌的视频通话常常只有 15~20 秒，
-    // 结果整场一次都没打出来（0.3.59 那两场就是），等于这段统计白做，
-    // 连「帧率到底有没有变成 24」都看不到。
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (sSLCamVideoBeatAt <= 0) {
-        // 首帧只立锚点。不然会打一行「0.0s / 0 帧 / 0.0fps」的噪音。
-        sSLCamVideoBeatAt = now;
-        sSLCamBeatAsked = sSLCamVideoAsked;
-        sSLCamBeatServed = sSLCamVideoServed;
-        sSLCamBeatBypass = sSLCamVideoBypass;
-        sSLCamBeatTotalMs = sSLCamProcTotalMs;
-        return;
-    }
-    if (now - sSLCamVideoBeatAt < 5.0) return;
+    // 300 帧 ≈ 30fps 下的 10 秒。按帧数而不是按时间触发，掉帧时也能看出真实节奏。
+    if (sSLCamVideoAsked % 300 != 0) return;
 
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     uint64_t asked = sSLCamVideoAsked - sSLCamBeatAsked;
     uint64_t servedN = sSLCamVideoServed - sSLCamBeatServed;
     uint64_t bypassN = sSLCamVideoBypass - sSLCamBeatBypass;
@@ -160,8 +104,8 @@ static void SLVCamVideoBeat(CMFormatDescriptionRef fmt, double procMs, BOOL serv
 
     CMVideoDimensions d = fmt ? CMVideoFormatDescriptionGetDimensions(fmt) : (CMVideoDimensions){0, 0};
     OSType sub = fmt ? CMFormatDescriptionGetMediaSubType(fmt) : 0;
-    SLVLog(@"视频: 心跳 %.1fs 宿主来要 %llu 帧（%.1ffps）· 帧间隔 %.1fms · 替换 %llu / 放行 %llu · 处理均 %.1fms 峰 %.1fms · 宿主 %dx%d %@ · 直出累计 %lu / 渲染累计 %lu",
-          win, (unsigned long long)asked, fps, sSLCamDurLastMs,
+    SLVLog(@"视频: 心跳 %.1fs 宿主来要 %llu 帧（%.1ffps）· 替换 %llu / 放行 %llu · 处理均 %.1fms 峰 %.1fms · 宿主 %dx%d %@ · 直出累计 %lu / 渲染累计 %lu",
+          win, (unsigned long long)asked, fps,
           (unsigned long long)servedN, (unsigned long long)bypassN,
           avg, sSLCamProcMaxMs, d.width, d.height, SLVFourCC(sub),
           (unsigned long)direct, (unsigned long)render);
@@ -421,45 +365,24 @@ static void SLVCamProcessSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sbuf)
             timing.decodeTimeStamp       = CMSampleBufferGetDecodeTimeStamp(sbuf);
             timing.duration              = CMSampleBufferGetDuration(sbuf);
 
-            // 0.3.61：duration 必须反映**真实帧间隔**，不能写死 1/30。
-            //
-            // 0.3.60 及之前这里一律填 1/30。后果：宿主按 15fps 送帧，我们却告诉下游
-            // 「每帧 33.3ms」，等于宣称这是 30fps 的流。Agora 内部的码率控制是按
-            // **声明帧率**摊每帧预算的 —— 声明 30fps，就按每帧 bitrate/30 发；实际只有
-            // 一半的帧进来，总发出码率就只剩一半。设 4000kbps 实际跑出 ~2000，
-            // 抬码率当然没感觉。
-            // 更关键的是：这条错误信息连零拷贝直出也一起带着（直出只跳过像素，
-            // 不跳过 timing），所以才会出现「像素一个字节没动，对面还是糊」。
-            //
-            // duration 还必须是「有效 + 非负」，否则 CMSampleBufferCreateReady 会以
-            // kCMSampleBufferError_InvalidSampleTimingInfo 失败，表现和格式错一模一样。
-            CMTime hostDur = timing.duration;
-            if (CMTIME_IS_VALID(hostDur) && CMTimeCompare(hostDur, kCMTimeZero) > 0) {
-                // 宿主给了合法时长，信它。
-            } else {
-                double gapMs = SLVCamFrameIntervalMs((__bridge void *)self,
-                                                     timing.presentationTimeStamp);
-                // 夹在 1/60 ~ 1/10：太小说明两路流混在了一起（会误报高帧率、
-                // 把码率预算继续摊薄），太大说明中间断过流（按断档时长声明会让
-                // 编码器以为帧率骤降，反手砍码率）。
-                if (!(gapMs > 0)) gapMs = 66.7;     // 没有上一帧：按陌陌通话的 15fps 兜底
-                if (gapMs < 16.7) gapMs = 16.7;
-                if (gapMs > 100.0) gapMs = 100.0;
-                timing.duration = CMTimeMakeWithSeconds(gapMs / 1000.0, 1000000);
-                if (sSLCamDurFixLogged++ == 0) {
-                    SLVLog(@"注入: duration 按真实帧间隔填 %.1fms（宿主原值 value=%lld scale=%d flags=%u，不再写死 1/30）",
-                          gapMs, hostDur.value, hostDur.timescale, hostDur.flags);
+            // duration 必须是「有效 + 非负」，否则 CMSampleBufferCreateReady 会以
+            // kCMSampleBufferError_InvalidSampleTimingInfo 失败 —— 这个错跟格式无关，
+            // 但表现和格式错一模一样（每帧都失败）。采集帧的 duration 经常是 indefinite，
+            // 光判 CMTIME_IS_INVALID 拦不住。
+            if (!CMTIME_IS_VALID(timing.duration) || CMTimeCompare(timing.duration, kCMTimeZero) < 0) {
+                if (sSLCamTimingFixLogged++ == 0) {
+                    SLVLog(@"注入: 真帧 duration 非法（value=%lld scale=%d flags=%u），已归一成 1/30",
+                          timing.duration.value, timing.duration.timescale, timing.duration.flags);
                 }
+                timing.duration = CMTimeMake(1, 30);
             }
-            sSLCamDurLastMs = CMTimeGetSeconds(timing.duration) * 1000.0;
             if (!CMTIME_IS_VALID(timing.decodeTimeStamp)) {
-                // 实时采集没有 B 帧，dts 本来就该等于 pts。留 invalid 会让部分链路
-                // 自己按 duration 累加时间轴，又一次把错误的帧率坐实。
                 if (sSLCamDTSFixLogged++ == 0) {
-                    SLVLog(@"注入: 真帧 dts 非法（value=%lld scale=%d），已按 PTS 补齐",
-                          timing.decodeTimeStamp.value, timing.decodeTimeStamp.timescale);
+                    SLVLog(@"注入: 真帧 dts 非法（value=%lld scale=%d flags=%u），已置为 invalid",
+                          timing.decodeTimeStamp.value, timing.decodeTimeStamp.timescale,
+                          timing.decodeTimeStamp.flags);
                 }
-                timing.decodeTimeStamp = timing.presentationTimeStamp;
+                timing.decodeTimeStamp = kCMTimeInvalid;
             }
             if (!CMTIME_IS_VALID(timing.presentationTimeStamp)) {
                 // 没有有效的 PTS 就没法接进宿主的时间轴，硬塞一个反而会把下游时序搞乱。
@@ -714,8 +637,6 @@ static void SLVCamDumpCandidates(const char *className) {
 // 全部**只读**：拦下来打完日志，原样转发给原实现，宿主行为一个字节都不变。
 // 之所以要单独做，是因为 0.3.57 的零拷贝对照场（素材 720x1280、和宿主格式完全一致、
 // 我们一个像素没动）对面**照样糊** —— 那问题就只能在这条链的下游。
-//
-// 0.3.59 起唯一例外是 setVideoEncoderConfiguration：开关打开时会先改写档位再转发。
 
 static NSString *SLVCamKV(id obj, NSString *key) {
     if (!obj) return @"-";
@@ -747,175 +668,7 @@ static NSString *SLVCamKVSize(id obj, NSString *key) {
     }
 }
 
-// ---- 0.3.63：dimension 是 C struct，KVC 拿不到，改用 NSInvocation ----
-//
-// 0.3.59 起每一版日志都在打「dimension=-」，一直没当回事 —— 但它意味着
-// valueForKey: 在这条属性上直接抛异常（CGSize 不是 KVC 认的那几种包装），
-// 于是 0.3.59~0.3.62 这四版里我们只改了 fps 和 bitrate，**分辨率一次都没碰过**。
-//
-// 而 fps=15 / bitrate=500 这一对，正好是 Agora 480P 档位的预设值
-// （640x480 · 15fps · 500Kbps）。陌陌要是照这个档位建的配置，编码器输入就只有
-// 640x480：我们把码率抬到 4000，只是把 480p 压得更干净，一放大到全屏照样糊。
-//
-// 这一个假设同时解释了三条已经确认的现象：
-//   · 抬码率 500→1600→4000，对面毫无感觉（天花板在分辨率，不在码率）
-//   · 零拷贝直出、像素一个字节没动，依然糊（糊发生在编码器缩小的那一步）
-//   · 同一网络下安卓端更清楚（安卓端档位不同）
-//
-// 所以这里绕开 KVC，直接用 NSInvocation 读写 struct 属性。返回长度/参数长度都先
-// 探一遍：CGSize 是 16 字节，也可能是个 int width/height 的 8 字节小结构，两种都接。
-
-static BOOL SLVCamSizeGetter(id obj, SEL sel, CGSize *out);
-static BOOL SLVCamSizeSetter(id obj, SEL sel, CGSize want);
-
-/// 依次试 dimension / videoDimension / size 三种叫法。命中就返回 YES 并带上 key。
-static BOOL SLVCamReadDimension(id cfg, CGSize *out, NSString **outKey) {
-    NSString *keys[] = { @"dimension", @"videoDimension", @"size" };
-    for (int i = 0; i < 3; i++) {
-        CGSize s = CGSizeZero;
-        if (!SLVCamSizeGetter(cfg, NSSelectorFromString(keys[i]), &s)) continue;
-        if (s.width < 2 || s.height < 2) continue;
-        *out = s;
-        if (outKey) *outKey = keys[i];
-        return YES;
-    }
-    return NO;
-}
-
-static NSString *SLVCamSettersName(NSString *key) {
-    return [NSString stringWithFormat:@"set%@%@:",
-            [[key substringToIndex:1] uppercaseString], [key substringFromIndex:1]];
-}
-
-static BOOL SLVCamSizeGetter(id obj, SEL sel, CGSize *out) {
-    if (!obj || !sel || ![obj respondsToSelector:sel]) return NO;
-    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
-    if (!sig) return NO;
-    NSUInteger len = [sig methodReturnLength];
-    if (len != sizeof(CGSize) && len != 8) return NO;
-
-    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-    [inv setTarget:obj];
-    [inv setSelector:sel];
-    @try { [inv invoke]; } @catch (__unused NSException *e) { return NO; }
-
-    if (len == sizeof(CGSize)) {
-        CGSize s = CGSizeZero;
-        [inv getReturnValue:&s];
-        *out = s;
-    } else {
-        int32_t wh[2] = { 0, 0 };
-        [inv getReturnValue:wh];
-        *out = CGSizeMake(wh[0], wh[1]);
-    }
-    return YES;
-}
-
-static BOOL SLVCamSizeSetter(id obj, SEL sel, CGSize want) {
-    if (!obj || !sel || ![obj respondsToSelector:sel]) return NO;
-    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
-    if (!sig || sig.numberOfArguments < 3) return NO;
-
-    NSUInteger argSz = 0;
-    NSGetSizeAndAlignment([sig getArgumentTypeAtIndex:2], &argSz, NULL);
-    if (argSz != sizeof(CGSize) && argSz != 8) return NO;
-
-    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-    [inv setTarget:obj];
-    [inv setSelector:sel];
-    if (argSz == sizeof(CGSize)) {
-        [inv setArgument:&want atIndex:2];
-    } else {
-        int32_t wh[2] = { (int32_t)want.width, (int32_t)want.height };
-        [inv setArgument:wh atIndex:2];
-    }
-    @try { [inv invoke]; } @catch (__unused NSException *e) { return NO; }
-    return YES;
-}
-
-/// 写 dimension：三个叫法挨个试，成功的写进 outKey。
-static BOOL SLVCamWriteDimension(id cfg, CGSize want, NSString **outKey) {
-    NSString *keys[] = { @"dimension", @"videoDimension", @"size" };
-    for (int i = 0; i < 3; i++) {
-        if (SLVCamSizeSetter(cfg, NSSelectorFromString(SLVCamSettersName(keys[i])), want)) {
-            if (outKey) *outKey = keys[i];
-            return YES;
-        }
-    }
-    // NSInvocation 走不通时退回 KVC（有的版本把 struct 包成 NSValue 存）
-    for (int i = 0; i < 3; i++) {
-        @try {
-            [cfg setValue:[NSValue valueWithCGSize:want] forKey:keys[i]];
-            if (outKey) *outKey = keys[i];
-            return YES;
-        } @catch (__unused NSException *e) { }
-    }
-    return NO;
-}
-
-// ---- 0.3.62：真实上行统计（给 delegate 套一层代理） ----
-//
-// 到 0.3.61 为止，能改的都改完了：duration 已如实写成 66.7ms（日志确认）、
-// 像素是零拷贝直出、码率明确设成 4000 —— 对面还是糊。剩下的可能性只有三种，
-// 而且全都藏在「引擎实际发出去的是什么」里：
-//   · 码率没落地 —— 通后配置被频道选项或服务端 profile 覆盖
-//   · 分辨率被自适应降了 —— degradation 选的是保帧率，一路压到 360p
-//   · 都正常 —— 问题在对端或网络
-// 这三种只能靠 localVideoStats 分开。它是 Agora 官方回调，带 sentBitrate /
-// sentFrameRate / encodedFrameWidth / targetBitrate / 自适应指示，比从配置对象里
-// 猜 struct 靠谱得多（dimension 一直是「-」就是这个坑）。
-//
-// 做法：未实现的 selector 全部转发给宿主原 delegate（forwardingTargetForSelector），
-// 只截获 localVideoStats 这一个。不动宿主任何状态，拆掉也不影响它。
-static char kSLCamDelegateProxyKey;
-
-static SEL SLVCamLocalVideoStatsSel(void) {
-    static SEL s = NULL;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = NSSelectorFromString(@"rtcEngine:localVideoStats:"); });
-    return s;
-}
-
-@interface SLVCamAgoraDelegateProxy : NSObject
-@property (nonatomic, weak) id target;
-@end
-
-@implementation SLVCamAgoraDelegateProxy
-
-- (BOOL)respondsToSelector:(SEL)aSelector {
-    if (aSelector == SLVCamLocalVideoStatsSel()) return YES;
-    return [self.target respondsToSelector:aSelector];
-}
-
-- (BOOL)conformsToProtocol:(Protocol *)aProtocol {
-    if ([self.target conformsToProtocol:aProtocol]) return YES;
-    return [super conformsToProtocol:aProtocol];
-}
-
-- (id)forwardingTargetForSelector:(SEL)aSelector {
-    return self.target;
-}
-
-- (void)rtcEngine:(id)engine localVideoStats:(id)stats {
-    (void)engine;
-    // 这个回调 1~2 秒一次，但太密会把日志刷满，限到 2 秒一行。
-    static CFAbsoluteTime lastAt = 0;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - lastAt < 2.0) return;
-    lastAt = now;
-
-    SLVLog(@"RTC: 上行 kbps=%@ · 帧率=%@ · 编码 %@x%@ · 目标kbps=%@ · 采集 %@x%@ · 自适应=%@ · 编码帧率=%@",
-          SLVCamKV(stats, @"sentBitrate"), SLVCamKV(stats, @"sentFrameRate"),
-          SLVCamKV(stats, @"encodedFrameWidth"), SLVCamKV(stats, @"encodedFrameHeight"),
-          SLVCamKV(stats, @"targetBitrate"),
-          SLVCamKV(stats, @"captureFrameWidth"), SLVCamKV(stats, @"captureFrameHeight"),
-          SLVCamKV(stats, @"qualityAdaptIndication"),
-          SLVCamKV(stats, @"encoderOutputFrameRate"));
-}
-
-@end
-
-#define SLV_MAX_RTC_HOOKS 12
+#define SLV_MAX_RTC_HOOKS 8
 static Method gSLRtcMethod[SLV_MAX_RTC_HOOKS];
 static IMP    gSLRtcOrig[SLV_MAX_RTC_HOOKS];
 static int    gSLRtcCount = 0;
@@ -923,33 +676,12 @@ static BOOL   sSLRtcLogged = NO;
 
 /// 按 Method 指针存原实现：同一个 selector 在父类和子类上都可能被调用，
 /// 存成「一个 selector 一份」会把子类那次转发到父类的实现上去。
-///
-/// 0.3.62 起还要照顾类方法（+sharedEngineWithAppId:delegate:）：那会儿 self 是
-/// 类对象，[self class] 仍是类本身，得再往元类上找一级。
 static IMP SLVCamRtcOrigIMP(id self, SEL _cmd) {
-    Class c = [self class];
-    Method m = class_getInstanceMethod(c, _cmd);
-    if (!m) m = class_getInstanceMethod(object_getClass(c), _cmd);
+    Method m = class_getInstanceMethod([self class], _cmd);
     for (int i = 0; i < gSLRtcCount; i++) {
         if (gSLRtcMethod[i] == m) return gSLRtcOrig[i];
     }
     return NULL;
-}
-
-/// 类方法版本。class_getInstanceMethod(cls, sel) 找不到类方法，只能走元类。
-static BOOL SLVCamRtcHookClassMethod(Class cls, NSString *name, IMP imp) {
-    if (!cls) return NO;
-    SEL sel = NSSelectorFromString(name);
-    Method m = class_getClassMethod(cls, sel);
-    if (!m) return NO;
-    for (int i = 0; i < gSLRtcCount; i++) if (gSLRtcMethod[i] == m) return YES;
-    if (gSLRtcCount >= SLV_MAX_RTC_HOOKS) return NO;
-    gSLRtcMethod[gSLRtcCount] = m;
-    gSLRtcOrig[gSLRtcCount] = method_getImplementation(m);
-    gSLRtcCount++;
-    method_setImplementation(m, imp);
-    SLVLog(@"RTC: 挂上 +[%s %s]", class_getName(cls), sel_getName(sel));
-    return YES;
 }
 
 static BOOL SLVCamRtcHook(Class cls, NSString *name, IMP imp) {
@@ -969,167 +701,11 @@ static BOOL SLVCamRtcHook(Class cls, NSString *name, IMP imp) {
 
 // 返回类型必须是 int：这几个 API 都返回错误码，宿主会拿它判断成败。
 // 声明成 void 会丢返回值，轻则日志里一堆误判，重则宿主以为设置失败而重试。
-
-// ---- 0.3.59：上行档位抬高（默认关） ----
-//
-// 0.3.58 的探针把「糊」定位成一条硬上限：陌陌交给 Agora 的是 fps=15 · bitrate=500。
-// 500kbps ÷ 15fps ÷ 921600px ≈ 0.036 bit/像素 —— 这个密度下编码器必然降分辨率，
-// 我们送 720x1280，对面拿到的只有 360p 级别。
-//
-// 同一个网络下安卓端看着明显更清楚，说明带宽不是瓶颈，是 iOS 端自己压得太狠。
-// 所以这里做一件事：宿主把档位交给引擎之前，先抬上去再转发。
-//
-// 默认关 —— 高码率在弱网下会更卡、更耗电，得让用户自己决定要不要。
-#define SLV_ENC_MIN_FPS       24
-// 0.3.60 验证版：故意抬到 4000，不是最终值。
-// 1600 那次对面看不出区别，只有两种可能 —— 要么码率没落地（被通后重置 / 被 SDK clamp），
-// 要么落地了但 1600 对这个素材还不够。4000 拉到一个明显失衡的值，
-// 就能一刀切开：有变化 = 链路通，没变化 = 根本没落地。
-#define SLV_ENC_MIN_KBPS    4000
-#define SLV_ENC_SHORT_SIDE    720    // 短边至少 720（竖屏 720x1280 / 横屏 1280x720）
-#define SLV_ENC_LONG_MAX     1280    // 长边不再往上加，免得一路顶到 4K 白耗带宽
-
-static BOOL SLVCamEncodeBoostOn(void) {
-    id v = [[NSUserDefaults standardUserDefaults] objectForKey:kSLCamEncodeBoostKey];
-    return v ? [v boolValue] : NO;
-}
-
-/// 按候选键名依次取，第一个取到的就是它。Agora 各版本这个属性叫法不完全一样，
-/// 0.3.58 只试了 dimension，日志里一直打「-」正是这个原因。
-static id SLVCamKVFirst(id obj, NSArray<NSString *> *keys, NSString **hitKey) {
-    if (!obj) return nil;
-    for (NSString *k in keys) {
-        @try {
-            id v = [obj valueForKey:k];
-            if (v && v != [NSNull null]) {
-                if (hitKey) *hitKey = k;
-                return v;
-            }
-        } @catch (__unused NSException *e) { }
-    }
-    return nil;
-}
-
-/// 把宿主给的档位抬到「看得清」的水平。返回 YES 表示真的动了。
-/// 全部只改这份配置对象：宿主本来就是要把它交给引擎的，改它等于改了它的意图，
-/// 但不会碰到引擎之外的任何状态。
-static BOOL SLVCamRaiseEncoderConfig(id cfg, NSInteger *outFps, NSInteger *outKbps,
-                                     CGSize *outDim, BOOL *hasDim, BOOL *dimWrote,
-                                     NSInteger *inFps, NSInteger *inKbps, CGSize *inDim) {
-    if (!cfg) return NO;
-
-    id fpsVal = SLVCamKVFirst(cfg, @[@"frameRate"], NULL);
-    id kbpsVal = SLVCamKVFirst(cfg, @[@"bitrate"], NULL);
-    NSInteger fps = fpsVal ? [fpsVal integerValue] : 0;
-    NSInteger kbps = kbpsVal ? [kbpsVal integerValue] : 0;
-    *inFps = fps;
-    *inKbps = kbps;
-    *inDim = CGSizeZero;
-    *hasDim = NO;
-    *dimWrote = NO;
-
-    // 0.3.63：先走 NSInvocation（KVC 在这条 struct 属性上一直抛异常，读到的一直是 nil）
-    CGSize dim = CGSizeZero;
-    NSString *dimKey = nil;
-    BOOL read = SLVCamReadDimension(cfg, &dim, &dimKey);
-    if (!read) {
-        id dimVal = SLVCamKVFirst(cfg, @[@"dimension", @"videoDimension", @"size"], &dimKey);
-        if ([dimVal isKindOfClass:[NSValue class]]) {
-            const char *t = [(NSValue *)dimVal objCType];
-            if (t && strcmp(t, @encode(CGSize)) == 0) {
-                CGSize s = [(NSValue *)dimVal CGSizeValue];
-                if (s.width >= 2 && s.height >= 2) { dim = s; read = YES; }
-            }
-        }
-    }
-    if (read) {
-        *hasDim = YES;
-        *inDim = dim;
-    }
-
-    NSInteger tFps = MAX(fps, SLV_ENC_MIN_FPS);
-    NSInteger tKbps = MAX(kbps, SLV_ENC_MIN_KBPS);
-    CGSize tDim = dim;
-    BOOL needDim = NO;
-
-    if (read) {
-        CGFloat mn = MIN(dim.width, dim.height);
-        CGFloat mx = MAX(dim.width, dim.height);
-        CGFloat k = 1.0;
-        if (mn < SLV_ENC_SHORT_SIDE) k = SLV_ENC_SHORT_SIDE / mn;
-        if (mx * k > SLV_ENC_LONG_MAX) k = SLV_ENC_LONG_MAX / mx;
-        if (k > 1.0) {
-            // 编码器只吃偶数边长，差 1 像素会被拒
-            tDim = CGSizeMake(round(dim.width * k / 2.0) * 2.0,
-                              round(dim.height * k / 2.0) * 2.0);
-            needDim = YES;
-        }
-    } else {
-        // 读不到就按采集朝向补一个：orientationMode 1 = 固定横屏，其余按竖屏
-        NSInteger om = [SLVCamKV(cfg, @"orientationMode") integerValue];
-        tDim = (om == 1) ? CGSizeMake(1280, 720) : CGSizeMake(720, 1280);
-        needDim = YES;
-    }
-
-    BOOL changed = NO;
-    if (tFps != fps) {
-        @try { [cfg setValue:@(tFps) forKey:@"frameRate"]; changed = YES; }
-        @catch (__unused NSException *e) { }
-    }
-    if (tKbps != kbps) {
-        @try { [cfg setValue:@(tKbps) forKey:@"bitrate"]; changed = YES; }
-        @catch (__unused NSException *e) { }
-    }
-    if (needDim) {
-        NSString *wroteKey = nil;
-        if (SLVCamWriteDimension(cfg, tDim, &wroteKey)) {
-            *dimWrote = YES;
-            changed = YES;
-        }
-    }
-
-    *outFps = tFps;
-    *outKbps = tKbps;
-    *outDim = tDim;
-    return changed;
-}
-
-/// 只读分支用的显示串：NSInvocation 读得到就用它，读不到退回 KVC。
-static NSString *SLVCamDimText(id cfg) {
-    CGSize s = CGSizeZero;
-    if (SLVCamReadDimension(cfg, &s, NULL)) {
-        return [NSString stringWithFormat:@"%.0fx%.0f", s.width, s.height];
-    }
-    NSString *dimKey = nil;
-    (void)SLVCamKVFirst(cfg, @[@"dimension", @"videoDimension", @"size"], &dimKey);
-    return dimKey ? SLVCamKVSize(cfg, dimKey) : @"-";
-}
-
 static int SLVCamRtcVideoConfig(id self, SEL _cmd, id cfg) {
-    if (!SLVCamEncodeBoostOn()) {
-        SLVLog(@"RTC: 编码档位 dimension=%@ · fps=%@ · bitrate=%@ · orientation=%@ · degradation=%@ · mirror=%@",
-              SLVCamDimText(cfg), SLVCamKV(cfg, @"frameRate"), SLVCamKV(cfg, @"bitrate"),
-              SLVCamKV(cfg, @"orientationMode"), SLVCamKV(cfg, @"degradationPreference"),
-              SLVCamKV(cfg, @"mirrorMode"));
-    } else {
-        NSInteger iFps = 0, iKbps = 0, tFps = 0, tKbps = 0;
-        CGSize iDim = CGSizeZero, tDim = CGSizeZero;
-        BOOL hasDim = NO, dimWrote = NO;
-        BOOL changed = SLVCamRaiseEncoderConfig(cfg, &tFps, &tKbps, &tDim, &hasDim, &dimWrote,
-                                                &iFps, &iKbps, &iDim);
-        NSString *dimFrom = hasDim ? [NSString stringWithFormat:@"%.0fx%.0f", iDim.width, iDim.height]
-                                   : @"读不到";
-        NSString *dimTo = dimWrote ? [NSString stringWithFormat:@"%.0fx%.0f", tDim.width, tDim.height]
-                                   : @"未改";
-        if (changed) {
-            SLVLog(@"RTC: 编码档位 抬高 %ldfps/%ldkbps/%@ → %ldfps/%ldkbps/%@（已改写，再转发给引擎）",
-                  (long)iFps, (long)iKbps, dimFrom, (long)tFps, (long)tKbps, dimTo);
-        } else {
-            SLVLog(@"RTC: 编码档位 %ldfps/%ldkbps/%@ —— 已经不低于目标，原样转发",
-                  (long)iFps, (long)iKbps, dimFrom);
-        }
-    }
-
+    SLVLog(@"RTC: 编码档位 dimension=%@ · fps=%@ · bitrate=%@ · orientation=%@ · degradation=%@ · mirror=%@",
+          SLVCamKVSize(cfg, @"dimension"), SLVCamKV(cfg, @"frameRate"),
+          SLVCamKV(cfg, @"bitrate"), SLVCamKV(cfg, @"orientationMode"),
+          SLVCamKV(cfg, @"degradationPreference"), SLVCamKV(cfg, @"mirrorMode"));
     IMP o = SLVCamRtcOrigIMP(self, _cmd);
     return o ? ((int (*)(id, SEL, id))o)(self, _cmd, cfg) : 0;
 }
@@ -1167,53 +743,6 @@ static int SLVCamRtcChannelMedia(id self, SEL _cmd, id opt) {
     return o ? ((int (*)(id, SEL, id))o)(self, _cmd, opt) : 0;
 }
 
-/// setDelegate: 是宿主的 delegate 入口。套一层代理后原样转发，宿主行为不变。
-/// 代理本身挂在 engine 上（associated object），因为 delegate 属性是 weak，
-/// 不挂住会当场释放，所有回调都收不到。
-static void SLVCamRtcSetDelegate(id self, SEL _cmd, id delegate) {
-    IMP o = SLVCamRtcOrigIMP(self, _cmd);
-    if (!o) return;
-
-    if (!delegate) {
-        ((void (*)(id, SEL, id))o)(self, _cmd, nil);
-        return;
-    }
-
-    SLVCamAgoraDelegateProxy *proxy = objc_getAssociatedObject(self, &kSLCamDelegateProxyKey);
-    if (![proxy isKindOfClass:[SLVCamAgoraDelegateProxy class]]) {
-        proxy = [SLVCamAgoraDelegateProxy new];
-        objc_setAssociatedObject(self, &kSLCamDelegateProxyKey, proxy,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        SLVLog(@"RTC: delegate 已套代理（只截 localVideoStats，其余全部转发）");
-    }
-    // 宿主重复 set 时可能把我们刚给的代理又传回来，别让它自己转发给自己
-    proxy.target = (delegate == (id)proxy) ? proxy.target : delegate;
-    ((void (*)(id, SEL, id))o)(self, _cmd, proxy);
-}
-
-/// 两条初始化入口也要照顾：陌陌如果直接用 sharedEngine / initWithAppId 建引擎，
-/// 就永远不会单独调 setDelegate:，代理也就装不上、整版白做。
-/// 这两条都在「建完引擎」之后补一次 setDelegate:（会走上面那个 hook 复用同一套逻辑）。
-static id SLVCamRtcInitWithAppId(id self, SEL _cmd, NSString *appId, id delegate) {
-    IMP o = SLVCamRtcOrigIMP(self, _cmd);
-    if (!o) return nil;
-    id engine = ((id (*)(id, SEL, NSString *, id))o)(self, _cmd, appId, delegate);
-    if (engine && delegate) {
-        SLVCamRtcSetDelegate(engine, NSSelectorFromString(@"setDelegate:"), delegate);
-    }
-    return engine;
-}
-
-static id SLVCamRtcSharedEngine(id self, SEL _cmd, NSString *appId, id delegate) {
-    IMP o = SLVCamRtcOrigIMP(self, _cmd);
-    if (!o) return nil;
-    id engine = ((id (*)(id, SEL, NSString *, id))o)(self, _cmd, appId, delegate);
-    if (engine && delegate) {
-        SLVCamRtcSetDelegate(engine, NSSelectorFromString(@"setDelegate:"), delegate);
-    }
-    return engine;
-}
-
 /// RTC SDK 是懒加载的：首次扫描时可能还不存在。所以这个函数可以被反复调用，
 /// 一旦类出现了就挂上，之后一直有效。
 static void SLVCamInstallRtcProbes(void) {
@@ -1226,10 +755,6 @@ static void SLVCamInstallRtcProbes(void) {
     SLVCamRtcHook(kit, @"setVideoProfile:swapWidthAndHeight:", (IMP)SLVCamRtcVideoProfile);
     SLVCamRtcHook(kit, @"setCameraCapturerConfiguration:", (IMP)SLVCamRtcCameraConfig);
     SLVCamRtcHook(kit, @"updateChannelWithMediaOptions:", (IMP)SLVCamRtcChannelMedia);
-    // 0.3.62：真实上行统计的入口（只读，靠 delegate 代理）
-    SLVCamRtcHook(kit, @"setDelegate:", (IMP)SLVCamRtcSetDelegate);
-    SLVCamRtcHook(kit, @"initWithAppId:delegate:", (IMP)SLVCamRtcInitWithAppId);
-    SLVCamRtcHookClassMethod(kit, @"sharedEngineWithAppId:delegate:", (IMP)SLVCamRtcSharedEngine);
 
     // 一个都没命中 = 这个类不是 RTC 引擎（或者陌陌用的是别家 SDK）。
     // 不置标志，下次会话加输出时再试一遍 —— 总比一次没命中就永久放弃好。
@@ -1238,7 +763,7 @@ static void SLVCamInstallRtcProbes(void) {
         return;
     }
     sSLRtcLogged = YES;
-    SLVLog(@"RTC: 编码/美颜探针已布点 %d 项（编码档位可改写，其余只读）", gSLRtcCount);
+    SLVLog(@"RTC: 编码/美颜探针已布点 %d 项（只读，不改宿主行为）", gSLRtcCount);
 }
 
 #pragma mark - 会话输出探测
