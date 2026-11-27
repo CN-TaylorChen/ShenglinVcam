@@ -1,3 +1,56 @@
+## 0.3.62 —— 不再猜：直接读引擎真正发出去的分辨率和码率
+
+0.3.61 的假设被证伪了。日志确认 `帧间隔 66.7ms`（不再谎称 30fps）、364 帧零拷贝直出、
+处理耗时 0.0ms、码率设成 4000 —— 对面还是糊。
+
+到这一步，能在我们这一层改的都改完了。再往下只有三种可能，且必须用数据分开：
+
+1. **码率没落地** —— 通后配置被频道选项或服务端 profile 覆盖
+2. **分辨率被自适应降了** —— degradation 选的是「保帧率」，一路压到 360p
+3. **都正常** —— 问题在对端或网络
+
+这一版不碰画面，只加一只眼睛：`AgoraRtcEngineDelegate` 的 `localVideoStats`。
+它是 Agora 官方回调，每 1~2 秒一次，带的是引擎的真实统计，不是我们猜的配置对象。
+
+```
+RTC: 上行 kbps=3950 · 帧率=15 · 编码 720x1280 · 目标kbps=4000 · 采集 720x1280 · 自适应=0 · 编码帧率=15
+```
+
+三个数各自对应一种结局：
+
+| 现象 | 结论 | 下一步 |
+|---|---|---|
+| `kbps` ≈ 4000 且 `编码 720x1280` | 发出去的没问题 | 查对端 / 网络，注入层收工 |
+| `kbps` ≈ 500 | 码率被覆盖 | hook `joinChannelByToken:...mediaOptions:` |
+| `编码 360x640` 之类 | 分辨率被自适应降了 | 换 `degradationPreference` 为保分辨率 |
+
+### 实现上要注意的两件事
+
+**给 delegate 套代理，不能用替换。** 陌陌的 delegate 挂着它自己的一堆回调，
+换掉就等于让它的通话状态机失联。这里用 `forwardingTargetForSelector:` ——
+只实现 `rtcEngine:localVideoStats:`，其余 selector 全部转给原对象，宿主察觉不到。
+`respondsToSelector:` 也要跟着转发，否则 Agora 会以为宿主没实现某个回调而跳过。
+
+**代理必须挂在 engine 上。** `delegate` 属性是 weak，只放进局部变量会被当场释放，
+之后一个回调都收不到。用 associated object 挂住。
+
+另外 `setDelegate:` 未必是唯一入口：陌陌如果直接用 `sharedEngineWithAppId:delegate:`
+或 `initWithAppId:delegate:` 建引擎，就永远不会单独调 setter。所以三条入口都挂了，
+后两条在建完引擎之后补一次 `setDelegate:`。类方法要走元类（`class_getClassMethod`），
+`class_getInstanceMethod(cls, sel)` 在那里永远找不到。
+
+### 装上之后验证
+
+打一通 20 秒以上的视频通话，日志里应该出现：
+
+```
+RTC: delegate 已套代理（只截 localVideoStats，其余全部转发）
+RTC: 上行 kbps=... · 帧率=... · 编码 ...x... · 目标kbps=... · 采集 ...x... · 自适应=... · 编码帧率=...
+```
+
+如果第一行都没有 → 说明陌陌的 delegate 不是通过这三个入口设的，下一版改成
+swizzle 宿主 delegate 类自己的 `rtcEngine:localVideoStats:`。
+
 ## 0.3.61 —— 码率白抬的真凶：我们告诉下游「这是 30fps」
 
 0.3.60 把码率抬到 4000，日志确认改写了，对手那头看不出任何区别。这一版找到了原因，

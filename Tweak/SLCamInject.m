@@ -747,7 +747,69 @@ static NSString *SLVCamKVSize(id obj, NSString *key) {
     }
 }
 
-#define SLV_MAX_RTC_HOOKS 8
+// ---- 0.3.62：真实上行统计（给 delegate 套一层代理） ----
+//
+// 到 0.3.61 为止，能改的都改完了：duration 已如实写成 66.7ms（日志确认）、
+// 像素是零拷贝直出、码率明确设成 4000 —— 对面还是糊。剩下的可能性只有三种，
+// 而且全都藏在「引擎实际发出去的是什么」里：
+//   · 码率没落地 —— 通后配置被频道选项或服务端 profile 覆盖
+//   · 分辨率被自适应降了 —— degradation 选的是保帧率，一路压到 360p
+//   · 都正常 —— 问题在对端或网络
+// 这三种只能靠 localVideoStats 分开。它是 Agora 官方回调，带 sentBitrate /
+// sentFrameRate / encodedFrameWidth / targetBitrate / 自适应指示，比从配置对象里
+// 猜 struct 靠谱得多（dimension 一直是「-」就是这个坑）。
+//
+// 做法：未实现的 selector 全部转发给宿主原 delegate（forwardingTargetForSelector），
+// 只截获 localVideoStats 这一个。不动宿主任何状态，拆掉也不影响它。
+static char kSLCamDelegateProxyKey;
+
+static SEL SLVCamLocalVideoStatsSel(void) {
+    static SEL s = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = NSSelectorFromString(@"rtcEngine:localVideoStats:"); });
+    return s;
+}
+
+@interface SLVCamAgoraDelegateProxy : NSObject
+@property (nonatomic, weak) id target;
+@end
+
+@implementation SLVCamAgoraDelegateProxy
+
+- (BOOL)respondsToSelector:(SEL)aSelector {
+    if (aSelector == SLVCamLocalVideoStatsSel()) return YES;
+    return [self.target respondsToSelector:aSelector];
+}
+
+- (BOOL)conformsToProtocol:(Protocol *)aProtocol {
+    if ([self.target conformsToProtocol:aProtocol]) return YES;
+    return [super conformsToProtocol:aProtocol];
+}
+
+- (id)forwardingTargetForSelector:(SEL)aSelector {
+    return self.target;
+}
+
+- (void)rtcEngine:(id)engine localVideoStats:(id)stats {
+    (void)engine;
+    // 这个回调 1~2 秒一次，但太密会把日志刷满，限到 2 秒一行。
+    static CFAbsoluteTime lastAt = 0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - lastAt < 2.0) return;
+    lastAt = now;
+
+    SLVLog(@"RTC: 上行 kbps=%@ · 帧率=%@ · 编码 %@x%@ · 目标kbps=%@ · 采集 %@x%@ · 自适应=%@ · 编码帧率=%@",
+          SLVCamKV(stats, @"sentBitrate"), SLVCamKV(stats, @"sentFrameRate"),
+          SLVCamKV(stats, @"encodedFrameWidth"), SLVCamKV(stats, @"encodedFrameHeight"),
+          SLVCamKV(stats, @"targetBitrate"),
+          SLVCamKV(stats, @"captureFrameWidth"), SLVCamKV(stats, @"captureFrameHeight"),
+          SLVCamKV(stats, @"qualityAdaptIndication"),
+          SLVCamKV(stats, @"encoderOutputFrameRate"));
+}
+
+@end
+
+#define SLV_MAX_RTC_HOOKS 12
 static Method gSLRtcMethod[SLV_MAX_RTC_HOOKS];
 static IMP    gSLRtcOrig[SLV_MAX_RTC_HOOKS];
 static int    gSLRtcCount = 0;
@@ -755,12 +817,33 @@ static BOOL   sSLRtcLogged = NO;
 
 /// 按 Method 指针存原实现：同一个 selector 在父类和子类上都可能被调用，
 /// 存成「一个 selector 一份」会把子类那次转发到父类的实现上去。
+///
+/// 0.3.62 起还要照顾类方法（+sharedEngineWithAppId:delegate:）：那会儿 self 是
+/// 类对象，[self class] 仍是类本身，得再往元类上找一级。
 static IMP SLVCamRtcOrigIMP(id self, SEL _cmd) {
-    Method m = class_getInstanceMethod([self class], _cmd);
+    Class c = [self class];
+    Method m = class_getInstanceMethod(c, _cmd);
+    if (!m) m = class_getInstanceMethod(object_getClass(c), _cmd);
     for (int i = 0; i < gSLRtcCount; i++) {
         if (gSLRtcMethod[i] == m) return gSLRtcOrig[i];
     }
     return NULL;
+}
+
+/// 类方法版本。class_getInstanceMethod(cls, sel) 找不到类方法，只能走元类。
+static BOOL SLVCamRtcHookClassMethod(Class cls, NSString *name, IMP imp) {
+    if (!cls) return NO;
+    SEL sel = NSSelectorFromString(name);
+    Method m = class_getClassMethod(cls, sel);
+    if (!m) return NO;
+    for (int i = 0; i < gSLRtcCount; i++) if (gSLRtcMethod[i] == m) return YES;
+    if (gSLRtcCount >= SLV_MAX_RTC_HOOKS) return NO;
+    gSLRtcMethod[gSLRtcCount] = m;
+    gSLRtcOrig[gSLRtcCount] = method_getImplementation(m);
+    gSLRtcCount++;
+    method_setImplementation(m, imp);
+    SLVLog(@"RTC: 挂上 +[%s %s]", class_getName(cls), sel_getName(sel));
+    return YES;
 }
 
 static BOOL SLVCamRtcHook(Class cls, NSString *name, IMP imp) {
@@ -952,6 +1035,53 @@ static int SLVCamRtcChannelMedia(id self, SEL _cmd, id opt) {
     return o ? ((int (*)(id, SEL, id))o)(self, _cmd, opt) : 0;
 }
 
+/// setDelegate: 是宿主的 delegate 入口。套一层代理后原样转发，宿主行为不变。
+/// 代理本身挂在 engine 上（associated object），因为 delegate 属性是 weak，
+/// 不挂住会当场释放，所有回调都收不到。
+static void SLVCamRtcSetDelegate(id self, SEL _cmd, id delegate) {
+    IMP o = SLVCamRtcOrigIMP(self, _cmd);
+    if (!o) return;
+
+    if (!delegate) {
+        ((void (*)(id, SEL, id))o)(self, _cmd, nil);
+        return;
+    }
+
+    SLVCamAgoraDelegateProxy *proxy = objc_getAssociatedObject(self, &kSLCamDelegateProxyKey);
+    if (![proxy isKindOfClass:[SLVCamAgoraDelegateProxy class]]) {
+        proxy = [SLVCamAgoraDelegateProxy new];
+        objc_setAssociatedObject(self, &kSLCamDelegateProxyKey, proxy,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        SLVLog(@"RTC: delegate 已套代理（只截 localVideoStats，其余全部转发）");
+    }
+    // 宿主重复 set 时可能把我们刚给的代理又传回来，别让它自己转发给自己
+    proxy.target = (delegate == (id)proxy) ? proxy.target : delegate;
+    ((void (*)(id, SEL, id))o)(self, _cmd, proxy);
+}
+
+/// 两条初始化入口也要照顾：陌陌如果直接用 sharedEngine / initWithAppId 建引擎，
+/// 就永远不会单独调 setDelegate:，代理也就装不上、整版白做。
+/// 这两条都在「建完引擎」之后补一次 setDelegate:（会走上面那个 hook 复用同一套逻辑）。
+static id SLVCamRtcInitWithAppId(id self, SEL _cmd, NSString *appId, id delegate) {
+    IMP o = SLVCamRtcOrigIMP(self, _cmd);
+    if (!o) return nil;
+    id engine = ((id (*)(id, SEL, NSString *, id))o)(self, _cmd, appId, delegate);
+    if (engine && delegate) {
+        SLVCamRtcSetDelegate(engine, NSSelectorFromString(@"setDelegate:"), delegate);
+    }
+    return engine;
+}
+
+static id SLVCamRtcSharedEngine(id self, SEL _cmd, NSString *appId, id delegate) {
+    IMP o = SLVCamRtcOrigIMP(self, _cmd);
+    if (!o) return nil;
+    id engine = ((id (*)(id, SEL, NSString *, id))o)(self, _cmd, appId, delegate);
+    if (engine && delegate) {
+        SLVCamRtcSetDelegate(engine, NSSelectorFromString(@"setDelegate:"), delegate);
+    }
+    return engine;
+}
+
 /// RTC SDK 是懒加载的：首次扫描时可能还不存在。所以这个函数可以被反复调用，
 /// 一旦类出现了就挂上，之后一直有效。
 static void SLVCamInstallRtcProbes(void) {
@@ -964,6 +1094,10 @@ static void SLVCamInstallRtcProbes(void) {
     SLVCamRtcHook(kit, @"setVideoProfile:swapWidthAndHeight:", (IMP)SLVCamRtcVideoProfile);
     SLVCamRtcHook(kit, @"setCameraCapturerConfiguration:", (IMP)SLVCamRtcCameraConfig);
     SLVCamRtcHook(kit, @"updateChannelWithMediaOptions:", (IMP)SLVCamRtcChannelMedia);
+    // 0.3.62：真实上行统计的入口（只读，靠 delegate 代理）
+    SLVCamRtcHook(kit, @"setDelegate:", (IMP)SLVCamRtcSetDelegate);
+    SLVCamRtcHook(kit, @"initWithAppId:delegate:", (IMP)SLVCamRtcInitWithAppId);
+    SLVCamRtcHookClassMethod(kit, @"sharedEngineWithAppId:delegate:", (IMP)SLVCamRtcSharedEngine);
 
     // 一个都没命中 = 这个类不是 RTC 引擎（或者陌陌用的是别家 SDK）。
     // 不置标志，下次会话加输出时再试一遍 —— 总比一次没命中就永久放弃好。
