@@ -1,3 +1,43 @@
+## 0.3.60 —— 换素材的第二处竞态：output 在 startReading 之前就被发布了
+
+0.3.59 把 reader 的归属权修好之后，同一个动作换了个死法：
+
+```
+*** -[AVAssetReaderTrackOutput copyNextSampleBuffer] cannot copy next sample buffer
+    before adding this output to an instance of AVAssetReader (using -addOutput:)
+    and calling -startReading on that asset reader
+4  ShenglinVcam-v0.3.59.dylib  -[SLVCamFeed sl_decodeLoopWithGeneration:] + 1176
+5  ShenglinVcam-v0.3.59.dylib  __24-[SLVCamFeed sl_restart]_block_invoke + 48
+```
+
+栈很清楚：`sl_restart` 刚 detach 出来的新线程，第一轮就撞上了。
+
+**原因是发布时机。** `sl_buildReaderForKey` 里，output 是在 `addOutput` 之后、
+`startReading` **之前**就写进共享 ivar 的：
+
+```objc
+if ([reader canAddOutput:o]) {
+    [reader addOutput:o];
+    [_lock lock]; _videoOut = o; [_lock unlock];   // reader 还没 start
+}
+```
+
+只要还有一代更旧的线程在这个窗口里（4K 素材构建要 2~10 秒，窗口很大），
+它就会把新线程刚发布的值覆盖成一个「还没 startReading」的 output。
+新线程拿它去 `copyNextSampleBuffer`，AVFoundation 直接抛异常 —— 这就是那条报错。
+
+**修法：把发布推迟到「确认可用」的那一刻。**
+
+- 构建期间 `vNew` / `aNew` / `aASBD` 全部是局部变量，不碰任何共享 ivar
+- `startReading` 成功、且 `gen == _generation` 仍然成立，才在锁内一次性发布
+  `_reader` / `_videoOut` / `_audioOut` / `_audioSrcASBD` / `_audioTrackAttached`
+- 两个输出改成**出参返回**，调用方直接用，不再去 ivar 里快照 ——
+  快照这一步本身就是上个版本崩掉的地方
+- `sl_restart` 顺手把 `_videoOut` / `_audioOut` 一起摘掉
+- 日志改成用本次构建的局部对象，不再锁外读共享 ivar
+
+这一处修完，换素材这条路上「释放 reader」和「发布半成品 output」两个竞态都清掉了。
+
 ## 0.3.59 —— 换素材时的闪退：reader 被下一个线程释放了
 
 日志里的死亡顺序非常固定（企业微信，视频通话中换素材，必现）：

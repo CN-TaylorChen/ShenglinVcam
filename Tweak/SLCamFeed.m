@@ -770,7 +770,16 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
 // 0.3.59：返回值给解码线程自己持有。
 // 以前 reader 只挂在 ivar 上，换一代时新线程一赋值就把旧 reader 释放掉 ——
 // 而旧线程可能正阻塞在 copyNextSampleBuffer 里，读到一半对象没了 → 闪退。
-- (AVAssetReader * _Nullable)sl_buildReaderForKey:(NSString *)key generation:(NSUInteger)gen;
+//
+// 0.3.60：两个输出也一并出参返回，不再让调用方去 ivar 里拿。
+// 之前 output 是在 addOutput 之后、startReading **之前**就写进共享 ivar 的，
+// 一个慢一代的旧线程正好在这个窗口里把它覆盖掉，新线程快照到的就是一个
+// 「没挂上 / 没 start」的 output → copyNextSampleBuffer 直接抛
+// "cannot copy next sample buffer before adding this output to an instance of
+// AVAssetReader ... and calling -startReading"。
+- (AVAssetReader * _Nullable)sl_buildReaderForKey:(NSString *)key generation:(NSUInteger)gen
+                                         videoOut:(AVAssetReaderTrackOutput * _Nullable * _Nullable)outV
+                                         audioOut:(AVAssetReaderTrackOutput * _Nullable * _Nullable)outA;
 - (BOOL)sl_pumpAudio:(AVAssetReaderTrackOutput *)out;
 - (BOOL)sl_audioNeedMore;
 - (BOOL)sl_audioNeedMoreLocked;
@@ -912,6 +921,10 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
     // 不 cancel 它会一直读到片尾；cancel 之后它在下一次 copyNextSampleBuffer
     // 立刻拿到 nil，看到 generation 变了就退出。
     if (_reader) { retired = _reader; _reader = nil; }
+    // 0.3.60：output 也一起摘掉。旧线程自己持有强引用（ownReader / vOut），
+    // 这里置 nil 只是别让新线程从 ivar 里读到上一代的东西。
+    _videoOut = nil;
+    _audioOut = nil;
     [_audioPCM setLength:0];
     _audioTSCount = 0;
     _audioJumpEpoch++;                   // 0.3.58：池子清空 = 内容断点，下一个包必须渐入
@@ -1147,12 +1160,14 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
                     [ownReader cancelReading];
                     ownReader = nil;
                 }
-                ownReader = [self sl_buildReaderForKey:key generation:gen];
+                AVAssetReaderTrackOutput *newV = nil, *newA = nil;
+                ownReader = [self sl_buildReaderForKey:key generation:gen
+                                             videoOut:&newV audioOut:&newA];
                 if (!ownReader) { usleep(30 * 1000); continue; }
-                [_lock lock];
-                vOut = _videoOut;
-                aOut = _audioOut;
-                [_lock unlock];
+                // 0.3.60：直接用 build 交回来的对象，不再去 ivar 快照 ——
+                // 快照这一步本身就是上个版本崩掉的地方。
+                vOut = newV;
+                aOut = newA;
             }
 
             BOOL gotAny = NO;
@@ -1256,14 +1271,14 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
                     ownReader = nil;
                     vOut = nil;
                     aOut = nil;
-                    ownReader = [self sl_buildReaderForKey:key generation:gen];
+                    AVAssetReaderTrackOutput *loopV = nil, *loopA = nil;
+                    ownReader = [self sl_buildReaderForKey:key generation:gen
+                                                 videoOut:&loopV audioOut:&loopA];
                     if (!ownReader) {
                         usleep(50 * 1000);
                     } else {
-                        [_lock lock];
-                        vOut = _videoOut;
-                        aOut = _audioOut;
-                        [_lock unlock];
+                        vOut = loopV;
+                        aOut = loopA;
                     }
                 } else {
                     usleep(120 * 1000);
@@ -1573,7 +1588,22 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
 
 #pragma mark - Reader 构建（只在解码线程调用）
 
-- (AVAssetReader * _Nullable)sl_buildReaderForKey:(NSString *)key generation:(NSUInteger)gen {
+- (AVAssetReader * _Nullable)sl_buildReaderForKey:(NSString *)key generation:(NSUInteger)gen
+                                         videoOut:(AVAssetReaderTrackOutput * _Nullable * _Nullable)outV
+                                         audioOut:(AVAssetReaderTrackOutput * _Nullable * _Nullable)outA {
+    if (outV) *outV = nil;
+    if (outA) *outA = nil;
+    // 0.3.60：构建期间一律用局部变量。
+    // 以前这里直接把 output 写进 _videoOut / _audioOut，而那些写在 startReading
+    // 之前 —— 只要有一代更旧的线程还在这个窗口里，它就会把新线程刚发布的值覆盖
+    // 成一个「尚未 startReading」的 output，新线程拿去做 copyNextSampleBuffer
+    // 立刻抛异常闪退。现在共享 ivar 只在「startReading 成功且代次仍是最新」的
+    // 那一刻、在锁内一次性发布。
+    AVAssetReaderTrackOutput *vNew = nil;
+    AVAssetReaderTrackOutput *aNew = nil;
+    AudioStreamBasicDescription aASBD;
+    memset(&aASBD, 0, sizeof(aASBD));
+    BOOL hasAudioNew = NO;
     // 0.3.58：换素材会 detach 新线程，旧线程在 buildReader 里还会再跑一段。
     // 以前它无条件 `[_reader cancelReading]` —— 正好把新线程刚 startReading 成功的
     // 那个 reader 取消掉，日志里就是「startReading 失败: 这项操作无法完成」，
@@ -1671,7 +1701,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
         o.alwaysCopiesSampleData = NO;
         if ([reader canAddOutput:o]) {
             [reader addOutput:o];
-            [_lock lock]; _videoOut = o; [_lock unlock];
+            vNew = o;
         } else {
             // 目标格式解码器不认，退回 BGRA，交给 CoreImage 转
             NSDictionary *bg = @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA) };
@@ -1679,7 +1709,7 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
             o2.alwaysCopiesSampleData = NO;
             if ([reader canAddOutput:o2]) {
                 [reader addOutput:o2];
-                [_lock lock]; _videoOut = o2; [_lock unlock];
+                vNew = o2;
             }
         }
         CGSize ns = vt.naturalSize;
@@ -1719,11 +1749,9 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
             o.alwaysCopiesSampleData = NO;
             if ([reader canAddOutput:o]) {
                 [reader addOutput:o];
-                [_lock lock];
-                _audioOut = o;
-                _audioSrcASBD = src;
-                _audioTrackAttached = YES;
-                [_lock unlock];
+                aNew = o;
+                aASBD = src;
+                hasAudioNew = YES;
             } else {
                 // 音轨在，但解不成 float32 / 单声道。表现就是「有音轨却全程静音」，
                 // 必须留一行，否则只能靠猜。
@@ -1762,6 +1790,19 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
         if (_reader && _reader != reader) prev = _reader;
         _reader = reader;
         _readerGen = gen;
+        // 0.3.60：output / 音频格式到这里才发布 —— 此刻 reader 一定已经
+        // startReading 成功，且代次仍是最新。晚一步发布的代价是零，
+        // 但它杜绝了「快照到半成品 output」这条崩溃路径。
+        _videoOut = vNew;
+        _audioOut = aNew;
+        if (hasAudioNew) {
+            _audioSrcASBD = aASBD;
+            _audioTrackAttached = YES;
+        } else {
+            _audioTrackAttached = NO;
+        }
+        if (outV) *outV = vNew;
+        if (outA) *outA = aNew;
     }
     [_lock unlock];
     if (prev) [prev cancelReading];
@@ -1786,10 +1827,12 @@ static NSUInteger SLVPolishChunk(uint8_t *bytes, size_t len,
         [_lock lock];
         ns = _naturalSize;
         [_lock unlock];
-        OSType decPf = (OSType)[[_videoOut.outputSettings objectForKey:(id)kCVPixelBufferPixelFormatTypeKey] unsignedIntValue];
+        // 0.3.60：日志直接用本次构建的局部对象，不读 ivar —— 锁外读共享 ivar
+        // 本身就是多余的风险（另一个线程可能正在改写）。
+        OSType decPf = (OSType)[[vNew.outputSettings objectForKey:(id)kCVPixelBufferPixelFormatTypeKey] unsignedIntValue];
         SLVLog(@"feed 管线就绪 %@ (video=%@ audio=%@) · 素材 %.0fx%.0f %u%@",
               key ?: @"(nil)",
-              _videoOut ? @"Y" : @"N", _audioOut ? @"Y" : @"N",
+              vNew ? @"Y" : @"N", aNew ? @"Y" : @"N",
               ns.width, ns.height, (unsigned)decPf,
               keyChanged ? @"" : [NSString stringWithFormat:@" · 第 %d 轮", sLoopRounds]);
     }
