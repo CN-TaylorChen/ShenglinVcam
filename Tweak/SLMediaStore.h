@@ -26,6 +26,9 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) BOOL isImage;
 /// 添加时间，列表倒序用
 @property (nonatomic, strong) NSDate *addedAt;
+/// 文件字节数，0 表示没读到。列表副标题要显示「12.4 MB」，
+/// 直接来自 allItems 里那次 attributesOfItemAtPath 调用，不额外开销。
+@property (nonatomic, assign) unsigned long long fileSize;
 @end
 
 @interface SLVMediaStore : NSObject

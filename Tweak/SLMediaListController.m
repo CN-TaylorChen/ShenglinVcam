@@ -38,7 +38,12 @@
 // 缩略图按 3x 屏算：40pt 的坑给 132px，够清晰又不占内存
 static const CGFloat kSLThumbPixels = 132.0;
 
-static UIImage *SLVMakeThumb(SLVMediaItem *it) {
+// 0.3.61：副标题不再写死「视频 · 循环播放」，改成「2160×3840 · 12.4 MB」。
+// 尺寸跟缩略图一起在后台取 —— 视频要建 AVURLAsset 读轨道，图片要读文件头，
+// 都是毫秒到百毫秒级的活，放主线程会卡列表；顺带复用缩略图那次 asset 创建。
+static UIImage *SLVMakeThumb(SLVMediaItem *it, CGSize *outSize) {
+    if (outSize) *outSize = CGSizeZero;
+
     if (it.isImage) {
         CGImageSourceRef src = CGImageSourceCreateWithURL(
             (__bridge CFURLRef)[NSURL fileURLWithPath:it.path], NULL);
@@ -49,6 +54,17 @@ static UIImage *SLVMakeThumb(SLVMediaItem *it) {
             (id)kCGImageSourceThumbnailMaxPixelSize : @(kSLThumbPixels),
         };
         CGImageRef cg = CGImageSourceCreateThumbnailAtIndex(src, 0, (__bridge CFDictionaryRef)opts);
+
+        if (outSize) {
+            NSDictionary *p = (__bridge_transfer NSDictionary *)CGImageSourceCopyPropertiesAtIndex(src, 0, NULL);
+            CGFloat w = [p[(id)kCGImagePropertyPixelWidth] doubleValue];
+            CGFloat h = [p[(id)kCGImagePropertyPixelHeight] doubleValue];
+            NSInteger orient = [p[(id)kCGImagePropertyOrientation] integerValue];
+            // 5~8 是转了 90°/270° 的方向，眼睛看到的宽高跟存储的正相反
+            if (orient >= 5 && orient <= 8) { CGFloat t = w; w = h; h = t; }
+            if (w >= 1.0 && h >= 1.0) *outSize = CGSizeMake(w, h);
+        }
+
         CFRelease(src);
         if (!cg) return nil;
         UIImage *img = [UIImage imageWithCGImage:cg];
@@ -58,6 +74,17 @@ static UIImage *SLVMakeThumb(SLVMediaItem *it) {
 
     // 视频：抽第 0 帧。appliesPreferredTrackTransform 保证竖拍视频不会躺着出来。
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:it.path] options:nil];
+    if (outSize) {
+        AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+        if (vt) {
+            // naturalSize 是传感器坐标，必须过一遍 preferredTransform 才是眼睛看到的宽高
+            CGSize s = CGSizeApplyAffineTransform(vt.naturalSize, vt.preferredTransform);
+            s.width = fabs(s.width);
+            s.height = fabs(s.height);
+            if (s.width >= 1.0 && s.height >= 1.0) *outSize = s;
+        }
+    }
+
     AVAssetImageGenerator *gen = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
     gen.appliesPreferredTrackTransform = YES;
     gen.maximumSize = CGSizeMake(kSLThumbPixels, kSLThumbPixels);
@@ -66,6 +93,38 @@ static UIImage *SLVMakeThumb(SLVMediaItem *it) {
     UIImage *img = [UIImage imageWithCGImage:cg];
     CGImageRelease(cg);
     return img;
+}
+
+/// 12.4 MB / 860 KB / 1.28 GB。0 表示没读到，返回 nil 让调用方省略这一段。
+static NSString *SLVBytesText(unsigned long long n) {
+    if (!n) return nil;
+    if (n >= (1ULL << 30)) return [NSString stringWithFormat:@"%.2f GB", n / 1073741824.0];
+    if (n >= (1ULL << 20)) return [NSString stringWithFormat:@"%.1f MB", n / 1048576.0];
+    return [NSString stringWithFormat:@"%llu KB", (n + 1023) / 1024];
+}
+
+/// 「2160×3840 · 12.4 MB」。尺寸还没算出来时先只给大小，两个都没有就退回类别名。
+static NSString *SLVSubtitleText(CGSize size, unsigned long long bytes, BOOL isImage) {
+    NSString *b = SLVBytesText(bytes);
+    if (size.width >= 1.0 && size.height >= 1.0) {
+        NSString *d = [NSString stringWithFormat:@"%ld×%ld",
+                       (long)lround(size.width), (long)lround(size.height)];
+        return b ? [d stringByAppendingFormat:@" · %@", b] : d;
+    }
+    if (b) return b;
+    return isImage ? @"图片" : @"视频";
+}
+
+/// 副标题缓存（文件名 → 成品字符串）。比缩略图缓存留得久，
+/// 列表滚回去就不用再建一次 asset。
+static NSCache<NSString *, NSString *> *SLVMetaCache(void) {
+    static NSCache *c = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        c = [NSCache new];
+        c.countLimit = 256;
+    });
+    return c;
 }
 
 static NSCache<NSString *, UIImage *> *SLVThumbCache(void) {
@@ -578,24 +637,36 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
 - (void)sl_configureWith:(SLVMediaItem *)it current:(BOOL)cur {
     self.boundFile = it.fileName;
     self.nameLab.text = it.displayName;
-    self.kindLab.text = it.isImage ? @"图片 · 定格画面" : @"视频 · 循环播放";
     self.kindLab.textColor = it.isImage ? [UIColor systemBlueColor] : [UIColor secondaryLabelColor];
     self.check.hidden = !cur;
 
     UIImage *cached = [SLVThumbCache() objectForKey:it.fileName];
+    NSString *meta = [SLVMetaCache() objectForKey:it.fileName];
     self.thumb.image = cached;
-    if (cached) return;
+    // 尺寸还没算出来时先只给文件大小（allItems 里同步拿到的），不让副标题空一行再跳字
+    self.kindLab.text = meta ?: SLVSubtitleText(CGSizeZero, it.fileSize, it.isImage);
 
-    // 缩略图没现成：先清空，再异步抽。抽不到就留个灰底方块，不显示破图。
+    BOOL needThumb = (cached == nil);
+    BOOL needMeta = (meta == nil);
+    if (!needThumb && !needMeta) return;
+
+    // 缩略图 / 副标题都靠后台抽：抽不到就留个灰底方块，不显示破图。
     __weak typeof(self) ws = self;
     NSString *name = it.fileName;
     dispatch_async(SLVThumbQueue(), ^{
-        UIImage *img = SLVMakeThumb(it);
-        if (img) [SLVThumbCache() setObject:img forKey:name];
-        if (!img) return;
+        CGSize px = CGSizeZero;
+        UIImage *img = SLVMakeThumb(it, &px);
+        if (img && needThumb) [SLVThumbCache() setObject:img forKey:name];
+
+        NSString *sub = needMeta ? SLVSubtitleText(px, it.fileSize, it.isImage) : nil;
+        if (sub) [SLVMetaCache() setObject:sub forKey:name];
+
+        if (!img && !sub) return;
         dispatch_async(dispatch_get_main_queue(), ^{
             // 回来时这一格可能已经滚走、绑到别的素材上了
-            if ([ws.boundFile isEqualToString:name]) ws.thumb.image = img;
+            if (![ws.boundFile isEqualToString:name]) return;
+            if (img && needThumb) ws.thumb.image = img;
+            if (sub) ws.kindLab.text = sub;
         });
     });
 }
@@ -1311,6 +1382,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
         (void)a; (void)v;
         [SLVMediaStore removeItem:it];
         [SLVThumbCache() removeObjectForKey:it.fileName];
+        [SLVMetaCache() removeObjectForKey:it.fileName];   // 同名文件可能再导入，别拿旧尺寸顶
         [ws sl_reload];
         [ws sl_refreshStage];
         SLVCamReloadAll();

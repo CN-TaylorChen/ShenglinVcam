@@ -138,6 +138,7 @@ static NSString *SLVDisplayNameForFile(NSString *fileName) {
         it.isImage = img;
         NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
         it.addedAt = attrs[NSFileModificationDate] ?: [NSDate dateWithTimeIntervalSince1970:0];
+        it.fileSize = [attrs[NSFileSize] unsignedLongLongValue];
         [out addObject:it];
     }
     // 最新的排最上面；时间戳撞车时用文件名兜底，保证顺序稳定
@@ -289,8 +290,9 @@ static NSString *SLVDisplayNameForFile(NSString *fileName) {
                 it.path = p;
                 it.displayName = SLVDisplayNameForFile(hit);
                 it.isImage = [self isImageFileName:hit];
-                it.addedAt = [fm attributesOfItemAtPath:p error:nil][NSFileModificationDate]
-                              ?: [NSDate date];
+                NSDictionary *a = [fm attributesOfItemAtPath:p error:nil];
+                it.addedAt = a[NSFileModificationDate] ?: [NSDate date];
+                it.fileSize = [a[NSFileSize] unsignedLongLongValue];
                 [self setCurrentItem:it];
                 [self sl_saveHashes:hashes];
                 if (duplicate) *duplicate = YES;
@@ -352,6 +354,7 @@ static NSString *SLVDisplayNameForFile(NSString *fileName) {
     it.displayName = SLVDisplayNameForFile(name);
     it.isImage = isImage;
     it.addedAt = [NSDate date];
+    it.fileSize = [[fm attributesOfItemAtPath:dst error:nil][NSFileSize] unsignedLongLongValue];
     // 0.2.20 起：每次导入都自动选中（以前只有库里空着才选，加第二个素材还得再点一次）
     [self setCurrentItem:it];
 
